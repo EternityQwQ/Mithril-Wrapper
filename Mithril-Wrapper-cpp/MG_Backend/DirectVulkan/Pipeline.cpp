@@ -244,6 +244,17 @@ VkPipeline get_or_create_pipeline(GLuint program,
     auto it = pr.pipelines.find(sig);
     if (it != pr.pipelines.end() && it->second != VK_NULL_HANDLE) return it->second;
 
+    // Negative cache: skip the creation attempt entirely for signatures that
+    // have already failed. This avoids re-running vkCreateGraphicsPipelines
+    // (and re-logging the warning) on every draw call for a persistently-
+    // broken shader/format combo. The set is cleared on program relink
+    // (delete_program_resources), so a fixed shader recovers on the next
+    // glLinkProgram. Without this, a single broken shader producing 100
+    // draws/frame would generate 100 WARN lines/frame = 6000/sec at 60 FPS.
+    if (pr.failedSignatures.count(sig)) {
+        return VK_NULL_HANDLE;
+    }
+
     // ---- Vertex input state ----
     std::vector<VkVertexInputBindingDescription> bindDescs;
     std::vector<VkVertexInputAttributeDescription> attrDescs;
@@ -444,7 +455,21 @@ VkPipeline get_or_create_pipeline(GLuint program,
     VkResult r = vkCreateGraphicsPipelines(b->device, b->pipelineCache, 1, &gi,
                                            nullptr, &pipeline);
     if (r != VK_SUCCESS) {
-        MITHRIL_LOG_WARN("vk", "vkCreateGraphicsPipelines failed (rc=%d)", (int)r);
+        // Add to negative cache so subsequent draws with the same signature
+        // skip the creation attempt (see the failedSignatures check above).
+        pr.failedSignatures.insert(sig);
+        // Improved diagnostics: include the color/depth formats and program id
+        // so the root cause (format mismatch, shader incompatibility, etc.)
+        // can be identified from the log without a debugger. The previous log
+        // only printed the VkResult code, making it impossible to distinguish
+        // a shader-stage failure from an attachment-format mismatch.
+        MITHRIL_LOG_WARN("vk", "vkCreateGraphicsPipelines failed (rc=%d, "
+                          "program=%u, colorCount=%d, colorFmt0=%d, "
+                          "depthFmt=%d, attribs=%d, blend=%d) — draws with "
+                          "this signature will be skipped until program relink",
+                          (int)r, program, color_count,
+                          color_count > 0 ? (int)color_formats[0] : 0,
+                          (int)depth_format, attrib_count, blend_enabled);
         return VK_NULL_HANDLE;
     }
     pr.pipelines[sig] = pipeline;

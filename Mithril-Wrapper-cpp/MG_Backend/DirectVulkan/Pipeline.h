@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "DescriptorSet.h"
@@ -29,6 +30,19 @@ struct ProgramResources {
     VkShaderModule fragmentModule = VK_NULL_HANDLE;
     // Cached pipelines keyed by a 64-bit signature (see Pipeline.cpp).
     std::unordered_map<uint64_t, VkPipeline> pipelines;
+
+    // Negative cache: signatures for which vkCreateGraphicsPipelines has
+    // failed. Without this, every draw call with a failing signature re-runs
+    // vkCreateGraphicsPipelines (the success-cache lookup at line ~245 only
+    // stores VK_NULL_HANDLE if we explicitly insert it, which we don't). On a
+    // persistent failure (e.g. shader/format mismatch), this means N draw
+    // calls/frame × M frames of redundant pipeline-creation attempts plus
+    // log spam. The set is cleared when the program's shader modules are
+    // rebuilt (delete_program_resources / re-link) so a fixed shader can
+    // recover. Draws against a negatively-cached signature skip the creation
+    // attempt and return VK_NULL_HANDLE immediately (draw is skipped, but
+    // without the CPU cost and log spam of a real attempt).
+    std::unordered_set<uint64_t> failedSignatures;
 
     // ---- Descriptor set management (built once by ensure_program_layouts) ----
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;

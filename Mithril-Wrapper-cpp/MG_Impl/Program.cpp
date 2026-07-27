@@ -112,6 +112,20 @@ void glLinkProgram(GLuint program) {
     mithril::Program* p = mithril::state_get_program(program);
     if (!p) { mithril::state_set_error(GL_INVALID_OPERATION); return; }
 
+    // Release any previously-built Vulkan resources (shader modules, cached
+    // pipelines, descriptor layouts, failed-signature negative cache) for
+    // this program BEFORE rebuilding. Without this, a relink with new shader
+    // source would keep using the OLD VkShaderModule (built from the OLD
+    // SPIR-V) — get_or_create_pipeline only creates the module once (when
+    // pr.vertexModule == VK_NULL_HANDLE) and the pipeline signature hash does
+    // NOT include SPIR-V content, so the stale pipeline would be returned
+    // from the cache on every subsequent draw. This manifests as "relink
+    // did nothing" or black screen if the old shaders are incompatible with
+    // the new render state. MobileGL rebuilds pipelines on every link
+    // (ProgramObject::Link -> GenerateBinary -> PipelineFactory); we mirror
+    // that by tearing down here so the next draw rebuilds from scratch.
+    backend_delete_program_resources(program);
+
     p->vertexSpirv.clear();
     p->fragmentSpirv.clear();
     p->uniforms.clear();
