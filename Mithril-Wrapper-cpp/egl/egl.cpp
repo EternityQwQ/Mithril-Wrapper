@@ -204,6 +204,17 @@ bool ensure_swapchain(EglSurface* s) {
         backend_destroy_swapchain(s->swapchain_state);
         s->swapchain_state = nullptr;
     }
+    // First-time creation: drain any in-flight GPU work (e.g. texture uploads
+    // or shader compilation issued during context init) BEFORE creating the
+    // swapchain. Without this, the first vkAcquireNextImageKHR races with
+    // outstanding work that may touch the presentation engine's IOSurface
+    // pool, and the first IOSurfaceBindAccel call crashes with SIGSEGV on
+    // iPadOS 16.x. MobileGL's RecreateSwapchain (VulkanRenderer.cpp:7786)
+    // calls vkDeviceWaitIdle unconditionally before swapchain creation; we
+    // mirror that here. backend_drain_and_detach_swapchain() also calls
+    // vkDeviceWaitIdle, so this is belt-and-suspenders even on the rebuild
+    // path above.
+    backend_drain_and_detach_swapchain();
     s->swapchain_state = backend_create_swapchain(
         s->native_window, w, h, s->wantDepthStencil ? 1 : 0, /*platform_hint=*/0);
     if (!s->swapchain_state) {

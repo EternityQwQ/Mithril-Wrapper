@@ -19,6 +19,7 @@
 #include "Resources.h"
 #include "../../MG_Impl/Log.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -54,7 +55,14 @@ Swapchain* create_swapchain_post_surface(VkSurfaceKHR surface, int width, int he
     // Surface capabilities.
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(b->physicalDevice, sc->surface, &caps);
-    uint32_t imgCount = caps.minImageCount > 0 ? caps.minImageCount : 2;
+    // Image count: request at least 3 (triple buffering) for smoother frame
+    // pacing and a deeper IOSurface pool. MobileGL requests
+    // max(minImageCountHint, caps.minImageCount) with minImageCountHint=3
+    // (SwapchainObject.cpp:176). With only minImageCount (typically 2 on
+    // iOS/Metal), the IOSurface pool is shallow and high-FPS rendering
+    // exhausts it, causing IOSurfaceBindAccel to crash when the driver
+    // tries to bind a recycled surface. Clamp to maxImageCount if set.
+    uint32_t imgCount = std::max<uint32_t>(caps.minImageCount, 3);
     if (caps.maxImageCount > 0 && imgCount > caps.maxImageCount) imgCount = caps.maxImageCount;
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == 0xFFFFFFFFu || extent.width == 0) {
@@ -82,6 +90,35 @@ Swapchain* create_swapchain_post_surface(VkSurfaceKHR surface, int width, int he
     MITHRIL_LOG_INFO("vk", "Swapchain: compositeAlpha=0x%x, supported=0x%x",
                      (unsigned)compAlpha, (unsigned)caps.supportedCompositeAlpha);
 
+    // Present mode: prefer MAILBOX (lowest latency, VSync + tear-free), fall
+    // back to IMMEDIATE (no VSync), then FIFO_RELAXED, then FIFO (always
+    // supported). MobileGL's priority order (SwapchainObject.h:56-61):
+    //   MAILBOX > IMMEDIATE > FIFO_RELAXED > FIFO
+    // FIFO alone forces each present to wait for the next vblank; under high
+    // frame rates this backs up the render thread and stresses the IOSurface
+    // pool, contributing to the IOSurfaceBindAccel crash.
+    uint32_t pmCount = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(b->physicalDevice, sc->surface, &pmCount, nullptr);
+    std::vector<VkPresentModeKHR> pms(pmCount);
+    if (pmCount > 0) {
+        vkGetPhysicalDeviceSurfacePresentModesKHR(b->physicalDevice, sc->surface, &pmCount, pms.data());
+    }
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;  // always available
+    const VkPresentModeKHR pmPreference[] = {
+        VK_PRESENT_MODE_MAILBOX_KHR,
+        VK_PRESENT_MODE_IMMEDIATE_KHR,
+        VK_PRESENT_MODE_FIFO_RELAXED_KHR,
+        VK_PRESENT_MODE_FIFO_KHR,
+    };
+    for (VkPresentModeKHR want : pmPreference) {
+        for (VkPresentModeKHR have : pms) {
+            if (have == want) { presentMode = want; goto pm_done; }
+        }
+    }
+pm_done:
+    MITHRIL_LOG_WARN("vk", "Swapchain: presentMode=%d (available=%zu)",
+                     (int)presentMode, pms.size());
+
     // Swapchain.
     VkSwapchainCreateInfoKHR scci{};
     scci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -91,11 +128,18 @@ Swapchain* create_swapchain_post_surface(VkSurfaceKHR surface, int width, int he
     scci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     scci.imageExtent = extent;
     scci.imageArrayLayers = 1;
+    // imageUsage: COLOR_ATTACHMENT (rendering) + TRANSFER_DST (blit/clear to
+    // swapchain). Add TRANSFER_SRC if the surface supports it — needed for
+    // glReadPixels / glBlitFramebuffer on FBO 0. MobileGL's
+    // SwapchainObject.cpp:205-215 does the same conditional add.
     scci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        scci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
     scci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     scci.preTransform = caps.currentTransform;
     scci.compositeAlpha = compAlpha;
-    scci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    scci.presentMode = presentMode;
     scci.clipped = VK_TRUE;
     if (vkCreateSwapchainKHR(b->device, &scci, nullptr, &sc->swapchain) != VK_SUCCESS) {
         MITHRIL_LOG_ERROR("vk", "vkCreateSwapchainKHR failed");
