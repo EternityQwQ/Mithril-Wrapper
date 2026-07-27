@@ -70,6 +70,17 @@ struct Backend {
     VkFence frameFences[kMaxFramesInFlight] = {};
     int     currentFrame = 0;
 
+    // Tracks whether a vkQueueSubmit has actually signaled each frame slot's
+    // fence since the last wait on that slot. commit_frame() sets the flag
+    // for the current slot after a successful submit; the NEXT commit_frame()
+    // on the same slot waits on that fence (deferred async-pipeline wait,
+    // mirroring MobileGL's FrameContext::WaitAndAcquireNextImage) and clears
+    // the flag. Without this gate, commit_frame would wait on an
+    // already-signaled or never-signaled fence. The fences are created with
+    // VK_FENCE_CREATE_SIGNALED_BIT (Device.cpp), so the first frame's wait is
+    // skipped — the flag starts false and is only set after a real submit.
+    bool    fencePending[kMaxFramesInFlight] = {};
+
     // Monotonic frame generation counter, bumped once per commit_frame(). Used
     // by DescriptorSet.cpp to reset each program's descriptor pool exactly once
     // per frame (currentFrame cycles 0/1, so a program drawn only on every other

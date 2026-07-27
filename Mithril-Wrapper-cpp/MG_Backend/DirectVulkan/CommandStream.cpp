@@ -179,6 +179,31 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     EncoderState& e = encoder();
     if (e.passActive) return;  // coalesce draws into one pass
 
+    // Defensive recovery: ensure the command buffer is in the recording state
+    // before recording any vkCmd* calls. Normally it is — begun by init_device()
+    // (first frame) or by commit_frame() (subsequent frames). But under GPU
+    // OOM / device-lost recovery, a prior vkBeginCommandBuffer may have failed
+    // (commandBufferRecording == false), leaving the buffer in an invalid
+    // (pending/executable) state. Calling vkCmdPipelineBarrier /
+    // vkCmdBeginRendering on a non-recording buffer is UB and — under the
+    // VK_NOT_READY death spiral reported in the field — traps the render
+    // thread in a tight loop of failed begins. This mirrors the recovery
+    // already done in commit_frame() (lines ~417-433).
+    if (!b->commandBufferRecording) {
+        if (b->deviceLost) return;  // persistent fault — skip silently
+        vkResetCommandBuffer(b->commandBuffer, 0);
+        VkCommandBufferBeginInfo rbi{};
+        rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vkBeginCommandBuffer(b->commandBuffer, &rbi) != VK_SUCCESS) {
+            MITHRIL_LOG_ERROR("vk", "begin_render_pass: vkBeginCommandBuffer "
+                              "recovery failed — skipping pass");
+            return;
+        }
+        b->commandBufferRecording = true;
+        e.hasCommands = false;  // fresh buffer, no pre-frame records survived
+    }
+
     // The command buffer is already in the recording state — either begun by
     // init_device() (first frame) or by commit_frame() (subsequent frames).
     // Pre-frame commands (layout transitions, texture uploads, etc.) recorded
@@ -243,21 +268,28 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     }
 
     // Begin dynamic rendering.
+    // loadOp selection — aligned with MobileGL's VkRenderPassManager
+    // (VkRenderPassManager.cpp:711-784). Priority order (hasClear first):
+    //   1. hasClear (e.loadClear)  -> CLEAR   (discard prior contents)
+    //   2. trackedLayout == UNDEFINED -> DONT_CARE (no valid contents to load;
+    //      LOAD on UNDEFINED is spec-illegal and wastes tile bandwidth)
+    //   3. otherwise               -> LOAD    (preserve existing contents)
+    // MobileGL sets initialLayout=UNDEFINED for cases 1 & 2; we achieve the
+    // same via the acquire->attachment barrier using oldLayout=UNDEFINED
+    // (swapchain_acquire_color deliberately resets currentColorLayout to
+    // UNDEFINED on every acquire, since post-present contents are undefined).
     VkRenderingAttachmentInfoKHR colorAttachs[8] = {};
     for (int i = 0; i < e.colorCount; ++i) {
         colorAttachs[i].sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
         colorAttachs[i].imageView = e.colorViews[i];
         colorAttachs[i].imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        // loadOp:
-        //   * CLEAR      — glClear passes (loadClear).
-        //   * DONT_CARE  — draw passes where the swapchain colour image was
-        //                  just acquired (UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL
-        //                  this frame). The previous contents were discarded
-        //                  by the UNDEFINED source layout, so LOAD would read
-        //                  garbage and waste bandwidth.
-        //   * LOAD       — draw passes where the swapchain image came back
-        //                  from present (PRESENT_SRC_KHR) or against a user
-        //                  FBO whose attachment already has valid contents.
+        // Color loadOp (MobileGL VkRenderPassManager.cpp:713,776-780):
+        //   hasClear -> CLEAR; !hasClear && UNDEFINED -> DONT_CARE; else LOAD.
+        // swapchainColorWasUndefined covers the swapchain image on its first
+        // pass of the frame (currentColorLayout was UNDEFINED before the
+        // acquire->attachment barrier). Subsequent passes in the same frame
+        // see COLOR_ATTACHMENT_OPTIMAL and correctly use LOAD to preserve the
+        // first pass's output.
         if (e.loadClear) {
             colorAttachs[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         } else if (swapchainColorWasUndefined &&
@@ -273,6 +305,16 @@ void begin_render_pass(VkImageView* color_views, int color_count,
         colorAttachs[i].clearValue.color.float32[2] = e.clearColor[2];
         colorAttachs[i].clearValue.color.float32[3] = e.clearColor[3];
     }
+    // Depth/stencil loadOp (MobileGL ResolveDepthStencilAttachmentLoadInfo,
+    // VkRenderPassManager.cpp:140-155). Same priority: hasClear -> CLEAR;
+    // UNDEFINED (first use) -> DONT_CARE; else LOAD. The depth image is
+    // persistent across frames (never presented), so after the one-shot
+    // UNDEFINED->DEPTH_STENCIL_ATTACHMENT_OPTIMAL transition it stays valid
+    // and subsequent passes use LOAD to preserve depth across passes.
+    // NOTE: MobileGL splits clearDepth/clearStencil independently; we use a
+    // single e.loadClear for both (the depth+stencil share one attachment
+    // slot here). Partial clears (clear depth only) are handled separately
+    // by vkCmdClearAttachments using clearMaskPending, not by the loadOp.
     VkRenderingAttachmentInfoKHR depthAttach{};
     depthAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
     depthAttach.imageView = e.depthView;
@@ -337,6 +379,39 @@ void commit_frame() {
     if (!b->initialized || !b->commandBuffer) return;
     EncoderState& e = encoder();
     if (e.passActive) end_render_pass();
+
+    // ---- Wait for the previous submit on this slot to complete ----
+    // This is the async-pipeline wait point (mirrors MobileGL's
+    // FrameContext::WaitAndAcquireNextImage, FrameContext.cpp:220, which
+    // calls vkWaitForFences on the slot's imageInFlightFence before acquire).
+    //
+    // We wait HERE (at the start of the next commit on the same slot), not
+    // after our own submit. This lets the GPU run up to kMaxFramesInFlight-1
+    // frames behind the CPU without stalling the render thread, achieving
+    // proper CPU/GPU parallelism. The fence was created with
+    // VK_FENCE_CREATE_SIGNALED_BIT (Device.cpp:265), so the first frame's
+    // wait returns immediately.
+    //
+    // Only wait if a submit actually happened on this slot (fencePending).
+    // The flag is set below after a successful submit; cleared here after the
+    // wait. Without this gate, we'd wait on an already-waited fence (cheap
+    // but pointless) or on a never-signaled fence (if a previous submit
+    // failed and we did not set fencePending).
+    if (b->fencePending[b->currentFrame]) {
+        VkFence fence = b->frameFences[b->currentFrame];
+        VkResult wr = vkWaitForFences(b->device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (wr != VK_SUCCESS) {
+            MITHRIL_LOG_ERROR("vk", "commit_frame: vkWaitForFences(slot=%d) "
+                              "failed (rc=%d) — possible device lost",
+                              b->currentFrame, (int)wr);
+            // Device lost: mark and bail. Subsequent commits will short-circuit
+            // on b->deviceLost. This is the only recovery from a GPU hang that
+            // does not involve a full device recreation.
+            b->deviceLost = true;
+            return;
+        }
+        b->fencePending[b->currentFrame] = false;
+    }
 
     // ---- Decide whether we need to submit at all ----
     // MobileGL's Present() logic (VulkanRenderer.cpp:6912):
@@ -539,8 +614,42 @@ void commit_frame() {
         sc->imageAvailableConsumed = true;
     }
 
-    // Wait on the frame we just submitted so the command buffer is reusable.
-    vkWaitForFences(b->device, 1, &fence, VK_TRUE, UINT64_MAX);
+    // Mark this slot's fence as pending. The NEXT commit_frame() that cycles
+    // back to this slot will wait on frameFences[currentFrame] before reusing
+    // the command buffer. This must be set BEFORE the currentFrame advance
+    // below, so the flag lands on the slot we just submitted (not the next
+    // one). Without this, the deferred wait at the top of commit_frame is a
+    // no-op (fencePending is always false) and vkResetCommandBuffer below
+    // would reset a buffer the GPU is still executing -> spec violation /
+    // UAF crash. The fences start signaled (VK_FENCE_CREATE_SIGNALED_BIT),
+    // so the first frame's wait is correctly skipped (flag starts false).
+    b->fencePending[b->currentFrame] = true;
+
+    // CRITICAL PERFORMANCE FIX: do NOT vkWaitForFences here.
+    //
+    // The previous code called vkWaitForFences(UINT64_MAX) immediately after
+    // every submit, which serialized the CPU onto the GPU: the render thread
+    // stalled until the GPU finished executing the entire frame before it
+    // could begin recording the next one. This (a) destroyed CPU/GPU
+    // parallelism, capping FPS at roughly 1/GPU-frame-time instead of the
+    // display refresh rate, and (b) on the very first frame, if the GPU hit
+    // any error (layout/sync), the fence never signaled and the wait hung
+    // forever -> black screen with audio still playing.
+    //
+    // MobileGL's model (VulkanRenderer.cpp:6951-6955 + FrameContext.cpp:220):
+    //   submit -> advance frame slot -> vkQueuePresentKHR ->
+    //   vkWaitForFences(NEXT slot's fence) BEFORE next acquire.
+    // The wait happens at the START of the next frame (on a different fence —
+    // the one the NEXT slot's command buffer will reuse), not at the end of
+    // this frame. This gives kMaxFramesInFlight-1 frames of latency for the
+    // GPU to finish, achieving true pipelining.
+    //
+    // We achieve the same by deferring the fence wait to the NEXT commit_frame
+    // entry: before recording into the current slot's command buffer, wait on
+    // its fence (which was signaled by the submit kMaxFramesInFlight frames
+    // ago). The fence was created with VK_FENCE_CREATE_SIGNALED_BIT, so the
+    // first frame's wait is a no-op. See the wait block at the top of this
+    // function (added below).
     b->currentFrame = (b->currentFrame + 1) % kMaxFramesInFlight;
     // Monotonic generation bump: descriptor pools are reset on first draw of
     // each generation (see DescriptorSet.cpp), so this must advance every frame
