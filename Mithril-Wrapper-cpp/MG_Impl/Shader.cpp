@@ -570,9 +570,65 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
                 "#define MG_MITHRIL_VERSION 1000000\n"
             );
             if (!shader2.parse(GetDefaultResources(), glsl_version, true, messages)) {
-                // Both attempts failed; return the original (wrapped) error
-                // log so the caller sees the more informative message.
-                return false;
+                // ---- Third fallback: relaxed Vulkan-rules mode ----
+                // MobileGL uses setEnvInputVulkanRulesRelaxed() on its Vulkan
+                // path (ShaderCompiler.cpp:188) to accept GL legacy builtins
+                // and constructs that strict VulkanRules rejects — e.g.
+                // gl_FragColor, gl_TexCoord, implicit int->uint conversions,
+                // and other desktop-GL-isms that Minecraft shader packs and
+                // mod shaders frequently use. Without relaxed mode, any shader
+                // referencing these constructs fails translation -> linked=false
+                // -> prepare_draw skips the draw -> black screen with audio.
+                //
+                // We only reach here after BOTH strict attempts (wrapped +
+                // unwrapped) failed, so this is a pure addition: shaders that
+                // already compile are unaffected. The relaxed retry uses the
+                // unwrapped source (source_unwrapped) so the regex wrapper's
+                // edge-case mangling is not a factor.
+                //
+                // Semantic note: relaxed mode keeps gl_VertexID/gl_InstanceID
+                // 1-based GL semantics (vs strict Vulkan's 0-based). The
+                // rewrite_desktop_builtins() call above already renamed these
+                // to gl_VertexIndex/gl_InstanceIndex, so the relaxed mode's
+                // 1-based semantics do NOT apply — the renamed builtins use
+                // Vulkan semantics. This is correct and matches the existing
+                // behavior for shaders that compile in strict mode.
+                MITHRIL_LOG_WARN("shader", "glslang parse failed in strict mode; "
+                                  "retrying with setEnvInputVulkanRulesRelaxed()");
+                std::string source_relaxed = source_unwrapped;
+                glslang::TShader shader3(stage);
+                const char* s3 = source_relaxed.c_str();
+                shader3.setStrings(&s3, 1);
+                shader3.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientOpenGL, glsl_version);
+                shader3.setEnvClient(glslang::EShClientOpenGL, glslang::EShTargetOpenGL_450);
+                shader3.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_5);
+                shader3.setEnvInputVulkanRulesRelaxed();  // key: accept GL legacy constructs
+                shader3.setAutoMapLocations(true);
+                shader3.setAutoMapBindings(true);
+                shader3.setPreamble(
+                    "#define MG_MITHRIL 1\n"
+                    "#define MG_MITHRIL_VERSION 1000000\n"
+                );
+                if (!shader3.parse(GetDefaultResources(), glsl_version, true, messages)) {
+                    // All three attempts failed; return the original (wrapped)
+                    // error log so the caller sees the most informative message.
+                    return false;
+                }
+                glslang::TProgram program3;
+                program3.addShader(&shader3);
+                if (!program3.link(messages)) {
+                    info = program3.getInfoLog();
+                    info += program3.getInfoDebugLog();
+                    return false;
+                }
+                glslang::TIntermediate* inter3 = program3.getIntermediate(stage);
+                if (!inter3) { info = "no intermediate after link (relaxed retry)"; return false; }
+                glslang::SpvOptions spv_opts3;
+                spv_opts3.disableOptimizer = false;
+                glslang::GlslangToSpv(*inter3, spirv, &spv_opts3);
+                if (spirv.empty()) { info = "SPIR-V generation produced no words (relaxed retry)"; return false; }
+                MITHRIL_LOG_INFO("shader", "shader compiled successfully in relaxed mode");
+                return true;
             }
             glslang::TProgram program2;
             program2.addShader(&shader2);
