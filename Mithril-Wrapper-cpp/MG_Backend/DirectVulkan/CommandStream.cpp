@@ -138,7 +138,17 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
             break;
         case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
             // Present engine reads the image.
-            dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
+            // FIX (root cause R): Use COLOR_ATTACHMENT_OUTPUT instead of
+            // BOTTOM_OF_PIPE. BOTTOM_OF_PIPE is legal per spec but MoltenVK
+            // historically maps it to a no-op barrier, which can cause the
+            // color-attachment writes from the render pass to not be fully
+            // visible to the present engine — the present then reads stale/
+            // incomplete pixels (black screen). COLOR_ATTACHMENT_OUTPUT is
+            // the stage where the presentation engine reads the image on
+            // MoltenVK/Metal, and is the stage MobileGL uses for this
+            // transition. This guarantees the color attachment writes complete
+            // before present.
+            dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             dstAccess = VK_ACCESS_MEMORY_READ_BIT;
             break;
         default:

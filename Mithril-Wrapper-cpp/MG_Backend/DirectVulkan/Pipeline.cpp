@@ -443,7 +443,25 @@ VkPipeline get_or_create_pipeline(GLuint program,
     renderingCI.colorAttachmentCount = color_count > 0 ? (uint32_t)color_count : 1;
     renderingCI.pColorAttachmentFormats = colorFmts;
     renderingCI.depthAttachmentFormat = depth_format;
-    renderingCI.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+    // FIX (root cause O): For packed depth-stencil formats (D32_SFLOAT_S8_UINT,
+    // D24_UNORM_S8_UINT), the stencil attachment format MUST match the depth
+    // format. begin_render_pass() binds the SAME VkImageView (depthView, which
+    // has aspect DEPTH|STENCIL) as both pDepthAttachment and pStencilAttachment.
+    // If the pipeline declares stencilAttachmentFormat = VK_FORMAT_UNDEFINED
+    // while the render pass provides a stencil attachment, this is a
+    // pipeline/render-pass incompatibility — MoltenVK may silently drop the
+    // entire draw or fail to compile the Metal stencil state, producing a
+    // black screen. MobileGL sets stencilAttachmentFormat = depth_format for
+    // packed D32S8/D24S8 formats. For depth-only formats (D32_SFLOAT,
+    // D16_UNORM) there is no stencil aspect, so UNDEFINED is correct.
+    if (depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+        depth_format == VK_FORMAT_D24_UNORM_S8_UINT ||
+        depth_format == VK_FORMAT_D16_UNORM_S8_UINT ||
+        depth_format == VK_FORMAT_S8_UINT) {
+        renderingCI.stencilAttachmentFormat = depth_format;
+    } else {
+        renderingCI.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+    }
 
     // ---- Graphics pipeline ----
     VkGraphicsPipelineCreateInfo gi{};

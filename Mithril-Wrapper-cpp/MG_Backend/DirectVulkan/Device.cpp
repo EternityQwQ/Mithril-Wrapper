@@ -230,6 +230,33 @@ bool init_device() {
     dynRenderFeat.dynamicRendering = VK_TRUE;
     dynRenderFeat.pNext = &extDynStateFeat;
 
+    // FIX (root cause Q): When VK_KHR_portability_subset is enabled (it is, on
+    // MoltenVK — Device.cpp:197-199), the Vulkan spec REQUIRES
+    // VkPhysicalDevicePortabilitySubsetFeaturesKHR to be chained into
+    // VkDeviceCreateInfo::pNext. Without it, all portability-subset features
+    // default to VK_FALSE, which may cause pipelines using portability-
+    // constrained features (triangleFans, separateStencilTextureFilter, etc.)
+    // to silently fail on MoltenVK → black screen. MobileGL chains this struct.
+    // Query the supported features first; only enable what the device supports.
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portSubsetFeat{};
+    portSubsetFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR;
+    portSubsetFeat.pNext = nullptr;
+    if (has_extension(devExtProps, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        // Query the supported portability-subset features. vkGetPhysicalDevice-
+        // Features2 fills portSubsetFeat with VK_TRUE for features the device
+        // supports; chaining the struct into VkDeviceCreateInfo::pNext enables
+        // exactly those supported features. We do NOT force any feature on,
+        // so unsupported features stay VK_FALSE (spec-safe).
+        VkPhysicalDeviceFeatures2 feat2{};
+        feat2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        feat2.pNext = &portSubsetFeat;
+        vkGetPhysicalDeviceFeatures2(b->physicalDevice, &feat2);
+        // Chain portability-subset at the END of the feature chain
+        // (after extended-dynamic-state). The order does not matter for
+        // correctness; we just need all feature structs in the pNext chain.
+        extDynStateFeat.pNext = &portSubsetFeat;
+    }
+
     // ---- Core VkPhysicalDeviceFeatures ----
     // Without pEnabledFeatures, all core features default to VK_FALSE, which
     // means ANY pipeline/shader using them will fail vkCreateGraphicsPipelines
