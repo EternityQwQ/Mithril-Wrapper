@@ -7,6 +7,9 @@
 #define MITHRIL_DIRECTVULKAN_COMMANDSTREAM_H
 
 #include <vulkan/vulkan.h>
+#include <cstdint>  // uint32_t (used by clear_attachments mask in lieu of
+                    // GLbitfield, to avoid pulling <GL/gl.h> into every TU
+                    // that includes this header)
 
 namespace mithril {
 namespace vk {
@@ -45,9 +48,9 @@ void begin_render_pass(VkImageView* color_views, int color_count,
 void end_render_pass();
 
 // Clear specific aspects of the current framebuffer via vkCmdClearAttachments.
-// Must be called inside a render pass. `mask` is a GLbitfield of
+// Must be called inside a render pass. `mask` is a GLbitfield (uint32_t) of
 // GL_COLOR_BUFFER_BIT / GL_DEPTH_BUFFER_BIT / GL_STENCIL_BUFFER_BIT.
-void clear_attachments(GLbitfield mask, int x, int y, int w, int h);
+void clear_attachments(uint32_t mask, int x, int y, int w, int h);
 
 /*
  * Ensure the current frame slot's command buffer is in the RECORDING state.

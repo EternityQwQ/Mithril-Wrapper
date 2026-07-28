@@ -420,7 +420,7 @@ void end_render_pass() {
  * MobileGL (VulkanRenderer.cpp:4230-4358) uses the same vkCmdClearAttachments
  * approach, respecting GL_SCISSOR_TEST for the clear rect.
  */
-void clear_attachments(GLbitfield mask, int x, int y, int w, int h) {
+void clear_attachments(uint32_t mask, int x, int y, int w, int h) {
     Backend* b = backend();
     EncoderState& e = encoder();
     if (!b->commandBuffer || !e.passActive) return;
