@@ -129,6 +129,136 @@ void ensure_program_layouts(GLuint program,
     }
 }
 
+/*
+ * Process-wide default 1x1 opaque-black texture used to fill unbound sampler
+ * bindings so the descriptor set stays complete. Without this, a shader that
+ * declares a sampler but whose GL texture unit is unbound would leave the
+ * corresponding descriptor binding unwritten — MoltenVK then samples
+ * undefined memory and the geometry renders pure black (root cause L).
+ *
+ * MobileGL keeps a similar default texture for the same reason. Lazily
+ * created on first use; lifetime is the process (never destroyed).
+ */
+struct DefaultTexture {
+    VkImage    image  = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view   = VK_NULL_HANDLE;
+    VkSampler  sampler = VK_NULL_HANDLE;
+};
+
+DefaultTexture& default_texture() {
+    static DefaultTexture dt;
+    if (dt.view != VK_NULL_HANDLE && dt.sampler != VK_NULL_HANDLE) return dt;
+    Backend* b = backend();
+    if (!b->device) return dt;
+
+    // 1x1 R8G8B8A8_UNORM, opaque black (0,0,0,1).
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = {1, 1, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(b->device, &ici, nullptr, &dt.image) != VK_SUCCESS) return dt;
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(b->device, dt.image, &req);
+    // find_memory_type lives in Resources.cpp.
+    uint32_t mt = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < 32; ++i) {
+        if ((req.memoryTypeBits >> i) & 1) { mt = i; break; }
+    }
+    if (mt == 0xFFFFFFFFu) { vkDestroyImage(b->device, dt.image, nullptr); dt.image = VK_NULL_HANDLE; return dt; }
+
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = mt;
+    if (vkAllocateMemory(b->device, &ai, nullptr, &dt.memory) != VK_SUCCESS) {
+        vkDestroyImage(b->device, dt.image, nullptr); dt.image = VK_NULL_HANDLE; return dt;
+    }
+    vkBindImageMemory(b->device, dt.image, dt.memory, 0);
+
+    // Transition UNDEFINED -> SHADER_READ_ONLY_OPTIMAL and clear to black.
+    // Use a one-shot command buffer on the graphics queue.
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cai{};
+    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cai.commandPool = b->commandPool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(b->device, &cai, &cb) != VK_SUCCESS) return dt;
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bi);
+
+    VkImageMemoryBarrier b2{};
+    b2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b2.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    b2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b2.image = dt.image;
+    b2.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b2.subresourceRange.baseMipLevel = 0;
+    b2.subresourceRange.levelCount = 1;
+    b2.subresourceRange.baseArrayLayer = 0;
+    b2.subresourceRange.layerCount = 1;
+    b2.srcAccessMask = 0;
+    b2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &b2);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    VkFence fence;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(b->device, &fci, nullptr, &fence);
+    vkQueueSubmit(b->graphicsQueue, 1, &si, fence);
+    vkWaitForFences(b->device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(b->device, fence, nullptr);
+    vkFreeCommandBuffers(b->device, b->commandPool, 1, &cb);
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = dt.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.baseMipLevel = 0;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.baseArrayLayer = 0;
+    vci.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(b->device, &vci, nullptr, &dt.view) != VK_SUCCESS) return dt;
+
+    VkSamplerCreateInfo sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter = VK_FILTER_NEAREST;
+    sci.minFilter = VK_FILTER_NEAREST;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.minLod = 0.0f;
+    sci.maxLod = 0.0f;
+    if (vkCreateSampler(b->device, &sci, nullptr, &dt.sampler) != VK_SUCCESS) {
+        vkDestroyImageView(b->device, dt.view, nullptr); dt.view = VK_NULL_HANDLE;
+        return dt;
+    }
+    return dt;
+}
+
 void bind_program_descriptors(GLuint program) {
     Backend* b = backend();
     if (!b->initialized || !b->commandBuffer || program == 0) return;
@@ -252,27 +382,42 @@ void bind_program_descriptors(GLuint program) {
                     }
                 }
             }
+            VkImageView view = VK_NULL_HANDLE;
+            VkSampler samp = VK_NULL_HANDLE;
             if (tex_id) {
-                VkImageView view = backend_get_texture_view(tex_id);
-                VkSampler samp = backend_get_or_create_sampler(
+                view = backend_get_texture_view(tex_id);
+                samp = backend_get_or_create_sampler(
                     tex_id, GL_LINEAR, GL_LINEAR,
                     GL_REPEAT, GL_REPEAT, GL_REPEAT, nullptr);
-                if (view != VK_NULL_HANDLE && samp != VK_NULL_HANDLE) {
-                    VkDescriptorImageInfo ii{};
-                    ii.sampler = samp;
-                    ii.imageView = view;
-                    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-                    imgInfos.push_back(ii);
-                    VkWriteDescriptorSet w{};
-                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    w.dstSet = set;
-                    w.dstBinding = db.binding;
-                    w.dstArrayElement = 0;
-                    w.descriptorCount = 1;
-                    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                    w.pImageInfo = &imgInfos.back();
-                    writes.push_back(w);
+            }
+            // FIX (root cause L): if no texture is bound (or the bound texture
+            // has no view/sampler), use the process-wide default 1x1 black
+            // texture. Without this, the descriptor binding would be left
+            // unwritten — MoltenVK then samples undefined memory and the
+            // geometry renders pure black. A complete descriptor set with a
+            // valid (black) texture is always preferable to an incomplete one.
+            if (view == VK_NULL_HANDLE || samp == VK_NULL_HANDLE) {
+                DefaultTexture& dt = default_texture();
+                if (dt.view != VK_NULL_HANDLE && dt.sampler != VK_NULL_HANDLE) {
+                    view = dt.view;
+                    samp = dt.sampler;
                 }
+            }
+            if (view != VK_NULL_HANDLE && samp != VK_NULL_HANDLE) {
+                VkDescriptorImageInfo ii{};
+                ii.sampler = samp;
+                ii.imageView = view;
+                ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                imgInfos.push_back(ii);
+                VkWriteDescriptorSet w{};
+                w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet = set;
+                w.dstBinding = db.binding;
+                w.dstArrayElement = 0;
+                w.descriptorCount = 1;
+                w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                w.pImageInfo = &imgInfos.back();
+                writes.push_back(w);
             }
         }
     }

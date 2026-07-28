@@ -311,6 +311,8 @@ VkPipeline backend_get_or_create_pipeline(GLuint program,
                                           const VkFormat* color_formats, int color_count,
                                           VkFormat depth_format,
                                           int blend_enabled, GLenum blend_src, GLenum blend_dst,
+                                          GLenum blend_src_alpha, GLenum blend_dst_alpha,
+                                          int color_write_mask,
                                           GLenum gl_primitive_mode);
 
 /* Release all Vulkan resources owned by a program (shader modules + pipelines +

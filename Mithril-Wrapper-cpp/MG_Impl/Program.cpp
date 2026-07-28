@@ -166,10 +166,18 @@ void glLinkProgram(GLuint program) {
             p->fragmentSpirv = s->spirv;
         }
     }
-    if (missing || (p->vertexSpirv.empty() && p->fragmentSpirv.empty())) {
+    // FIX (root cause K): link fails if EITHER stage is missing/empty (||),
+    // not only if BOTH are empty (&&). The old && logic let single-stage
+    // programs (VS-only or FS-only) "link successfully", but Drawing.cpp's
+    // prepare_draw uses || to skip draws whose VS or FS is empty — so every
+    // draw of a "linked" single-stage program was silently skipped, producing
+    // a black screen. GL also requires a complete program (VS+FS) to link.
+    if (missing || p->vertexSpirv.empty() || p->fragmentSpirv.empty()) {
         p->linked = false;
         p->infoLog = "link failed: a required stage was missing or uncompiled";
-        MITHRIL_LOG_ERROR("program", "Link failed for program %u: missing stage", program);
+        MITHRIL_LOG_ERROR("program", "Link failed for program %u: missing/empty stage "
+                          "(VS=%zu FS=%zu words)", program,
+                          p->vertexSpirv.size(), p->fragmentSpirv.size());
         return;
     }
     p->linked = true;

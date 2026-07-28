@@ -122,9 +122,17 @@ static void prepare_draw(GLenum mode) {
         m.buffer_name  = a.boundBuffer;
     }
 
-    // Get-or-create the VkGraphicsPipeline. Blend state is part of the
-    // pipeline signature so that enabling/disabling GL_BLEND or changing
-    // blend functions creates a distinct pipeline.
+    // Get-or-create the VkGraphicsPipeline. Blend state + colorWriteMask are
+    // part of the pipeline signature so that enabling/disabling GL_BLEND,
+    // changing blend functions, or calling glColorMask creates a distinct
+    // pipeline (root cause I+J: previously only blend_enabled/src/dst were in
+    // the signature and colorWriteMask was hardcoded RGBA-all-on, so different
+    // blend/mask configs collided in the cache and glColorMask was a no-op).
+    int cwm_bits = 0;
+    if (g_state->colorMask[0]) cwm_bits |= 1;
+    if (g_state->colorMask[1]) cwm_bits |= 2;
+    if (g_state->colorMask[2]) cwm_bits |= 4;
+    if (g_state->colorMask[3]) cwm_bits |= 8;
     VkPipeline pipeline = backend_get_or_create_pipeline(
         prog->id,
         prog->vertexSpirv.data(),   (int)prog->vertexSpirv.size(),
@@ -135,6 +143,9 @@ static void prepare_draw(GLenum mode) {
         g_state->blend ? 1 : 0,
         g_state->blendSrcRGB,
         g_state->blendDstRGB,
+        g_state->blendSrcA,
+        g_state->blendDstA,
+        cwm_bits,
         mode);
     if (pipeline == VK_NULL_HANDLE) return;
 

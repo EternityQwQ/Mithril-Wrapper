@@ -945,8 +945,13 @@ void backend_set_depth_test(int enabled, int write_mask, int compare_func) {
 
 void backend_set_color_write_mask(int r, int g, int b, int a) {
     (void)r; (void)g; (void)b; (void)a;
-    // VK_DYNAMIC_STATE_COLOR_WRITE_ENABLE_EXT is extension-only; colour
-    // write is part of the pipeline's blend attachment for now.
+    // No-op by design: colorWriteMask is a STATIC pipeline state (part of
+    // VkPipelineColorBlendAttachmentState), not a dynamic state. It is read
+    // from g_state->colorMask at pipeline-creation time (Drawing.cpp packs it
+    // into the pipeline signature), so changing glColorMask creates a new
+    // pipeline rather than updating the bound one. VK_DYNAMIC_STATE_COLOR_WRITE
+    // _ENABLE_EXT would allow dynamic toggling but requires an extension we do
+    // not enable; the static approach is correct and matches MobileGL.
 }
 
 void backend_set_stencil_state(int enabled, int func, int ref, int mask,

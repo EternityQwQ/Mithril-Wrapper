@@ -61,6 +61,11 @@ std::unordered_map<GLuint, ProgramResources>& program_table();
 
 // Build (or fetch from cache) a VkPipeline for the given configuration.
 // All arguments mirror backend_get_or_create_pipeline() in Backend.h.
+//   color_write_mask : 4-bit RGBA mask (bit0=R, bit1=G, bit2=B, bit3=A) from
+//                      g_state->colorMask; part of the pipeline signature so
+//                      glColorMask changes create distinct pipelines.
+//   blend_src_alpha / blend_dst_alpha : GL blend factors for the alpha
+//                      channel (independent from RGB); part of the signature.
 VkPipeline get_or_create_pipeline(GLuint program,
                                   const uint32_t* vertex_spirv, int vertex_word_count,
                                   const uint32_t* fragment_spirv, int fragment_word_count,
@@ -68,6 +73,8 @@ VkPipeline get_or_create_pipeline(GLuint program,
                                   const VkFormat* color_formats, int color_count,
                                   VkFormat depth_format,
                                   int blend_enabled, GLenum blend_src, GLenum blend_dst,
+                                  GLenum blend_src_alpha, GLenum blend_dst_alpha,
+                                  int color_write_mask,
                                   GLenum gl_primitive_mode);
 
 // Release all Vulkan resources owned by a program (shader modules + pipelines).

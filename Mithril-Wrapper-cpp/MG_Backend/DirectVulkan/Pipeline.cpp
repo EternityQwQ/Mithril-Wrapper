@@ -126,7 +126,9 @@ VkCompareOp gl_compare_to_vk(GLenum f) {
 uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attrib_count,
                         const VkFormat* color_formats, int color_count,
                         VkFormat depth_format, int blend_enabled,
-                        GLenum blend_src, GLenum blend_dst, GLenum prim) {
+                        GLenum blend_src, GLenum blend_dst,
+                        GLenum blend_src_alpha, GLenum blend_dst_alpha,
+                        int color_write_mask, GLenum prim) {
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const void* p, size_t n) {
         const uint8_t* b = (const uint8_t*)p;
@@ -148,6 +150,9 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
     mix(&blend_enabled, sizeof(blend_enabled));
     mix(&blend_src, sizeof(blend_src));
     mix(&blend_dst, sizeof(blend_dst));
+    mix(&blend_src_alpha, sizeof(blend_src_alpha));
+    mix(&blend_dst_alpha, sizeof(blend_dst_alpha));
+    mix(&color_write_mask, sizeof(color_write_mask));
     mix(&prim, sizeof(prim));
     return h;
 }
@@ -214,6 +219,8 @@ VkPipeline get_or_create_pipeline(GLuint program,
                                   const VkFormat* color_formats, int color_count,
                                   VkFormat depth_format,
                                   int blend_enabled, GLenum blend_src, GLenum blend_dst,
+                                  GLenum blend_src_alpha, GLenum blend_dst_alpha,
+                                  int color_write_mask,
                                   GLenum gl_primitive_mode) {
     Backend* b = backend();
     if (!b->initialized || program == 0) return VK_NULL_HANDLE;
@@ -240,7 +247,9 @@ VkPipeline get_or_create_pipeline(GLuint program,
 
     uint64_t sig = hash_signature(program, attribs, attrib_count, color_formats,
                                   color_count, depth_format, blend_enabled,
-                                  blend_src, blend_dst, gl_primitive_mode);
+                                  blend_src, blend_dst,
+                                  blend_src_alpha, blend_dst_alpha,
+                                  color_write_mask, gl_primitive_mode);
     auto it = pr.pipelines.find(sig);
     if (it != pr.pipelines.end() && it->second != VK_NULL_HANDLE) return it->second;
 
@@ -359,18 +368,28 @@ VkPipeline get_or_create_pipeline(GLuint program,
     ds.stencilTestEnable = VK_FALSE;
 
     // ---- Color blend ----
+    // FIX (root cause I+J): use independent alpha blend factors (blend_src_alpha/
+    // blend_dst_alpha) and apply the GL colorWriteMask from g_state instead of
+    // hardcoding RGBA all-on. glColorMask now takes effect via the pipeline
+    // signature (color_write_mask is hashed above), so depth-only pre-passes
+    // that disable color writes get a distinct pipeline that does not corrupt
+    // the color buffer.
     VkPipelineColorBlendAttachmentState cbAttach{};
     cbAttach.blendEnable = blend_enabled ? VK_TRUE : VK_FALSE;
     if (blend_enabled) {
         cbAttach.srcColorBlendFactor = gl_blend_to_vk(blend_src);
         cbAttach.dstColorBlendFactor = gl_blend_to_vk(blend_dst);
         cbAttach.colorBlendOp = VK_BLEND_OP_ADD;
-        cbAttach.srcAlphaBlendFactor = gl_blend_to_vk(blend_src);
-        cbAttach.dstAlphaBlendFactor = gl_blend_to_vk(blend_dst);
+        cbAttach.srcAlphaBlendFactor = gl_blend_to_vk(blend_src_alpha);
+        cbAttach.dstAlphaBlendFactor = gl_blend_to_vk(blend_dst_alpha);
         cbAttach.alphaBlendOp = VK_BLEND_OP_ADD;
     }
-    cbAttach.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkColorComponentFlags cwm = 0;
+    if (color_write_mask & 1) cwm |= VK_COLOR_COMPONENT_R_BIT;
+    if (color_write_mask & 2) cwm |= VK_COLOR_COMPONENT_G_BIT;
+    if (color_write_mask & 4) cwm |= VK_COLOR_COMPONENT_B_BIT;
+    if (color_write_mask & 8) cwm |= VK_COLOR_COMPONENT_A_BIT;
+    cbAttach.colorWriteMask = cwm;
 
     VkPipelineColorBlendStateCreateInfo cb{};
     cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -515,12 +534,16 @@ VkPipeline backend_get_or_create_pipeline(GLuint program,
                                           const VkFormat* color_formats, int color_count,
                                           VkFormat depth_format,
                                           int blend_enabled, GLenum blend_src, GLenum blend_dst,
+                                          GLenum blend_src_alpha, GLenum blend_dst_alpha,
+                                          int color_write_mask,
                                           GLenum gl_primitive_mode) {
     return mithril::vk::get_or_create_pipeline(program, vertex_spirv, vertex_word_count,
                                                fragment_spirv, fragment_word_count,
                                                attribs, attrib_count,
                                                color_formats, color_count, depth_format,
                                                blend_enabled, blend_src, blend_dst,
+                                               blend_src_alpha, blend_dst_alpha,
+                                               color_write_mask,
                                                gl_primitive_mode);
 }
 
