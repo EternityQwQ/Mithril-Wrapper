@@ -21,6 +21,7 @@
 #include "../../MG_Impl/Log.h"
 
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 namespace mithril {
@@ -66,6 +67,34 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
 bool init_device() {
     Backend* b = backend();
     if (b->initialized) return true;
+
+    // ---- MoltenVK runtime configuration (root cause T) ----
+    // Set critical MoltenVK environment variables BEFORE vkCreateInstance.
+    // MoltenVK reads these once during instance creation; setting them after
+    // has no effect. Amethyst-iOS sets these explicitly for stability.
+    //
+    // MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=1: vkQueueSubmit blocks until
+    //   encoding is complete. Prevents submit races on iOS. (MoltenVK default
+    //   is 1, but we set it explicitly for determinism.)
+    //
+    // MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1: Pre-fill Metal command
+    //   buffers at vkQueueSubmit time instead of deferring to present time.
+    //   This ensures the Metal command buffer (and its IOSurface bindings)
+    //   are fully encoded before present, avoiding races where the present
+    //   engine reads an unbound IOSurface. Amethyst sets this for stability.
+    //
+    // MVK_CONFIG_RESUME_LOST_DEVICE=1: Automatically attempt to recover from
+    //   VK_ERROR_DEVICE_LOST by re-creating the VkDevice. Without this, a
+    //   single GPU error permanently kills rendering (black screen forever).
+    //
+    // MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y=1: MoltenVK flips vertex Y
+    //   during SPIR-V→MSL translation to account for GL(Vulkan) vs Metal NDC
+    //   differences. Our viewport code passes GL coordinates unchanged and
+    //   relies on this flip. (MoltenVK default is 1, set explicitly.)
+    setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 1);
+    setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "1", 1);
+    setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 1);
+    setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "1", 1);
 
     // ---- Instance ----
     std::vector<VkExtensionProperties> instExtProps;

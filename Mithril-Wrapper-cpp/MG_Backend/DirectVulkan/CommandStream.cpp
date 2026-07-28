@@ -571,6 +571,80 @@ void commit_frame() {
         return;
     }
 
+    // FIX (root cause S): If we are about to present but NO draw commands were
+    // recorded this frame (hasCommands=false), the swapchain image was never
+    // used as a render target. On MoltenVK/iOS, the IOSurface backing the
+    // swapchain image is lazily bound the first time the image is used as a
+    // color attachment in a render pass. If we present without ever rendering
+    // to it, MoltenVK presents a drawable whose IOSurface was never bound →
+    // the Metal driver's IOSurfaceBindAccel dereferences an uninitialized
+    // IOSurface → SIGSEGV or silent black screen.
+    //
+    // This happens on the first frame when the swapchain is created lazily
+    // (eglMakeCurrent failed because the window wasn't sized, so eglSwapBuffers
+    // creates the swapchain — but the app already finished rendering with no
+    // color attachment, so no draw commands were recorded).
+    //
+    // Fix: if we need to present (needsLayoutTransition or needsImageAvailableWait)
+    // but have no draw commands, insert a minimal dynamic-rendering pass that
+    // touches the swapchain color attachment. This forces MoltenVK to bind the
+    // IOSurface as a render target, making the subsequent present safe.
+    // MobileGL avoids this because its TransitionToPresent path still records
+    // a real command buffer with a layout barrier, and traditional VkRenderPass
+    // ensures attachment binding happens during render pass begin.
+    if (sc && !hasCommands && (needsLayoutTransition || needsImageAvailableWait)) {
+        // Insert a dummy render pass: BeginRendering with DONT_CARE loadOp,
+        // no draws, EndRendering. This is enough to trigger IOSurface binding
+        // in MoltenVK without clearing or modifying the image contents.
+        if (sc->currentImage >= 0 && sc->currentImage < (int)sc->views.size() &&
+            sc->views[sc->currentImage] != VK_NULL_HANDLE) {
+            // Ensure the image is in COLOR_ATTACHMENT_OPTIMAL first (if it
+            // isn't already). The layout transition below (needsLayoutTransition)
+            // will handle COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR.
+            if (sc->currentColorLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+                sc->currentColorLayout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+                record_layout_barrier(b->commandBuffer,
+                                      sc->images[sc->currentImage], sc->format,
+                                      sc->currentColorLayout,
+                                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                      /*isDepthStencil=*/false);
+                sc->currentColorLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            }
+            // Minimal render pass to trigger IOSurface binding.
+            VkRenderingAttachmentInfoKHR dummyAttach{};
+            dummyAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+            dummyAttach.imageView = sc->views[sc->currentImage];
+            dummyAttach.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            dummyAttach.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            dummyAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfoKHR dummyRI{};
+            dummyRI.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
+            dummyRI.renderArea.offset.x = 0;
+            dummyRI.renderArea.offset.y = 0;
+            dummyRI.renderArea.extent.width = sc->width;
+            dummyRI.renderArea.extent.height = sc->height;
+            dummyRI.layerCount = 1;
+            dummyRI.colorAttachmentCount = 1;
+            dummyRI.pColorAttachments = &dummyAttach;
+            static PFN_vkCmdBeginRenderingKHR beginFn = nullptr;
+            static PFN_vkCmdEndRenderingKHR endFn = nullptr;
+            if (!beginFn) {
+                beginFn = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(b->device, "vkCmdBeginRendering");
+                if (!beginFn) beginFn = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(b->device, "vkCmdBeginRenderingKHR");
+            }
+            if (!endFn) {
+                endFn = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(b->device, "vkCmdEndRendering");
+                if (!endFn) endFn = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(b->device, "vkCmdEndRenderingKHR");
+            }
+            if (beginFn) beginFn(b->commandBuffer, &dummyRI);
+            if (endFn) endFn(b->commandBuffer);
+            // After the dummy pass, the image is in COLOR_ATTACHMENT_OPTIMAL.
+            // The needsLayoutTransition block below will transition it to
+            // PRESENT_SRC_KHR for present.
+            needsLayoutTransition = true;
+        }
+    }
+
     // The command buffer is guaranteed to be in the recording state here —
     // ensure_command_buffer_recording() at the top of this function took care
     // of it (including the fence wait, reset, and begin). The old defensive
