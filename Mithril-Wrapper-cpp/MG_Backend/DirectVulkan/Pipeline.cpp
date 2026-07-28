@@ -530,10 +530,15 @@ void delete_program_resources(GLuint program) {
     pr.pipelines.clear();
     if (pr.vertexModule)   { vkDestroyShaderModule(b->device, pr.vertexModule, nullptr);   pr.vertexModule = VK_NULL_HANDLE; }
     if (pr.fragmentModule) { vkDestroyShaderModule(b->device, pr.fragmentModule, nullptr); pr.fragmentModule = VK_NULL_HANDLE; }
-    // Descriptor resources built by ensure_program_layouts. The pool must be
-    // destroyed before the set layout it was created from (Vulkan ordering);
+    // Descriptor resources built by ensure_program_layouts. Pools must be
+    // destroyed before the set layout they were created from (Vulkan ordering);
     // destroying a pool implicitly frees all sets allocated from it.
-    if (pr.descriptorPool)      { vkDestroyDescriptorPool(b->device, pr.descriptorPool, nullptr);      pr.descriptorPool = VK_NULL_HANDLE; }
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (pr.descriptorPools[i]) {
+            vkDestroyDescriptorPool(b->device, pr.descriptorPools[i], nullptr);
+            pr.descriptorPools[i] = VK_NULL_HANDLE;
+        }
+    }
     if (pr.pipelineLayout)      { vkDestroyPipelineLayout(b->device, pr.pipelineLayout, nullptr);      pr.pipelineLayout = VK_NULL_HANDLE; }
     if (pr.descriptorSetLayout) { vkDestroyDescriptorSetLayout(b->device, pr.descriptorSetLayout, nullptr); pr.descriptorSetLayout = VK_NULL_HANDLE; }
     pr.bindings.clear();

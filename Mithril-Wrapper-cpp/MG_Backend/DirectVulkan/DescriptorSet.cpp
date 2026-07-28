@@ -96,10 +96,12 @@ void ensure_program_layouts(GLuint program,
         return;
     }
 
-    // ---- VkDescriptorPool ----
-    // maxSets=256, 256 descriptors per type (per task spec). The pool is reset
-    // once per frame in bind_program_descriptors(), so 256 sets amortise across
-    // a frame's draws; a mid-frame exhaustion triggers a reset+retry.
+    // ---- VkDescriptorPool (one per frame-in-flight slot) ----
+    // maxSets=256, 256 descriptors per type, PER SLOT. Each slot's pool is
+    // reset on the first draw of a new frameGeneration for that slot (see
+    // bind_program_descriptors). Per-slot pools prevent the UAF where a shared
+    // pool reset invalidated descriptor sets still referenced by an in-flight
+    // command buffer on another slot.
     bool hasUBO = false, hasImg = false;
     for (const auto& db : pr.bindings) {
         if (db.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) hasUBO = true;
@@ -123,9 +125,12 @@ void ensure_program_layouts(GLuint program,
     dpci.maxSets = 256;
     dpci.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     dpci.pPoolSizes = poolSizes.data();
-    if (vkCreateDescriptorPool(b->device, &dpci, nullptr, &pr.descriptorPool) != VK_SUCCESS) {
-        MITHRIL_LOG_WARN("vk", "vkCreateDescriptorPool failed (program %u)", program);
-        // Layout is still valid; bind_program_descriptors will no-op without a pool.
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (vkCreateDescriptorPool(b->device, &dpci, nullptr, &pr.descriptorPools[i]) != VK_SUCCESS) {
+            MITHRIL_LOG_WARN("vk", "vkCreateDescriptorPool failed (program %u, slot %d)", program, i);
+            pr.descriptorPools[i] = VK_NULL_HANDLE;
+            // Layout is still valid; bind_program_descriptors skips slots with a null pool.
+        }
     }
 }
 
@@ -272,42 +277,55 @@ void bind_program_descriptors(GLuint program) {
     auto it = tbl.find(program);
     if (it == tbl.end()) return;
     ProgramResources& pr = it->second;
+    int slot = b->currentFrame;
     if (!pr.layoutsBuilt || pr.bindings.empty() ||
-        pr.pipelineLayout == VK_NULL_HANDLE || pr.descriptorPool == VK_NULL_HANDLE) {
+        pr.pipelineLayout == VK_NULL_HANDLE ||
+        pr.descriptorPools[slot] == VK_NULL_HANDLE) {
         return;
     }
 
     mithril::Program* prog = mithril::state_get_program(program);
     if (!prog) return;
 
-    // Per-frame pool reset. commit_frame() waits on the previous frame's fence
-    // (so the prior frame's sets are no longer in-flight) and then bumps the
-    // monotonic frameGeneration. We reset this program's pool on the first draw
-    // of each new generation and reuse it for the rest of the frame; a program
-    // drawn only on every other frame still gets reset because the monotonic
-    // counter never repeats (unlike the cycling currentFrame). Within a frame
-    // frameGeneration is constant, so this never resets mid-frame.
-    if (pr.lastResetGen != b->frameGeneration) {
-        vkResetDescriptorPool(b->device, pr.descriptorPool, 0);
-        pr.lastResetGen = b->frameGeneration;
+    // Per-slot pool reset. ensure_command_buffer_recording() (called above,
+    // line 274) has ALREADY waited on frameFences[currentFrame] before this
+    // point — so the command buffer submitted to this slot kMaxFramesInFlight
+    // frames ago, and all of MoltenVK's Metal encoding of its descriptor
+    // references, is guaranteed complete on the GPU. Resetting this slot's
+    // pool is therefore safe: no in-flight command buffer references the sets
+    // being invalidated.
+    //
+    // (The previous shared-pool design reset a single pool across all slots
+    // on the first draw of a new frameGeneration, which invalidated descriptor
+    // sets still referenced by the just-submitted slot's in-flight command
+    // buffer — a UAF that crashed MoltenVK's Metal encoder in
+    // MVKGraphicsResourcesCommandEncoderState::encodeImpl at the next
+    // vkEndCommandBuffer, SIGSEGV in objc_msgSend.)
+    if (pr.lastResetGen[slot] != b->frameGeneration) {
+        vkResetDescriptorPool(b->device, pr.descriptorPools[slot], 0);
+        pr.lastResetGen[slot] = b->frameGeneration;
     }
 
-    // Allocate a fresh set for this draw.
+    // Allocate a fresh set for this draw from the current slot's pool.
     VkDescriptorSetAllocateInfo dsai{};
     dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool = pr.descriptorPool;
+    dsai.descriptorPool = pr.descriptorPools[slot];
     dsai.descriptorSetCount = 1;
     dsai.pSetLayouts = &pr.descriptorSetLayout;
     VkDescriptorSet set = VK_NULL_HANDLE;
     if (vkAllocateDescriptorSets(b->device, &dsai, &set) != VK_SUCCESS) {
-        // Pool exhausted mid-frame (more than 256 distinct sets this frame):
-        // reset and retry once. Acceptable for bring-up; a fully correct impl
-        // would grow the pool or pool-set per frame.
-        vkResetDescriptorPool(b->device, pr.descriptorPool, 0);
-        if (vkAllocateDescriptorSets(b->device, &dsai, &set) != VK_SUCCESS) {
-            MITHRIL_LOG_WARN("vk", "vkAllocateDescriptorSets failed (program %u)", program);
-            return;
-        }
+        // Pool exhausted mid-frame (>256 distinct sets this frame for this
+        // program). Do NOT reset-and-retry: that would invalidate descriptor
+        // sets already bound into the current frame's command buffer while it
+        // is still being recorded (a UAF under
+        // MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1). Skip the bind for this
+        // draw; the shader will read stale/undefined bindings, which is
+        // preferable to crashing.
+        MITHRIL_LOG_WARN("vk", "vkAllocateDescriptorSets failed (program %u, slot %d, "
+                          "gen %llu) — descriptor pool exhausted; skipping descriptor "
+                          "bind for this draw",
+                          program, slot, (unsigned long long)b->frameGeneration);
+        return;
     }
 
     // Gather descriptor writes. The info vectors are reserved to the binding

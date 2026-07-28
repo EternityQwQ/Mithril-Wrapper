@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "DescriptorSet.h"
+#include "Device.h"       // kMaxFramesInFlight
 #include "../Backend.h"   // defines ::MGVertexAttrib (extern "C", global scope)
 
 namespace mithril {
@@ -47,13 +48,26 @@ struct ProgramResources {
     // ---- Descriptor set management (built once by ensure_program_layouts) ----
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout      pipelineLayout = VK_NULL_HANDLE;
-    VkDescriptorPool      descriptorPool = VK_NULL_HANDLE;
+    // One pool per frame-in-flight slot. bind_program_descriptors() resets
+    // descriptorPools[b->currentFrame] on the first draw of a new frameGeneration.
+    // This is safe because ensure_command_buffer_recording() has already waited
+    // on frameFences[currentFrame] — guaranteeing the GPU work (and MoltenVK's
+    // Metal encoding of descriptor references) submitted to this slot
+    // kMaxFramesInFlight frames ago is complete. A single shared pool reset
+    // across all slots was a UAF: it invalidated descriptor sets still
+    // referenced by the just-submitted slot's in-flight command buffer,
+    // crashing MoltenVK's Metal encoder in
+    // MVKGraphicsResourcesCommandEncoderState::encodeImpl at the next
+    // vkEndCommandBuffer (SIGSEGV in objc_msgSend on a zombie
+    // MTLBuffer/MTLTexture).
+    VkDescriptorPool      descriptorPools[kMaxFramesInFlight] = {};
     std::vector<DescriptorBinding> bindings;  // reflected VS+FS binding set
     bool layoutsBuilt = false;
-    // Monotonic frame-generation value (see advance_frame_generation()) at
-    // which this program's descriptor pool was last reset. bind_program_descriptors()
-    // resets the pool once per frame so sets can be reused across frames.
-    uint64_t lastResetGen = 0;
+    // Per-slot monotonic frame-generation value at which each slot's pool was
+    // last reset. A program drawn only on alternate frames still resets the
+    // correct slot's pool on its next use (the per-slot gen lags the global
+    // gen until the slot is actually revisited).
+    uint64_t lastResetGen[kMaxFramesInFlight] = {};
 };
 
 // Accessor for the per-program resource table (keyed by GL program name).
