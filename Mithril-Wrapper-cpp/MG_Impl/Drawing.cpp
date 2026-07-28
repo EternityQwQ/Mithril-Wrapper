@@ -152,16 +152,30 @@ static void prepare_draw(GLenum mode) {
     backend_set_viewport(g_state->viewportX, g_state->viewportY,
                          g_state->viewportW, g_state->viewportH,
                          g_state->depthNear, g_state->depthFar);
+    // FIX (root cause G): ALWAYS set the scissor. VK_DYNAMIC_STATE_SCISSOR is
+    // a dynamic state (Pipeline.cpp), so it MUST be set via vkCmdSetScissor
+    // before drawing. When scissorTest is disabled, the old code skipped the
+    // call entirely, leaving the dynamic scissor at its undefined default
+    // (0,0,0,0) — which clips ALL pixels → black screen. MobileGL always
+    // sets a scissor (full viewport when GL_SCISSOR_TEST is off).
     if (g_state->scissorTest) {
         backend_set_scissor(g_state->scissorX, g_state->scissorY,
                             g_state->scissorW, g_state->scissorH);
+    } else {
+        backend_set_scissor(0, 0, g_state->viewportW, g_state->viewportH);
     }
+    // FIX (root cause H): ALWAYS set cull mode. VK_DYNAMIC_STATE_CULL_MODE is
+    // dynamic; skipping the call when cullFace is disabled leaves the previous
+    // draw's cull mode active → stale culling culls geometry incorrectly.
+    // When cullFace is off, explicitly set VK_CULL_MODE_NONE.
     if (g_state->cullFace) {
         int mode_cull = 0;
         if (g_state->cullMode == GL_FRONT) mode_cull = 1;
         else if (g_state->cullMode == GL_BACK) mode_cull = 2;
         backend_set_cull_mode(mode_cull);
         backend_set_front_face(g_state->frontFace == GL_CCW ? 1 : 0);
+    } else {
+        backend_set_cull_mode(0);  // VK_CULL_MODE_NONE
     }
     backend_set_color_write_mask(
         g_state->colorMask[0], g_state->colorMask[1],
