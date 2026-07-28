@@ -538,9 +538,19 @@ void commit_frame() {
     bool needsLayoutTransition = false;
     bool needsImageAvailableWait = false;
     if (sc && sc->currentImage >= 0 && sc->currentImage < (int)sc->images.size()) {
-        if (sc->currentColorLayout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
-            sc->currentColorLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
-            sc->currentColorLayout != VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR) {
+        // FIX (root cause N): present requires the image to be in
+        // PRESENT_SRC_KHR layout. The old code EXCLUDED UNDEFINED from the
+        // transition check, assuming begin_render_pass would always transition
+        // UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL first. But when the swapchain
+        // is created lazily (eglMakeCurrent failed because the window wasn't
+        // sized yet, so eglSwapBuffers creates it), the first frame has NO
+        // draw commands — the image stays UNDEFINED and is presented directly,
+        // which is spec-illegal and crashes MoltenVK's IOSurfaceBindAccel
+        // (SIGSEGV) because the IOSurface was never properly bound as a
+        // render target. Now we transition to PRESENT_SRC_KHR whenever the
+        // layout is not already PRESENT_SRC_KHR (UNDEFINED -> PRESENT_SRC is
+        // a legal, content-discarding barrier).
+        if (sc->currentColorLayout != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
             needsLayoutTransition = true;
         }
         needsImageAvailableWait = !sc->imageAvailableConsumed;
