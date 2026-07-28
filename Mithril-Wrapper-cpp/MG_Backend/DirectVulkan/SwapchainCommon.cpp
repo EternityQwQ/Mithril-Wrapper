@@ -176,11 +176,19 @@ pm_done:
     semi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
     vkCreateSemaphore(b->device, &semi, nullptr, &sc->imageAvailable);
 
-    // Render-finished semaphore signaled by commit_frame()'s vkQueueSubmit
-    // and waited on by swapchain_present_and_acquire()'s vkQueuePresentKHR.
-    // Pairs the submit→present dependency that imageAvailable alone cannot
-    // express (imageAvailable is signaled by acquire, not by render).
-    vkCreateSemaphore(b->device, &semi, nullptr, &sc->pendingRenderFinished);
+    // Per-swapchain-image render-finished semaphores. One per swapchain image
+    // so present always waits on the exact semaphore signaled by the submit
+    // that rendered into the image being presented. Mirrors MobileGL's
+    // FrameContext (m_swapchainImageRenderFinishedSemaphores, FrameContext.h:122).
+    // A single per-swapchain semaphore races under triple buffering: image A's
+    // submit signals it, then image B's submit re-signals before present
+    // consumes A's signal → present of A reads stale pixels (black screen) or
+    // hits a spec violation (re-signaling a signaled binary semaphore).
+    sc->renderFinishedPerImage.resize(imgCount2);
+    sc->renderFinishedSignaledPerImage.assign(imgCount2, false);
+    for (uint32_t i = 0; i < imgCount2; ++i) {
+        vkCreateSemaphore(b->device, &semi, nullptr, &sc->renderFinishedPerImage[i]);
+    }
 
     // Depth/stencil image (VK_FORMAT_D32_SFLOAT_S8_UINT).
     if (want_depth_stencil) {
@@ -270,8 +278,11 @@ void destroy_swapchain(Swapchain* sc) {
     sc->views.clear();
     sc->images.clear();
     if (sc->imageAvailable) { vkDestroySemaphore(b->device, sc->imageAvailable, nullptr); sc->imageAvailable = VK_NULL_HANDLE; }
-    if (sc->pendingRenderFinished) { vkDestroySemaphore(b->device, sc->pendingRenderFinished, nullptr); sc->pendingRenderFinished = VK_NULL_HANDLE; }
-    sc->renderFinishedSignaled = false;
+    for (auto& sem : sc->renderFinishedPerImage) {
+        if (sem) { vkDestroySemaphore(b->device, sem, nullptr); sem = VK_NULL_HANDLE; }
+    }
+    sc->renderFinishedPerImage.clear();
+    sc->renderFinishedSignaledPerImage.clear();
     if (sc->swapchain) { vkDestroySwapchainKHR(b->device, sc->swapchain, nullptr); sc->swapchain = VK_NULL_HANDLE; }
     if (sc->surface)   { vkDestroySurfaceKHR(b->instance, sc->surface, nullptr); sc->surface = VK_NULL_HANDLE; }
     delete sc;
@@ -347,9 +358,9 @@ void swapchain_present_and_acquire(Swapchain* sc) {
         uint32_t idx = (uint32_t)sc->currentImage;
         VkPresentInfoKHR pi{};
         pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        // Wait on renderFinished ONLY (NOT imageAvailable). This mirrors
-        // MobileGL's GetPresentInfo (FrameContext.cpp:208), which sets
-        // waitSemaphoreCount=1 on the per-image renderFinished semaphore.
+        // Wait on renderFinishedPerImage[currentImage] ONLY (NOT imageAvailable).
+        // This mirrors MobileGL's GetPresentInfo (FrameContext.cpp:208), which
+        // sets waitSemaphoreCount=1 on the per-image renderFinished semaphore.
         //
         // Why NOT imageAvailable: imageAvailable is the acquire semaphore,
         // signaled by vkAcquireNextImageKHR and consumed by commit_frame()'s
@@ -362,14 +373,18 @@ void swapchain_present_and_acquire(Swapchain* sc) {
         // was signaled at acquire time, long before any draw commands ran.
         //
         // Only wait on renderFinished if commit_frame() actually signaled it
-        // this frame (renderFinishedSignaled). If commit_frame skipped submit
-        // (no commands, no layout transition, imageAvailable already consumed
-        // by a previous mid-frame flush), then there is no render work to wait
-        // on and present proceeds without a wait — which is correct because
-        // the image is already in PRESENT_SRC_KHR and no GPU work touches it.
+        // for THIS image this frame (renderFinishedSignaledPerImage[idx]). If
+        // commit_frame skipped submit (no commands, no layout transition,
+        // imageAvailable already consumed by a previous mid-frame flush), then
+        // there is no render work to wait on and present proceeds without a
+        // wait — which is correct because the image is already in
+        // PRESENT_SRC_KHR and no GPU work touches it.
         VkSemaphore waitSemaphore = VK_NULL_HANDLE;
-        if (sc->renderFinishedSignaled && sc->pendingRenderFinished != VK_NULL_HANDLE) {
-            waitSemaphore = sc->pendingRenderFinished;
+        if (idx < sc->renderFinishedSignaledPerImage.size() &&
+            sc->renderFinishedSignaledPerImage[idx] &&
+            idx < sc->renderFinishedPerImage.size() &&
+            sc->renderFinishedPerImage[idx] != VK_NULL_HANDLE) {
+            waitSemaphore = sc->renderFinishedPerImage[idx];
             pi.waitSemaphoreCount = 1;
             pi.pWaitSemaphores = &waitSemaphore;
         }
@@ -402,13 +417,16 @@ void swapchain_present_and_acquire(Swapchain* sc) {
                                   "swapchain for rebuild", (int)r);
             }
         }
-        // The render-finished signal has now been consumed by present (or, on
-        // failure, will never be consumed — but we clear the flag either way
-        // so the next commit_frame() can signal again). Without this clear,
-        // a failed present would leave renderFinishedSignaled=true forever,
-        // and the next commit_frame would skip signaling (UB: present waits
-        // on a semaphore that was never signaled).
-        sc->renderFinishedSignaled = false;
+        // The render-finished signal for THIS image has now been consumed by
+        // present (or, on failure, will never be consumed — but we clear the
+        // flag either way so the next commit_frame() rendering into this image
+        // can signal again). Without this clear, a failed present would leave
+        // renderFinishedSignaledPerImage[idx]=true forever, and the next
+        // commit_frame would skip signaling (UB: present waits on a semaphore
+        // that was never signaled).
+        if (idx < sc->renderFinishedSignaledPerImage.size()) {
+            sc->renderFinishedSignaledPerImage[idx] = false;
+        }
         sc->currentImage = -1;
     }
 

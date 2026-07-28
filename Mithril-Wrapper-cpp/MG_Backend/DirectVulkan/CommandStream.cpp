@@ -38,7 +38,7 @@ struct EncoderState {
     // nullptr when no EGLSurface is current (headless) or the active FBO is
     // a user-created framebuffer object. Set by EGL after each acquire; read
     // by begin_render_pass() / commit_frame() to record layout barriers and
-    // signal pendingRenderFinished.
+    // signal the per-image renderFinished semaphore.
     Swapchain* activeSwapchain = nullptr;
 
     // True once any command has been recorded into the current command buffer
@@ -720,16 +720,28 @@ void commit_frame() {
     }
 
     // ---- Signal renderFinished so present can wait on it ----
-    // Always signal (if not already signaled this frame) so present has a
-    // semaphore to wait on. Without this, present would either wait on a
-    // never-signaled semaphore (hang) or skip the wait (race). MobileGL's
-    // GetSubmitInfo unconditionally sets signalSemaphoreCount=1
-    // (FrameContext.cpp:196).
+    // Signal the per-image render-finished semaphore for the image we just
+    // rendered into. This mirrors MobileGL's GetSubmitInfo (FrameContext.cpp:196),
+    // which signals m_swapchainImageRenderFinishedSemaphores[swapchainImageIndex].
+    //
+    // Per-image (not per-frame-slot or per-swapchain) signaling is essential:
+    // present must wait on the exact semaphore signaled by the submit that
+    // rendered into THIS image. A single shared semaphore races under triple
+    // buffering (image A's submit signals it, then image B's submit re-signals
+    // before present consumes A's signal → black screen or spec violation).
+    //
+    // Only signal if not already signaled for THIS image this frame (a binary
+    // semaphore cannot be re-signaled while still signaled). renderFinished
+    // SignaledPerImage[currentImage] is cleared by swapchain_present_and_acquire
+    // after present consumes the signal.
     VkSemaphore signalSemaphore = VK_NULL_HANDLE;
-    if (sc && sc->pendingRenderFinished != VK_NULL_HANDLE &&
-        !sc->renderFinishedSignaled) {
-        signalSemaphore = sc->pendingRenderFinished;
-        sc->renderFinishedSignaled = true;
+    if (sc && sc->currentImage >= 0 &&
+        (size_t)sc->currentImage < sc->renderFinishedPerImage.size() &&
+        sc->renderFinishedPerImage[sc->currentImage] != VK_NULL_HANDLE &&
+        (size_t)sc->currentImage < sc->renderFinishedSignaledPerImage.size() &&
+        !sc->renderFinishedSignaledPerImage[sc->currentImage]) {
+        signalSemaphore = sc->renderFinishedPerImage[sc->currentImage];
+        sc->renderFinishedSignaledPerImage[sc->currentImage] = true;
     }
     if (signalSemaphore != VK_NULL_HANDLE) {
         si.signalSemaphoreCount = 1;
@@ -776,7 +788,13 @@ void commit_frame() {
         // these rollbacks, the state would be inconsistent (e.g. next submit
         // would skip the imageAvailable wait, racing the presenter again).
         if (sc) {
-            sc->renderFinishedSignaled = false;
+            // Roll back the per-image render-finished signal flag for the
+            // image we tried (and failed) to render into, so the next
+            // commit_frame() can signal it again.
+            if (sc->currentImage >= 0 &&
+                (size_t)sc->currentImage < sc->renderFinishedSignaledPerImage.size()) {
+                sc->renderFinishedSignaledPerImage[sc->currentImage] = false;
+            }
             // imageAvailableConsumed stays false (we never set it true on
             // failure) — correct, the next submit should still wait.
             sc->needsRebuild = true;

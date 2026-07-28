@@ -43,19 +43,30 @@ struct Swapchain {
     // layout-transition barrier + draw commands execute.
     VkSemaphore     imageAvailable = VK_NULL_HANDLE;
 
-    // Render-finished semaphore signaled by the submit that runs the frame's
-    // command buffer. vkQueuePresentKHR waits on this (not imageAvailable) so
-    // the present only proceeds once rendering is complete. Set by
-    // commit_frame() each frame; read by swapchain_present_and_acquire().
-    VkSemaphore     pendingRenderFinished = VK_NULL_HANDLE;
+    // Per-swapchain-image render-finished semaphores. vkQueueSubmit signals
+    // renderFinishedPerImage[currentImage] when the frame's command buffer
+    // completes; vkQueuePresentKHR waits on the SAME per-image semaphore.
+    //
+    // This mirrors MobileGL's FrameContext
+    // (m_swapchainImageRenderFinishedSemaphores, FrameContext.h:122), which
+    // indexes renderFinished by SWAPCHAIN IMAGE (not by frame slot). The
+    // per-image design is essential because present must wait on the
+    // semaphore that was signaled by the submit which rendered into THIS
+    // specific image. A single per-swapchain (or per-frame-slot) semaphore
+    // races: if image A's submit signals it and image B's submit re-signals
+    // before present consumes A's signal, present of A reads stale pixels
+    // (black screen) or hits a spec violation (signaling an already-signaled
+    // binary semaphore). One semaphore per swapchain image guarantees the
+    // submit->present dependency is always expressed on the correct edge.
+    std::vector<VkSemaphore> renderFinishedPerImage;
 
-    // Tracks whether pendingRenderFinished has been signaled but not yet
-    // waited on. vkQueueSubmit signals a binary semaphore; signaling one that
-    // is already signaled is spec-violating and accumulates unconsumed
-    // signals. commit_frame() only signals when this is false; sets it true.
+    // Per-image flag: whether renderFinishedPerImage[i] has been signaled but
+    // not yet waited on by present. vkQueueSubmit signals a binary semaphore;
+    // signaling one that is already signaled is spec-violating. commit_frame()
+    // sets this true when it signals renderFinishedPerImage[currentImage];
     // swapchain_present_and_acquire() clears it after vkQueuePresentKHR
-    // consumes the signal. Also cleared by destroy_swapchain().
-    bool            renderFinishedSignaled = false;
+    // consumes the signal.
+    std::vector<bool> renderFinishedSignaledPerImage;
 
     // Tracks whether imageAvailable has been consumed by a vkQueueSubmit wait
     // this frame. vkAcquireNextImageKHR signals imageAvailable; the FIRST

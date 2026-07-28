@@ -35,7 +35,7 @@ void set_load_clear(bool clear);   // true = CLEAR (glClear), false = LOAD
  * DEPTH_STENCIL_ATTACHMENT_OPTIMAL barrier on the depth image); commit_frame()
  * uses it to record the reverse COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
  * barrier before vkEndCommandBuffer, and to signal the swapchain's
- * pendingRenderFinished semaphore on vkQueueSubmit so vkQueuePresentKHR can
+ * per-image renderFinished semaphore on vkQueueSubmit so vkQueuePresentKHR can
  * wait on it. Pass nullptr to detach (headless / no surface).
  */
 void set_active_swapchain(Swapchain* sc);

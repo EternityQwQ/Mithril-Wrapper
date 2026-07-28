@@ -48,26 +48,33 @@ struct ProgramResources {
     // ---- Descriptor set management (built once by ensure_program_layouts) ----
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout      pipelineLayout = VK_NULL_HANDLE;
-    // One pool per frame-in-flight slot. bind_program_descriptors() resets
-    // descriptorPools[b->currentFrame] on the first draw of a new frameGeneration.
-    // This is safe because ensure_command_buffer_recording() has already waited
-    // on frameFences[currentFrame] — guaranteeing the GPU work (and MoltenVK's
-    // Metal encoding of descriptor references) submitted to this slot
-    // kMaxFramesInFlight frames ago is complete. A single shared pool reset
-    // across all slots was a UAF: it invalidated descriptor sets still
-    // referenced by the just-submitted slot's in-flight command buffer,
-    // crashing MoltenVK's Metal encoder in
-    // MVKGraphicsResourcesCommandEncoderState::encodeImpl at the next
-    // vkEndCommandBuffer (SIGSEGV in objc_msgSend on a zombie
-    // MTLBuffer/MTLTexture).
+    // One pool per frame-in-flight slot, created with
+    // VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT. bind_program_descriptors()
+    // reuses cached sets via cursor rewind (see allocatedSets/setCursor below)
+    // instead of vkResetDescriptorPool — the latter requires all in-flight sets
+    // to be complete (VUID-vkResetDescriptorPool-descriptorPool-00313), and even
+    // though ensure_command_buffer_recording() waits on the slot's fence before
+    // we touch the pool, avoiding reset entirely is more robust against any
+    // future code path that might allocate mid-frame. This mirrors MobileGL's
+    // UniformManager (UniformManager.cpp:183,1026), which also avoids
+    // vkResetDescriptorPool in favor of cursor rewind + set reuse.
     VkDescriptorPool      descriptorPools[kMaxFramesInFlight] = {};
     std::vector<DescriptorBinding> bindings;  // reflected VS+FS binding set
     bool layoutsBuilt = false;
-    // Per-slot monotonic frame-generation value at which each slot's pool was
-    // last reset. A program drawn only on alternate frames still resets the
-    // correct slot's pool on its next use (the per-slot gen lags the global
-    // gen until the slot is actually revisited).
-    uint64_t lastResetGen[kMaxFramesInFlight] = {};
+    // Per-slot cached descriptor sets + rewind cursor. At the start of each
+    // frame (detected via lastFrameGen != b->frameGeneration), the cursor is
+    // rewound to 0. Subsequent draws in that frame reuse
+    // allocatedSets[slot][cursor++] if available, or vkAllocateDescriptorSets
+    // a new set and appends it. The pool's FREE_DESCRIPTOR_SET_BIT flag keeps
+    // the option open to vkFreeDescriptorSets a destroyed layout's cached
+    // sets, though in practice we never free individual sets — the pool is
+    // destroyed wholesale on program deletion (which implicitly frees all
+    // sets allocated from it). Rewind is safe because it runs after the
+    // slot's fence wait in ensure_command_buffer_recording(), so no in-flight
+    // command buffer references the reused sets.
+    std::vector<VkDescriptorSet> allocatedSets[kMaxFramesInFlight];
+    size_t    setCursor[kMaxFramesInFlight] = {};
+    uint64_t  lastFrameGen[kMaxFramesInFlight] = {};
 };
 
 // Accessor for the per-program resource table (keyed by GL program name).

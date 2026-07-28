@@ -532,8 +532,13 @@ void delete_program_resources(GLuint program) {
     if (pr.fragmentModule) { vkDestroyShaderModule(b->device, pr.fragmentModule, nullptr); pr.fragmentModule = VK_NULL_HANDLE; }
     // Descriptor resources built by ensure_program_layouts. Pools must be
     // destroyed before the set layout they were created from (Vulkan ordering);
-    // destroying a pool implicitly frees all sets allocated from it.
+    // destroying a pool implicitly frees all sets allocated from it, so the
+    // per-slot allocatedSets caches just need to be cleared (no per-set
+    // vkFreeDescriptorSets — the pool destruction reclaims them wholesale).
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        pr.allocatedSets[i].clear();
+        pr.setCursor[i] = 0;
+        pr.lastFrameGen[i] = 0;
         if (pr.descriptorPools[i]) {
             vkDestroyDescriptorPool(b->device, pr.descriptorPools[i], nullptr);
             pr.descriptorPools[i] = VK_NULL_HANDLE;

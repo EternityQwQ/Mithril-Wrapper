@@ -235,7 +235,7 @@ bool ensure_swapchain(EglSurface* s) {
 // record the PRESENT_SRC/UNDEFINED <-> COLOR_ATTACHMENT_OPTIMAL layout barriers
 // on the swapchain color image, the one-shot UNDEFINED ->
 // DEPTH_STENCIL_ATTACHMENT_OPTIMAL barrier on the depth image, and signal the
-// swapchain's pendingRenderFinished semaphore on submit. Without this
+// swapchain's per-image renderFinished semaphore on submit. Without this
 // registration, dynamic rendering would hard-code COLOR_ATTACHMENT_OPTIMAL on
 // an image that is actually in PRESENT_SRC_KHR (or UNDEFINED on first use),
 // which MoltenVK treats as an illegal layout and renders nothing (black screen).
@@ -256,7 +256,7 @@ void install_surface_on_state(EglSurface* s) {
         g_state->eglDefaultWidth  = s->width;
         g_state->eglDefaultHeight = s->height;
         // Register the swapchain with the encoder so it can record layout
-        // barriers and signal pendingRenderFinished. Only register when the
+        // barriers and signal renderFinishedPerImage. Only register when the
         // surface actually has an acquired color view (color != VK_NULL_HANDLE)
         // — passing a swapchain whose acquire failed would crash the barrier
         // recorder, which dereferences sc->images[sc->currentImage].
@@ -761,7 +761,17 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     // IOSurfaceBindAccel SIGSEGV seen in the field. The correct order is:
     // present the already-rendered frame against the current (still-valid)
     // swapchain, THEN tear down + recreate for the next frame.
-    if (s->swapchain_state) {
+    //
+    // ZERO-AREA GUARD: if the native window has collapsed to 0x0 (iOS app
+    // backgrounded / view minimized / snapshot not yet sized), skip present
+    // entirely. Mirrors MobileGL commit 7ab8386: presenting against an
+    // out-of-date swapchain from a zero-area window previously let Present
+    // submit on an already-signaled fence and present an image that was
+    // never properly acquired → black screen with sound. Skipping present
+    // here lets the resize/rebuild path below recreate the swapchain at the
+    // new (non-zero) size on the next swap.
+    bool zero_area = (s->width <= 0 || s->height <= 0);
+    if (s->swapchain_state && !zero_area) {
         backend_present_and_acquire(s->swapchain_state);
     }
 
@@ -798,7 +808,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     // Re-install the (possibly new) swapchain's current image on the GLState
     // so the next frame's draws land on a valid drawable. This also re-
     // registers the swapchain with the encoder (backend_set_active_swapchain)
-    // so layout barriers + pendingRenderFinished signaling work next frame.
+    // so layout barriers + per-image renderFinished signaling work next frame.
     if (s->swapchain_state && t_currentDraw == s) {
         install_surface_on_state(s);
     }

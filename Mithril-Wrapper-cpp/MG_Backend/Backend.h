@@ -95,7 +95,7 @@ void backend_commit(void);
  * it to record the PRESENT_SRC/UNDEFINED <-> COLOR_ATTACHMENT_OPTIMAL layout
  * barriers on the swapchain color image, the one-shot UNDEFINED ->
  * DEPTH_STENCIL_ATTACHMENT_OPTIMAL barrier on the depth image, and to signal
- * the swapchain's pendingRenderFinished semaphore on submit. Pass nullptr
+ * the swapchain's per-image renderFinished semaphore on submit. Pass nullptr
  * when no surface is current (headless / surface destroyed).
  */
 void backend_set_active_swapchain(void* swapchain_state);
