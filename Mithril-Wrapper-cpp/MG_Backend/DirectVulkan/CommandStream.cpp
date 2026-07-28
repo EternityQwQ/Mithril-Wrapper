@@ -6,6 +6,7 @@
 #include "Swapchain.h"
 #include "../Backend.h"
 #include "../../MG_Impl/Log.h"
+#include "../../MG_State/State.h"  // g_state (for scissorTest in clear_attachments)
 
 #include <cstring>
 #include <vector>
@@ -54,8 +55,6 @@ EncoderState& encoder() {
     static EncoderState s;
     return s;
 }
-
-GLbitfield clearMaskPending = 0;
 
 /*
  * Record an image-memory barrier transitioning `image` from `oldLayout` to
@@ -171,6 +170,63 @@ void set_active_swapchain(Swapchain* sc) {
     encoder().activeSwapchain = sc;
 }
 
+/*
+ * Ensure the current frame slot's command buffer is in the RECORDING state.
+ * See the header comment for the full rationale. In short: with per-slot
+ * command buffers, after commit_frame() submits slot N and advances to
+ * slot N+1, the next recording operation must switch the alias to slot N+1's
+ * buffer, wait on its fence, reset it, and begin it. This function does all
+ * of that lazily.
+ *
+ * This is the FIX for the black-screen-with-sound root cause: the old code
+ * used a single shared command buffer and did vkResetCommandBuffer at the
+ * end of commit_frame() — resetting a buffer the GPU was still executing,
+ * which is Vulkan spec UB. The per-slot design + lazy ensure eliminates this
+ * by never resetting a pending buffer.
+ */
+bool ensure_command_buffer_recording() {
+    Backend* b = backend();
+    if (!b->initialized) return false;
+    if (b->commandBufferRecording) return true;  // fast path
+    if (b->deviceLost) return false;
+    if (!b->commandPool) return false;
+
+    // Wait on the current slot's fence if a submit is pending on it. After
+    // the wait, this slot's command buffer is no longer pending and can be
+    // safely reset. The fence was created with VK_FENCE_CREATE_SIGNALED_BIT,
+    // so the very first frame's wait (fencePending=false) is skipped.
+    if (b->fencePending[b->currentFrame]) {
+        VkFence fence = b->frameFences[b->currentFrame];
+        VkResult wr = vkWaitForFences(b->device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (wr != VK_SUCCESS) {
+            MITHRIL_LOG_ERROR("vk", "ensure_command_buffer_recording: "
+                              "vkWaitForFences(slot=%d) failed (rc=%d) — "
+                              "possible device lost",
+                              b->currentFrame, (int)wr);
+            b->deviceLost = true;
+            return false;
+        }
+        b->fencePending[b->currentFrame] = false;
+    }
+
+    // Switch the alias to the current slot's buffer and reset+begin it.
+    b->commandBuffer = b->commandBuffers[b->currentFrame];
+    vkResetCommandBuffer(b->commandBuffer, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(b->commandBuffer, &bi) != VK_SUCCESS) {
+        MITHRIL_LOG_ERROR("vk", "ensure_command_buffer_recording: "
+                          "vkBeginCommandBuffer failed (slot=%d)",
+                          b->currentFrame);
+        b->commandBufferRecording = false;
+        return false;
+    }
+    b->commandBufferRecording = true;
+    encoder().hasCommands = false;  // fresh buffer, no commands yet
+    return true;
+}
+
 void begin_render_pass(VkImageView* color_views, int color_count,
                        VkImageView depth_view, int width, int height, int samples) {
     (void)samples;
@@ -179,29 +235,14 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     EncoderState& e = encoder();
     if (e.passActive) return;  // coalesce draws into one pass
 
-    // Defensive recovery: ensure the command buffer is in the recording state
-    // before recording any vkCmd* calls. Normally it is — begun by init_device()
-    // (first frame) or by commit_frame() (subsequent frames). But under GPU
-    // OOM / device-lost recovery, a prior vkBeginCommandBuffer may have failed
-    // (commandBufferRecording == false), leaving the buffer in an invalid
-    // (pending/executable) state. Calling vkCmdPipelineBarrier /
-    // vkCmdBeginRendering on a non-recording buffer is UB and — under the
-    // VK_NOT_READY death spiral reported in the field — traps the render
-    // thread in a tight loop of failed begins. This mirrors the recovery
-    // already done in commit_frame() (lines ~417-433).
-    if (!b->commandBufferRecording) {
-        if (b->deviceLost) return;  // persistent fault — skip silently
-        vkResetCommandBuffer(b->commandBuffer, 0);
-        VkCommandBufferBeginInfo rbi{};
-        rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vkBeginCommandBuffer(b->commandBuffer, &rbi) != VK_SUCCESS) {
-            MITHRIL_LOG_ERROR("vk", "begin_render_pass: vkBeginCommandBuffer "
-                              "recovery failed — skipping pass");
-            return;
-        }
-        b->commandBufferRecording = true;
-        e.hasCommands = false;  // fresh buffer, no pre-frame records survived
+    // Ensure the current slot's command buffer is in the recording state.
+    // After commit_frame() submits slot N and advances to slot N+1, the
+    // alias b->commandBuffer is stale (points at the pending slot N buffer).
+    // This call lazily switches to slot N+1's buffer, waits on its fence,
+    // resets it, and begins it. On the very first frame, the buffer is
+    // already recording (begun by init_device), so this is a no-op.
+    if (!ensure_command_buffer_recording()) {
+        return;  // device lost or begin failed — skip this pass
     }
 
     // The command buffer is already in the recording state — either begun by
@@ -311,10 +352,10 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     // persistent across frames (never presented), so after the one-shot
     // UNDEFINED->DEPTH_STENCIL_ATTACHMENT_OPTIMAL transition it stays valid
     // and subsequent passes use LOAD to preserve depth across passes.
-    // NOTE: MobileGL splits clearDepth/clearStencil independently; we use a
-    // single e.loadClear for both (the depth+stencil share one attachment
-    // slot here). Partial clears (clear depth only) are handled separately
-    // by vkCmdClearAttachments using clearMaskPending, not by the loadOp.
+    // NOTE: glClear now uses backend_clear_attachments (vkCmdClearAttachments)
+    // to clear only the requested aspects, NOT loadOp=CLEAR. The loadClear
+    // flag here only affects the initial loadOp of the pass, and glClear
+    // sets it to LOAD (not CLEAR) before calling begin_render_pass.
     VkRenderingAttachmentInfoKHR depthAttach{};
     depthAttach.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
     depthAttach.imageView = e.depthView;
@@ -370,6 +411,77 @@ void end_render_pass() {
     e.passActive = false;
 }
 
+/*
+ * Clear specific aspects of the current framebuffer via vkCmdClearAttachments.
+ * Must be called inside a render pass. This is the correct implementation of
+ * glClear: it clears ONLY the buffers specified by `mask`, unlike the old
+ * loadOp=CLEAR approach which cleared ALL attachments regardless of mask.
+ *
+ * MobileGL (VulkanRenderer.cpp:4230-4358) uses the same vkCmdClearAttachments
+ * approach, respecting GL_SCISSOR_TEST for the clear rect.
+ */
+void clear_attachments(GLbitfield mask, int x, int y, int w, int h) {
+    Backend* b = backend();
+    EncoderState& e = encoder();
+    if (!b->commandBuffer || !e.passActive) return;
+    if (mask == 0) return;
+
+    // Build the VkClearAttachment array for the requested aspects.
+    std::vector<VkClearAttachment> attaches;
+    VkClearValue cv{};
+
+    if (mask & GL_COLOR_BUFFER_BIT) {
+        cv.color.float32[0] = e.clearColor[0];
+        cv.color.float32[1] = e.clearColor[1];
+        cv.color.float32[2] = e.clearColor[2];
+        cv.color.float32[3] = e.clearColor[3];
+        // One clear attachment per color attachment (VK_IMAGE_ASPECT_COLOR_BIT
+        // covers all color aspects, but per-attachment is safer with MRT).
+        for (int i = 0; i < e.colorCount; ++i) {
+            VkClearAttachment a{};
+            a.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            a.colorAttachment = (uint32_t)i;
+            a.clearValue = cv;
+            attaches.push_back(a);
+        }
+    }
+    if (mask & GL_DEPTH_BUFFER_BIT) {
+        VkClearAttachment a{};
+        a.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        a.clearValue.depthStencil.depth = (float)e.clearDepth;
+        attaches.push_back(a);
+    }
+    if (mask & GL_STENCIL_BUFFER_BIT) {
+        VkClearAttachment a{};
+        a.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        a.clearValue.depthStencil.stencil = (uint32_t)e.clearStencil;
+        attaches.push_back(a);
+    }
+    if (attaches.empty()) return;
+
+    // Determine the clear rect. GL scissor test clips the clear region.
+    // When scissor is disabled, clear the full framebuffer rect.
+    VkClearRect rect{};
+    if (mithril::g_state && mithril::g_state->scissorTest) {
+        rect.rect.offset.x = mithril::g_state->scissorX;
+        rect.rect.offset.y = mithril::g_state->scissorY;
+        rect.rect.extent.width = (uint32_t)mithril::g_state->scissorW;
+        rect.rect.extent.height = (uint32_t)mithril::g_state->scissorH;
+    } else {
+        rect.rect.offset.x = 0;
+        rect.rect.offset.y = 0;
+        rect.rect.extent.width = (uint32_t)w;
+        rect.rect.extent.height = (uint32_t)h;
+    }
+    rect.baseArrayLayer = 0;
+    rect.layerCount = 1;
+
+    vkCmdClearAttachments(b->commandBuffer,
+                          (uint32_t)attaches.size(), attaches.data(),
+                          1, &rect);
+    e.hasCommands = true;
+}
+
 void commit_frame() {
     Backend* b = backend();
     if (b->deviceLost) {
@@ -380,37 +492,26 @@ void commit_frame() {
     EncoderState& e = encoder();
     if (e.passActive) end_render_pass();
 
-    // ---- Wait for the previous submit on this slot to complete ----
+    // ---- Ensure the current slot's command buffer is recording ----
     // This is the async-pipeline wait point (mirrors MobileGL's
     // FrameContext::WaitAndAcquireNextImage, FrameContext.cpp:220, which
     // calls vkWaitForFences on the slot's imageInFlightFence before acquire).
     //
-    // We wait HERE (at the start of the next commit on the same slot), not
-    // after our own submit. This lets the GPU run up to kMaxFramesInFlight-1
-    // frames behind the CPU without stalling the render thread, achieving
-    // proper CPU/GPU parallelism. The fence was created with
-    // VK_FENCE_CREATE_SIGNALED_BIT (Device.cpp:265), so the first frame's
-    // wait returns immediately.
+    // With per-slot command buffers, after the previous commit_frame()
+    // submitted slot N and advanced to slot N+1, the alias b->commandBuffer
+    // still points at slot N's pending buffer. This call lazily switches to
+    // the current slot's buffer, waits on its fence (submitted
+    // kMaxFramesInFlight frames ago — the deferred async wait that gives the
+    // GPU kMaxFramesInFlight-1 frames of latency), resets it, and begins it.
     //
-    // Only wait if a submit actually happened on this slot (fencePending).
-    // The flag is set below after a successful submit; cleared here after the
-    // wait. Without this gate, we'd wait on an already-waited fence (cheap
-    // but pointless) or on a never-signaled fence (if a previous submit
-    // failed and we did not set fencePending).
-    if (b->fencePending[b->currentFrame]) {
-        VkFence fence = b->frameFences[b->currentFrame];
-        VkResult wr = vkWaitForFences(b->device, 1, &fence, VK_TRUE, UINT64_MAX);
-        if (wr != VK_SUCCESS) {
-            MITHRIL_LOG_ERROR("vk", "commit_frame: vkWaitForFences(slot=%d) "
-                              "failed (rc=%d) — possible device lost",
-                              b->currentFrame, (int)wr);
-            // Device lost: mark and bail. Subsequent commits will short-circuit
-            // on b->deviceLost. This is the only recovery from a GPU hang that
-            // does not involve a full device recreation.
-            b->deviceLost = true;
-            return;
-        }
-        b->fencePending[b->currentFrame] = false;
+    // If the buffer is already recording (e.g. this is the first commit of
+    // the process, or a previous commit's shouldSubmit was false so the
+    // buffer was never submitted), this is a fast no-op.
+    //
+    // This replaces the old single-buffer design's "wait at top + reset+begin
+    // at bottom" pattern, which reset a pending buffer (spec UB) at the bottom.
+    if (!ensure_command_buffer_recording()) {
+        return;  // device lost or begin failed
     }
 
     // ---- Decide whether we need to submit at all ----
@@ -450,29 +551,12 @@ void commit_frame() {
         return;
     }
 
-    // If the command buffer is not in the recording state (e.g. a previous
-    // commit_frame vkEndCommandBuffer'd it but then vkQueueSubmit failed and
-    // we returned early before reset+begin), we cannot record the present
-    // barrier below. Force a reset+begin here so the barrier lands in a fresh
-    // buffer. Without this, vkCmdPipelineBarrier on a non-recording buffer is
-    // UB and triggers the VK_NOT_READY death spiral reported under GPU OOM.
-    if (!b->commandBufferRecording) {
-        vkResetCommandBuffer(b->commandBuffer, 0);
-        VkCommandBufferBeginInfo rbi{};
-        rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vkBeginCommandBuffer(b->commandBuffer, &rbi) != VK_SUCCESS) {
-            MITHRIL_LOG_ERROR("vk", "commit_frame: vkBeginCommandBuffer recovery failed");
-            e.hasCommands = false;
-            return;
-        }
-        b->commandBufferRecording = true;
-        // After a forced reset, the previously-recorded commands (draws etc.)
-        // are gone. Only the present barrier below will be in the buffer.
-        // Submitting it is still correct — it transitions the swapchain image
-        // to PRESENT_SRC_KHR — but the frame's actual rendering is lost.
-        // This is acceptable under GPU OOM (the rendering likely failed too).
-    }
+    // The command buffer is guaranteed to be in the recording state here —
+    // ensure_command_buffer_recording() at the top of this function took care
+    // of it (including the fence wait, reset, and begin). The old defensive
+    // recovery block that was here has been removed because it reset the
+    // buffer WITHOUT waiting on the fence first, which could reset a pending
+    // buffer (spec UB) under the per-slot design.
 
     // Transition the swapchain color image back to PRESENT_SRC_KHR before
     // vkEndCommandBuffer so vkQueuePresentKHR sees a legal layout. Without
@@ -615,64 +699,46 @@ void commit_frame() {
     }
 
     // Mark this slot's fence as pending. The NEXT commit_frame() that cycles
-    // back to this slot will wait on frameFences[currentFrame] before reusing
-    // the command buffer. This must be set BEFORE the currentFrame advance
-    // below, so the flag lands on the slot we just submitted (not the next
-    // one). Without this, the deferred wait at the top of commit_frame is a
-    // no-op (fencePending is always false) and vkResetCommandBuffer below
-    // would reset a buffer the GPU is still executing -> spec violation /
-    // UAF crash. The fences start signaled (VK_FENCE_CREATE_SIGNALED_BIT),
-    // so the first frame's wait is correctly skipped (flag starts false).
+    // back to this slot (kMaxFramesInFlight frames later) will wait on
+    // frameFences[currentFrame] via ensure_command_buffer_recording() before
+    // reusing this slot's command buffer. This must be set BEFORE the
+    // currentFrame advance below, so the flag lands on the slot we just
+    // submitted (not the next one). Without this, the deferred wait in
+    // ensure_command_buffer_recording() is a no-op (fencePending is always
+    // false) and the next reset of this slot's buffer would reset a buffer
+    // the GPU is still executing -> spec violation / UAF crash. The fences
+    // start signaled (VK_FENCE_CREATE_SIGNALED_BIT), so the first frame's
+    // wait is correctly skipped (flag starts false).
     b->fencePending[b->currentFrame] = true;
 
-    // CRITICAL PERFORMANCE FIX: do NOT vkWaitForFences here.
+    // CRITICAL FIX: do NOT vkResetCommandBuffer here.
     //
-    // The previous code called vkWaitForFences(UINT64_MAX) immediately after
-    // every submit, which serialized the CPU onto the GPU: the render thread
-    // stalled until the GPU finished executing the entire frame before it
-    // could begin recording the next one. This (a) destroyed CPU/GPU
-    // parallelism, capping FPS at roughly 1/GPU-frame-time instead of the
-    // display refresh rate, and (b) on the very first frame, if the GPU hit
-    // any error (layout/sync), the fence never signaled and the wait hung
-    // forever -> black screen with audio still playing.
+    // The old single-buffer code reset+begin the command buffer at this point
+    // so that inter-frame texture uploads (stage_and_copy_image) had a
+    // recording buffer to write into. But with a single shared buffer, this
+    // reset hit a buffer the GPU was still executing (spec UB) — the root
+    // cause of the black-screen-with-sound issue.
     //
-    // MobileGL's model (VulkanRenderer.cpp:6951-6955 + FrameContext.cpp:220):
-    //   submit -> advance frame slot -> vkQueuePresentKHR ->
-    //   vkWaitForFences(NEXT slot's fence) BEFORE next acquire.
-    // The wait happens at the START of the next frame (on a different fence —
-    // the one the NEXT slot's command buffer will reuse), not at the end of
-    // this frame. This gives kMaxFramesInFlight-1 frames of latency for the
-    // GPU to finish, achieving true pipelining.
+    // With per-slot command buffers, we advance to the NEXT slot's buffer and
+    // leave the just-submitted slot's buffer alone (pending on the GPU). The
+    // next slot's buffer is lazily reset+begin by ensure_command_buffer_recording()
+    // when the next begin_render_pass / stage_and_copy_image / commit_frame
+    // needs it. The lazy ensure waits on the next slot's fence (submitted
+    // kMaxFramesInFlight frames ago) before resetting, so no pending buffer is
+    // ever reset.
     //
-    // We achieve the same by deferring the fence wait to the NEXT commit_frame
-    // entry: before recording into the current slot's command buffer, wait on
-    // its fence (which was signaled by the submit kMaxFramesInFlight frames
-    // ago). The fence was created with VK_FENCE_CREATE_SIGNALED_BIT, so the
-    // first frame's wait is a no-op. See the wait block at the top of this
-    // function (added below).
+    // The alias b->commandBuffer is NOT updated here — it still points at the
+    // just-submitted (pending) buffer. ensure_command_buffer_recording() will
+    // update it to point at the new slot's buffer on the next call. Code that
+    // records into b->commandBuffer between now and the next ensure call MUST
+    // call ensure_command_buffer_recording() first (stage_and_copy_image,
+    // transition_image_layout, bind_program_descriptors).
+    b->commandBufferRecording = false;  // just-submitted buffer is no longer recording
     b->currentFrame = (b->currentFrame + 1) % kMaxFramesInFlight;
     // Monotonic generation bump: descriptor pools are reset on first draw of
     // each generation (see DescriptorSet.cpp), so this must advance every frame
     // regardless of the cycling currentFrame value.
     b->frameGeneration++;
-
-    // Begin a fresh command buffer so subsequent uploads/records have somewhere
-    // to go. (Render pass begins will reset + begin again.) Check the return
-    // value: under GPU OOM, vkBeginCommandBuffer can return VK_NOT_READY or
-    // VK_ERROR_OUT_OF_DEVICE_MEMORY. Without this check, the buffer is left in
-    // an invalid state and every subsequent vkCmd* call is UB, trapping the
-    // render thread in the death spiral reported in the field.
-    vkResetCommandBuffer(b->commandBuffer, 0);
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(b->commandBuffer, &bi) == VK_SUCCESS) {
-        b->commandBufferRecording = true;
-    } else {
-        MITHRIL_LOG_ERROR("vk", "post-submit vkBeginCommandBuffer failed — "
-                          "command buffer unusable until next commit");
-        b->commandBufferRecording = false;
-    }
 
     e.hasCommands = false;  // fresh command buffer, no commands yet
 }
@@ -684,14 +750,24 @@ void commit_frame() {
  *
  * Sequence:
  *   1. end_render_pass() + commit_frame() — flush any pending commands that
- *      reference the swapchain's images into the GPU.
+ *      reference the swapchain's images into the GPU. This submit is safe
+ *      because ensure_command_buffer_recording() at the top of commit_frame
+ *      waits on the current slot's fence before resetting its buffer.
  *   2. vkDeviceWaitIdle() — block until the GPU has finished executing those
- *      commands, so the swapchain's IOSurface-backed images are no longer
- *      referenced by the driver. Without this wait, vkDestroySwapchainKHR /
- *      vkDestroyImageView would free IOSurfaces that the GPU is still reading,
- *      and the next IOSurfaceBindAccel call in the Metal driver would crash
- *      with SIGSEGV (UAF).
- *   3. set_active_swapchain(nullptr) — clear the encoder's raw pointer to the
+ *      commands (and any prior in-flight submits on other slots), so the
+ *      swapchain's IOSurface-backed images are no longer referenced by the
+ *      driver. Without this wait, vkDestroySwapchainKHR / vkDestroyImageView
+ *      would free IOSurfaces that the GPU is still reading, and the next
+ *      IOSurfaceBindAccel call in the Metal driver would crash with SIGSEGV
+ *      (UAF).
+ *   3. Clear fencePending[] — after vkDeviceWaitIdle, ALL fences are signaled.
+ *      Clearing the flags ensures the next commit_frame doesn't waste a
+ *      vkWaitForFences call on an already-signaled fence, and more importantly
+ *      ensures consistent state for the new swapchain's first frame.
+ *   4. Reset commandBufferRecording — the just-submitted buffer is no longer
+ *      recording. The next ensure_command_buffer_recording() will lazily
+ *      reset+begin the current slot's buffer (now safe, fence signaled).
+ *   5. set_active_swapchain(nullptr) — clear the encoder's raw pointer to the
  *      swapchain so begin_render_pass() / commit_frame() cannot record layout
  *      barriers against its (soon-to-be-freed) images.
  */
@@ -704,6 +780,20 @@ void drain_and_detach_swapchain() {
     end_render_pass();
     commit_frame();
     vkDeviceWaitIdle(b->device);
+
+    // After vkDeviceWaitIdle, all in-flight command buffers across ALL slots
+    // have completed. Clear fencePending so the next ensure_command_buffer_recording()
+    // on any slot doesn't wait on an already-signaled fence (benign but wasteful,
+    // and the state should be clean for the new swapchain's first frame).
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        b->fencePending[i] = false;
+    }
+    // The command buffer alias still points at whatever slot was current when
+    // commit_frame advanced. Mark it not-recording so the next
+    // ensure_command_buffer_recording() will reset+begin it (safe now, since
+    // vkDeviceWaitIdle guarantees no buffer is pending).
+    b->commandBufferRecording = false;
+
     set_active_swapchain(nullptr);
 }
 
@@ -722,6 +812,10 @@ void backend_set_clear_depth(double d) { mithril::vk::set_clear_depth(d); }
 void backend_set_clear_stencil(int s)  { mithril::vk::set_clear_stencil(s); }
 void backend_set_load_clear(void)      { mithril::vk::set_load_clear(true); }
 void backend_set_load_load(void)       { mithril::vk::set_load_clear(false); }
+
+void backend_clear_attachments(GLbitfield mask, int x, int y, int w, int h) {
+    mithril::vk::clear_attachments(mask, x, y, w, h);
+}
 
 void backend_begin_render_pass(VkImageView* color_views, int color_count,
                                VkImageView depth_view, int width, int height, int samples) {

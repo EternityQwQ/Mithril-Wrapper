@@ -4,6 +4,7 @@
 // family declared in MG_Backend/Backend.h.
 #include "Resources.h"
 #include "Device.h"
+#include "CommandStream.h"  // ensure_command_buffer_recording
 #include "../Backend.h"
 #include "../../MG_Impl/Log.h"
 
@@ -94,6 +95,13 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                           int unpack_alignment, GLenum format, GLenum type) {
     Backend* b = backend();
     if (!b->commandBuffer) return;
+    // With per-slot command buffers, the alias b->commandBuffer may point at
+    // a just-submitted (pending) buffer after commit_frame advanced the slot.
+    // ensure_command_buffer_recording() lazily switches to the current slot's
+    // buffer, waits on its fence, resets, and begins it. Without this, the
+    // vkCmdPipelineBarrier / vkCmdCopyBufferToImage calls below would record
+    // into a non-recording buffer (spec UB).
+    if (!ensure_command_buffer_recording()) return;
     if (unpack_alignment <= 0) unpack_alignment = 4;  // GL default UNPACK_ALIGNMENT
 
     // Compute host-side bytes per pixel for this (format, type) pair and
@@ -284,6 +292,9 @@ void transition_image_layout(TextureEntry& tex, VkImageLayout newLayout) {
     Backend* b = backend();
     if (!b->commandBuffer || tex.image == VK_NULL_HANDLE) return;
     if (tex.currentLayout == newLayout) return;  // already there
+    // Ensure the current slot's command buffer is recording before we issue
+    // vkCmdPipelineBarrier. See stage_and_copy_image for rationale.
+    if (!ensure_command_buffer_recording()) return;
 
     VkImageAspectFlags aspect = aspect_for_format(tex.format);
 

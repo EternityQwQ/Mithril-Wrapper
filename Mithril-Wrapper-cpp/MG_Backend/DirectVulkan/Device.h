@@ -33,23 +33,26 @@ struct Backend {
     uint32_t         graphicsFamily = 0xFFFFFFFFu;
 
     VkCommandPool    commandPool = VK_NULL_HANDLE;
-    // Primary command buffer reused across a frame's draws. Reset + begin in
-    // begin_render_pass / commit, rerecorded each frame.
+    // Per-frame-slot primary command buffers (mirrors MobileGL's
+    // FrameContext::FrameData::commandBuffer). Each slot has its own buffer so
+    // that submitting slot N's buffer and then recording into slot N+1's
+    // buffer can happen concurrently without resetting a pending buffer
+    // (which is Vulkan spec UB). With a single shared buffer, the reset+begin
+    // at the end of commit_frame would reset a buffer the GPU is still
+    // executing — the root cause of the black-screen-with-sound issue.
+    VkCommandBuffer  commandBuffers[kMaxFramesInFlight] = {};
+    // Alias pointing to commandBuffers[currentFrame]. Updated by
+    // ensure_command_buffer_recording() whenever the current slot changes or
+    // the buffer is reset+begin. All existing code that references
+    // b->commandBuffer continues to work unchanged.
     VkCommandBuffer  commandBuffer = VK_NULL_HANDLE;
 
-    // Tracks whether commandBuffer is in a usable (recording or reset) state.
-    // Set false when vkEndCommandBuffer succeeds (buffer is now in
-    // pending/executable state and CANNOT accept new vkCmd* calls until
-    // vkResetCommandBuffer + vkBeginCommandBuffer run again). Set true once
-    // vkBeginCommandBuffer succeeds.
-    //
-    // Without this flag, a failed vkQueueSubmit path that returns after
-    // vkEndCommandBuffer leaves the buffer in executable state; the next
-    // begin_render_pass() calls vkCmdBeginRendering on a non-recording buffer,
-    // which is UB and — under the GPU OOM condition reported in the field —
-    // causes vkBeginCommandBuffer itself to return VK_NOT_READY on the next
-    // commit_frame's reset+begin, trapping the render thread in a tight loop
-    // of failed begins.
+    // Tracks whether commandBuffer (= commandBuffers[currentFrame]) is in the
+    // RECORDING state. Set false after vkEndCommandBuffer (buffer is now
+    // executable/pending). Set true by ensure_command_buffer_recording().
+    // Code that records into b->commandBuffer outside of begin_render_pass
+    // (e.g. stage_and_copy_image for texture uploads) MUST call
+    // ensure_command_buffer_recording() first.
     bool             commandBufferRecording = false;
 
     VkPipelineCache  pipelineCache = VK_NULL_HANDLE;

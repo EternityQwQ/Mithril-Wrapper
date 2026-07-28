@@ -230,6 +230,44 @@ bool init_device() {
     dynRenderFeat.dynamicRendering = VK_TRUE;
     dynRenderFeat.pNext = &extDynStateFeat;
 
+    // ---- Core VkPhysicalDeviceFeatures ----
+    // Without pEnabledFeatures, all core features default to VK_FALSE, which
+    // means ANY pipeline/shader using them will fail vkCreateGraphicsPipelines
+    // and get negatively cached in Pipeline.cpp's failedSignatures — the draw
+    // is then permanently skipped, manifesting as black-screen-with-sound.
+    // MobileGL (VulkanRenderer.cpp:7291-7348) explicitly enables ~17 features
+    // here; we mirror that set, gated by what the physical device actually
+    // supports so we never request an unsupported feature (which would cause
+    // vkCreateDevice to fail).
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(b->physicalDevice, &supported);
+
+    VkPhysicalDeviceFeatures enabled{};
+    enabled.robustBufferAccess            = supported.robustBufferAccess;
+    enabled.independentBlend              = supported.independentBlend;
+    enabled.fillModeNonSolid              = supported.fillModeNonSolid;
+    enabled.dualSrcBlend                  = supported.dualSrcBlend;
+    enabled.logicOp                       = supported.logicOp;
+    enabled.shaderClipDistance            = supported.shaderClipDistance;
+    enabled.shaderCullDistance            = supported.shaderCullDistance;
+    enabled.wideLines                     = supported.wideLines;
+    enabled.largePoints                   = supported.largePoints;
+    enabled.shaderInt64                   = supported.shaderInt64;
+    enabled.vertexPipelineStoresAndAtomics= supported.vertexPipelineStoresAndAtomics;
+    enabled.fragmentStoresAndAtomics      = supported.fragmentStoresAndAtomics;
+    enabled.shaderStorageImageExtendedFormats    = supported.shaderStorageImageExtendedFormats;
+    enabled.shaderStorageImageReadWithoutFormat  = supported.shaderStorageImageReadWithoutFormat;
+    enabled.shaderStorageImageWriteWithoutFormat = supported.shaderStorageImageWriteWithoutFormat;
+    enabled.drawIndirectFirstInstance     = supported.drawIndirectFirstInstance;
+    enabled.multiDrawIndirect             = supported.multiDrawIndirect;
+    enabled.samplerAnisotropy             = supported.samplerAnisotropy;
+    enabled.depthBounds                   = supported.depthBounds;
+    enabled.occlusionQueryPrecise         = supported.occlusionQueryPrecise;
+    enabled.pipelineStatisticsQuery       = supported.pipelineStatisticsQuery;
+    enabled.multiViewport                 = supported.multiViewport;
+    enabled.imageCubeArray                = supported.imageCubeArray;
+    enabled.alphaToOne                    = supported.alphaToOne;
+
     VkDeviceCreateInfo devCI{};
     devCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     devCI.pNext = &dynRenderFeat;
@@ -237,6 +275,7 @@ bool init_device() {
     devCI.pQueueCreateInfos = &queueCI;
     devCI.enabledExtensionCount = (uint32_t)devExts.size();
     devCI.ppEnabledExtensionNames = devExts.data();
+    devCI.pEnabledFeatures = &enabled;
 
     if (vkCreateDevice(b->physicalDevice, &devCI, nullptr, &b->device) != VK_SUCCESS) {
         MITHRIL_LOG_ERROR("vk", "vkCreateDevice failed");
@@ -258,11 +297,13 @@ bool init_device() {
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.commandPool = b->commandPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(b->device, &allocInfo, &b->commandBuffer) != VK_SUCCESS) {
+    allocInfo.commandBufferCount = kMaxFramesInFlight;
+    if (vkAllocateCommandBuffers(b->device, &allocInfo, b->commandBuffers) != VK_SUCCESS) {
         MITHRIL_LOG_ERROR("vk", "vkAllocateCommandBuffers failed");
         return false;
     }
+    // Alias points to the current slot's buffer (slot 0 at init).
+    b->commandBuffer = b->commandBuffers[b->currentFrame];
 
     // ---- Per-frame fences ----
     VkFenceCreateInfo fenceCI{};
@@ -272,11 +313,12 @@ bool init_device() {
         vkCreateFence(b->device, &fenceCI, nullptr, &b->frameFences[i]);
     }
 
-    // Begin the primary command buffer in the recording state so that
-    // pre-frame commands (e.g. layout transitions from glTexStorage2D, texture
-    // uploads from glTexImage2D outside a render pass) have somewhere to record
-    // before the first begin_render_pass. begin_render_pass does NOT reset the
-    // buffer; only commit_frame resets + re-begins it after submission.
+    // Begin slot 0's command buffer in the recording state so that pre-frame
+    // commands (texture uploads, layout transitions from glTexStorage2D) have
+    // somewhere to record before the first begin_render_pass. The other slots
+    // are lazily begun by ensure_command_buffer_recording() when their turn
+    // comes. This mirrors MobileGL's FrameContext::Initialize
+    // (FrameContext.cpp:29-31) which begins each slot's buffer at init.
     VkCommandBufferBeginInfo cbBegin{};
     cbBegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     cbBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -322,7 +364,11 @@ void shutdown_device() {
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
         if (b->frameFences[i]) { vkDestroyFence(b->device, b->frameFences[i], nullptr); b->frameFences[i] = VK_NULL_HANDLE; }
     }
-    if (b->commandBuffer) { vkFreeCommandBuffers(b->device, b->commandPool, 1, &b->commandBuffer); b->commandBuffer = VK_NULL_HANDLE; }
+    if (b->commandPool && b->commandBuffers[0]) {
+        vkFreeCommandBuffers(b->device, b->commandPool, kMaxFramesInFlight, b->commandBuffers);
+        for (int i = 0; i < kMaxFramesInFlight; ++i) b->commandBuffers[i] = VK_NULL_HANDLE;
+        b->commandBuffer = VK_NULL_HANDLE;
+    }
     if (b->commandPool) { vkDestroyCommandPool(b->device, b->commandPool, nullptr); b->commandPool = VK_NULL_HANDLE; }
     if (b->dummyVertexBuffer) { vkDestroyBuffer(b->device, b->dummyVertexBuffer, nullptr); b->dummyVertexBuffer = VK_NULL_HANDLE; }
     if (b->dummyVertexMemory) { vkFreeMemory(b->device, b->dummyVertexMemory, nullptr); b->dummyVertexMemory = VK_NULL_HANDLE; }

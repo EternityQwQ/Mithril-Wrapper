@@ -44,6 +44,31 @@ void begin_render_pass(VkImageView* color_views, int color_count,
 // End the active dynamic-rendering pass.
 void end_render_pass();
 
+// Clear specific aspects of the current framebuffer via vkCmdClearAttachments.
+// Must be called inside a render pass. `mask` is a GLbitfield of
+// GL_COLOR_BUFFER_BIT / GL_DEPTH_BUFFER_BIT / GL_STENCIL_BUFFER_BIT.
+void clear_attachments(GLbitfield mask, int x, int y, int w, int h);
+
+/*
+ * Ensure the current frame slot's command buffer is in the RECORDING state.
+ *
+ * With per-slot command buffers (Backend::commandBuffers[]), after
+ * commit_frame() submits slot N and advances to slot N+1, the alias
+ * b->commandBuffer still points at slot N's buffer (now pending on the GPU).
+ * The NEXT call to begin_render_pass / stage_and_copy_image / commit_frame
+ * must switch to slot N+1's buffer, wait on its fence (submitted
+ * kMaxFramesInFlight frames ago), reset it, and begin it before recording.
+ *
+ * This function does all of that lazily — only when the buffer is NOT already
+ * recording. If it's already recording, it's a no-op (fast path). Call this
+ * from ANY code path that records into b->commandBuffer outside of an active
+ * render pass (texture uploads, layout transitions, commit_frame's present
+ * barrier, etc.).
+ *
+ * Returns true if the buffer is recording and ready for vkCmd* calls.
+ */
+bool ensure_command_buffer_recording();
+
 // Submit the recorded command buffer to the graphics queue and wait on the
 // per-frame fence. Called by backend_commit() and backend_present_and_acquire().
 void commit_frame();

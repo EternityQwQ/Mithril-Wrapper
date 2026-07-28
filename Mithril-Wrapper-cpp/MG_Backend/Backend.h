@@ -55,6 +55,23 @@ void backend_set_load_clear(void);
 void backend_set_load_load(void);
 
 /*
+ * Clear specific aspects of the current framebuffer's attachments using
+ * vkCmdClearAttachments. MUST be called inside a render pass (after
+ * backend_begin_render_pass and before backend_end_render_pass). The clear
+ * respects GL scissor: if scissor test is enabled, the clear rect is the
+ * scissor rect; otherwise it is the full framebuffer (0,0,w,h).
+ *
+ *   mask : GLbitfield of GL_COLOR_BUFFER_BIT / GL_DEPTH_BUFFER_BIT /
+ *          GL_STENCIL_BUFFER_BIT (OR'd together, exactly as glClear takes).
+ *   x,y,w,h : framebuffer dimensions (used when scissor test is disabled).
+ *
+ * This replaces the old approach of using loadOp=CLEAR for glClear, which
+ * cleared ALL attachments regardless of mask — so glClear(GL_DEPTH_BUFFER_BIT)
+ * would wipe the color buffer too, causing black screen.
+ */
+void backend_clear_attachments(GLbitfield mask, int x, int y, int w, int h);
+
+/*
  * Begin a dynamic-rendering pass against the given attachments.
  *   color_views : array of VkImageView (VK_NULL_HANDLE entries allowed)
  *   color_count : number of color attachments

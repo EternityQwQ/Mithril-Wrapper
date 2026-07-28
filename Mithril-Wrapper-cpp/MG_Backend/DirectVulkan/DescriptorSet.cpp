@@ -19,6 +19,7 @@
 #include "DescriptorSet.h"
 #include "Device.h"
 #include "Pipeline.h"
+#include "CommandStream.h"  // ensure_command_buffer_recording
 #include "Reflect.h"  // reflect_stage / merge_bindings (pure-logic, unit-tested)
 #include "../Backend.h"
 #include "../../MG_State/State.h"
@@ -131,6 +132,11 @@ void ensure_program_layouts(GLuint program,
 void bind_program_descriptors(GLuint program) {
     Backend* b = backend();
     if (!b->initialized || !b->commandBuffer || program == 0) return;
+    // Ensure the current slot's command buffer is recording before we issue
+    // vkCmdBindDescriptorSets. This is normally a no-op (bind_program_descriptors
+    // is called during a render pass, when the buffer is already recording),
+    // but the ensure call makes this function safe if called outside a pass.
+    if (!ensure_command_buffer_recording()) return;
 
     auto& tbl = program_table();
     auto it = tbl.find(program);

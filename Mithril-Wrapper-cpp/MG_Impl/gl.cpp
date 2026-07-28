@@ -46,15 +46,17 @@ void glClear(GLbitfield mask) {
     int w = 0, h = 0;
     int n = mithril::collect_draw_fbo_attachments(colors, &depth, &w, &h);
 
-    // Clear uses the Clear load action for the requested buffers.
-    backend_set_load_clear();
+    // FIX: Use LOAD (not CLEAR) for the render pass, then vkCmdClearAttachments
+    // to clear ONLY the aspects specified by `mask`. The old code used
+    // loadOp=CLEAR which cleared ALL attachments regardless of mask — so
+    // glClear(GL_DEPTH_BUFFER_BIT) would wipe the color buffer too, causing
+    // black screen. This matches MobileGL's Clear() implementation
+    // (VulkanRenderer.cpp:4230-4358) which uses vkCmdClearAttachments.
+    backend_set_load_load();
     backend_begin_render_pass(colors, n, depth, w, h, 1);
-    // Respect the mask: if only depth/stencil, the color attachment load
-    // action is irrelevant (we still need a pass to clear depth). End
-    // immediately — there is nothing to encode.
+    backend_clear_attachments(mask, 0, 0, w, h);
     backend_end_render_pass();
     backend_commit();
-    (void)mask;
 }
 
 /* ---- Enable / Disable ---- */
