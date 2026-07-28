@@ -25,6 +25,18 @@ struct Swapchain {
     int             width = 0;
     int             height = 0;
 
+    // Actual drawable size at acquire time (from CAMetalLayer.drawableSize).
+    // Updated by EGL's install_surface_on_state() after each acquire. On
+    // MoltenVK/iOS, the swapchain image is backed by a CAMetalLayer drawable
+    // whose size = drawableSize at acquire time, NOT the swapchain's
+    // imageExtent at creation time. If the drawableSize changed after swapchain
+    // creation (e.g. GLFW resized the window), these fields reflect the ACTUAL
+    // IOSurface dimensions, while width/height still hold the creation-time
+    // extent. begin_render_pass() clamps the render area to min(these, width/height)
+    // to prevent IOSurfaceBindAccel SIGSEGV from out-of-bounds access.
+    int             actualDrawableWidth = 0;
+    int             actualDrawableHeight = 0;
+
     // Swapchain images + per-image views.
     std::vector<VkImage>     images;
     std::vector<VkImageView> views;

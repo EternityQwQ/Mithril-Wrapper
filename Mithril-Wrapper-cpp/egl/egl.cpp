@@ -253,8 +253,41 @@ void install_surface_on_state(EglSurface* s) {
         g_state->eglDefaultColorFormat  = backend_swapchain_color_format(s->swapchain_state);
         g_state->eglDefaultDepthImage   = backend_swapchain_current_depth_image(s->swapchain_state);
         g_state->eglDefaultDepthFormat  = backend_swapchain_depth_format(s->swapchain_state);
-        g_state->eglDefaultWidth  = s->width;
-        g_state->eglDefaultHeight = s->height;
+        // FIX (IOSurfaceBindAccel SIGSEGV): Use the ACTUAL drawable size from
+        // the native window (CAMetalLayer.drawableSize), NOT the swapchain's
+        // creation-time size (s->width). On MoltenVK/iOS, the swapchain image
+        // is backed by a CAMetalLayer drawable whose size = drawableSize at
+        // acquire time, NOT the swapchain's imageExtent at creation time.
+        // If the drawableSize changed after swapchain creation (e.g. GLFW
+        // resized the window between swapchain creation and the first frame),
+        // the IOSurface backing the acquired drawable has the NEW size, while
+        // s->width still holds the OLD size. Setting eglDefaultWidth to the
+        // stale s->width causes the render area to exceed the IOSurface
+        // dimensions → IOSurfaceBindAccel dereferences out-of-bounds memory
+        // → SIGSEGV.
+        //
+        // Use min(actual_drawable_size, swapchain_size) to handle both cases:
+        //   - drawable shrank: clamp to the smaller drawable size (IOSurface)
+        //   - drawable grew: clamp to the swapchain size (VkImage extent)
+        int actualW = s->width;
+        int actualH = s->height;
+        int drawW = 0, drawH = 0;
+        if (surface_get_size(s->native_window, &drawW, &drawH) && drawW > 0 && drawH > 0) {
+            if (drawW < actualW) actualW = drawW;
+            if (drawH < actualH) actualH = drawH;
+            // Update the swapchain's tracked actual drawable size so
+            // begin_render_pass() can clamp the render area as a secondary
+            // safety net (in case eglDefaultWidth is stale during a frame).
+            backend_swapchain_set_drawable_size(s->swapchain_state, drawW, drawH);
+            if (drawW != s->width || drawH != s->height) {
+                MITHRIL_LOG_WARN("egl", "install_surface_on_state: drawableSize=%dx%d "
+                                  "differs from swapchainSize=%dx%d — clamping eglDefault "
+                                  "to %dx%d (prevents IOSurfaceBindAccel SIGSEGV)",
+                                  drawW, drawH, s->width, s->height, actualW, actualH);
+            }
+        }
+        g_state->eglDefaultWidth  = actualW;
+        g_state->eglDefaultHeight = actualH;
         // Register the swapchain with the encoder so it can record layout
         // barriers and signal renderFinishedPerImage. Only register when the
         // surface actually has an acquired color view (color != VK_NULL_HANDLE)
@@ -655,11 +688,15 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
         }
         install_surface_on_state(d);
         // Initialise the viewport to the surface size if the app hasn't yet.
+        // Use g_state->eglDefaultWidth/Height (the actual drawable size, clamped
+        // to the swapchain size by install_surface_on_state) instead of d->width
+        // (the swapchain creation-time size, which may be stale if the window
+        // was resized after swapchain creation).
         if (c->state->viewportW <= 0 || c->state->viewportH <= 0) {
             c->state->viewportX = 0;
             c->state->viewportY = 0;
-            c->state->viewportW = d->width;
-            c->state->viewportH = d->height;
+            c->state->viewportW = g_state->eglDefaultWidth;
+            c->state->viewportH = g_state->eglDefaultHeight;
         }
     } else {
         install_surface_on_state(nullptr);

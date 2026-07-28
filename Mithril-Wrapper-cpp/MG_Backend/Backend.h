@@ -101,6 +101,17 @@ void backend_commit(void);
 void backend_set_active_swapchain(void* swapchain_state);
 
 /*
+ * Update the swapchain's tracked actual drawable size (from the native
+ * window's current size, e.g. CAMetalLayer.drawableSize). Called by EGL's
+ * install_surface_on_state() after each acquire so begin_render_pass() can
+ * clamp the render area to the ACTUAL IOSurface dimensions, not just the
+ * swapchain's creation-time extent. This prevents IOSurfaceBindAccel SIGSEGV
+ * when the drawableSize changed after swapchain creation (e.g. GLFW resized
+ * the window between swapchain creation and the first frame).
+ */
+void backend_swapchain_set_drawable_size(void* swapchain_state, int w, int h);
+
+/*
  * Drain any in-flight GPU work that references the active swapchain, then
  * detach the swapchain from the encoder so subsequent begin_render_pass() /
  * commit_frame() calls cannot record barriers against its (soon-to-be-destroyed)

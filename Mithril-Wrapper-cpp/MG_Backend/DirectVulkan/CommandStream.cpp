@@ -277,6 +277,62 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     e.depthView = depth_view;
     e.width = width;
     e.height = height;
+    int origW = width, origH = height;  // for clamp diagnostic log
+
+    // FIX (IOSurfaceBindAccel SIGSEGV): Clamp the render area to the
+    // swapchain image dimensions when rendering to FBO 0 (swapchain-bound).
+    //
+    // The GL viewport / eglDefaultWidth can exceed the swapchain image size
+    // when GLFW or the host app sets a window size that differs from the
+    // CAMetalLayer's drawableSize at swapchain creation time. On MoltenVK/iOS,
+    // the IOSurface backing the swapchain image has the drawableSize, NOT the
+    // GL viewport size. If renderArea.extent > IOSurface dimensions,
+    // IOSurfaceBindAccel dereferences out-of-bounds memory → SIGSEGV.
+    //
+    // This mirrors MobileGL's VkRenderPassManager (VkRenderPassManager.cpp:760),
+    // which clamps the render area to min(attachment dimensions, requested area).
+    //
+    // DOUBLE CLAMP: clamp to BOTH the swapchain creation-time size (sc->width)
+    // AND the actual drawable size (sc->actualDrawableWidth). The drawable
+    // size is updated by EGL after each acquire and reflects the ACTUAL
+    // IOSurface dimensions (which may differ from the swapchain's imageExtent
+    // if the drawableSize changed after swapchain creation). This is the
+    // critical fix for the crash where GLFW resized the window between
+    // swapchain creation and the first frame: the swapchain was created at
+    // 2204x1696, but the drawable shrank to 1752x1696, and the render area
+    // of 2204x1696 exceeded the 1752x1696 IOSurface → SIGSEGV.
+    if (e.activeSwapchain) {
+        Swapchain* sc = e.activeSwapchain;
+        bool swapchainBound = false;
+        for (int i = 0; i < e.colorCount; ++i) {
+            if (sc->currentImage >= 0 && sc->currentImage < (int)sc->views.size() &&
+                e.colorViews[i] == sc->views[sc->currentImage]) {
+                swapchainBound = true;
+                break;
+            }
+        }
+        if (swapchainBound) {
+            // Primary clamp: swapchain creation-time extent (VkImage size).
+            if (e.width > sc->width) e.width = sc->width;
+            if (e.height > sc->height) e.height = sc->height;
+            // Secondary clamp: actual drawable size (IOSurface size at acquire
+            // time). This catches the case where drawableSize shrank after
+            // swapchain creation — the IOSurface is smaller than the VkImage.
+            if (sc->actualDrawableWidth > 0 && e.width > sc->actualDrawableWidth)
+                e.width = sc->actualDrawableWidth;
+            if (sc->actualDrawableHeight > 0 && e.height > sc->actualDrawableHeight)
+                e.height = sc->actualDrawableHeight;
+        }
+        // Diagnostic: log when the render area was clamped (helps verify the
+        // IOSurfaceBindAccel fix is active). Only logs when clamping occurred.
+        if (e.width != origW || e.height != origH) {
+            MITHRIL_LOG_WARN("vk", "begin_render_pass: clamped renderArea "
+                              "%dx%d -> %dx%d (swapchain=%dx%d, drawable=%dx%d)",
+                              origW, origH, e.width, e.height,
+                              sc->width, sc->height,
+                              sc->actualDrawableWidth, sc->actualDrawableHeight);
+        }
+    }
 
     // ---- Layout barriers for the swapchain-backed default framebuffer ----
     // dynamic-rendering hard-codes imageLayout = COLOR_ATTACHMENT_OPTIMAL in
@@ -395,8 +451,11 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO_KHR;
     ri.renderArea.offset.x = 0;
     ri.renderArea.offset.y = 0;
-    ri.renderArea.extent.width = (uint32_t)width;
-    ri.renderArea.extent.height = (uint32_t)height;
+    // Use e.width/e.height (clamped to swapchain dimensions above) instead of
+    // the raw caller-provided width/height. This ensures renderArea never
+    // exceeds the swapchain image / IOSurface dimensions.
+    ri.renderArea.extent.width = (uint32_t)e.width;
+    ri.renderArea.extent.height = (uint32_t)e.height;
     ri.layerCount = 1;
     ri.colorAttachmentCount = (uint32_t)e.colorCount;
     ri.pColorAttachments = e.colorCount > 0 ? colorAttachs : nullptr;
@@ -481,17 +540,40 @@ void clear_attachments(uint32_t mask, int x, int y, int w, int h) {
 
     // Determine the clear rect. GL scissor test clips the clear region.
     // When scissor is disabled, clear the full framebuffer rect.
+    // Clamp to the render pass's effective dimensions (e.width/e.height),
+    // which were already clamped to the swapchain image dimensions in
+    // begin_render_pass. Without this, a clear rect larger than the
+    // attachment causes a spec violation (VUID-vkCmdClearAttachments-pRects-00016)
+    // and can crash MoltenVK's IOSurfaceBindAccel on iOS.
     VkClearRect rect{};
     if (mithril::g_state && mithril::g_state->scissorTest) {
         rect.rect.offset.x = mithril::g_state->scissorX;
         rect.rect.offset.y = mithril::g_state->scissorY;
         rect.rect.extent.width = (uint32_t)mithril::g_state->scissorW;
         rect.rect.extent.height = (uint32_t)mithril::g_state->scissorH;
+        // Clamp scissor rect to the render pass's effective dimensions
+        // (e.width/e.height, already clamped to drawable/swapchain size).
+        // A scissor rect extending past the IOSurface causes the same
+        // IOSurfaceBindAccel SIGSEGV as an oversized render area.
+        int32_t sx = (int32_t)rect.rect.offset.x;
+        int32_t sy = (int32_t)rect.rect.offset.y;
+        int32_t sw = (int32_t)rect.rect.extent.width;
+        int32_t sh = (int32_t)rect.rect.extent.height;
+        if (sx < 0) { sw += sx; sx = 0; }
+        if (sy < 0) { sh += sy; sy = 0; }
+        if (sx + sw > e.width)  sw = e.width - sx;
+        if (sy + sh > e.height) sh = e.height - sy;
+        if (sw < 0) sw = 0;
+        if (sh < 0) sh = 0;
+        rect.rect.offset.x = (uint32_t)sx;
+        rect.rect.offset.y = (uint32_t)sy;
+        rect.rect.extent.width = (uint32_t)sw;
+        rect.rect.extent.height = (uint32_t)sh;
     } else {
         rect.rect.offset.x = 0;
         rect.rect.offset.y = 0;
-        rect.rect.extent.width = (uint32_t)w;
-        rect.rect.extent.height = (uint32_t)h;
+        rect.rect.extent.width = (uint32_t)e.width;
+        rect.rect.extent.height = (uint32_t)e.height;
     }
     rect.baseArrayLayer = 0;
     rect.layerCount = 1;

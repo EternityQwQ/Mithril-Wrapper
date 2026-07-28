@@ -109,6 +109,13 @@ int backend_swapchain_needs_rebuild(void* swapchain_state) {
     return sc && sc->needsRebuild ? 1 : 0;
 }
 
+void backend_swapchain_set_drawable_size(void* swapchain_state, int w, int h) {
+    auto* sc = (mithril::vk::Swapchain*)swapchain_state;
+    if (!sc) return;
+    sc->actualDrawableWidth = w;
+    sc->actualDrawableHeight = h;
+}
+
 VkImage backend_swapchain_current_color_image(void* swapchain_state) {
     auto* sc = (mithril::vk::Swapchain*)swapchain_state;
     if (!sc || sc->currentImage < 0 || sc->currentImage >= (int)sc->images.size())
