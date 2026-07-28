@@ -86,6 +86,64 @@ void destroy_texture_entry(TextureEntry& e) {
     e.stagingSize = 0;
 }
 
+// ---- Deferred destruction (root cause U fix) ----
+// Push the entry's Vulkan handles into disposalQueue[currentFrame] and null
+// out the entry. The actual vkDestroy* / vkFreeMemory calls happen in
+// drain_disposal_queue() after the slot's fence is waited — by then the GPU
+// has finished all command buffers that might reference these resources.
+// This prevents the Metal resource UAF crash where MoltenVK's deferred
+// encoding (MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1) retains MTLBuffer/
+// MTLTexture wrappers that were already freed by an immediate vkDestroy*.
+void defer_destroy_buffer_entry(BufferEntry& e) {
+    Backend* b = backend();
+    if (!b->device) return;
+    if (e.mapped) { vkUnmapMemory(b->device, e.memory); e.mapped = nullptr; }
+    if (e.buffer == VK_NULL_HANDLE && e.memory == VK_NULL_HANDLE) return;
+    DeferredDestroy d;
+    d.buffer = e.buffer;
+    d.memory = e.memory;
+    b->disposalQueue[b->currentFrame].push_back(d);
+    e.buffer = VK_NULL_HANDLE;
+    e.memory = VK_NULL_HANDLE;
+    e.size = 0;
+}
+
+void defer_destroy_texture_entry(TextureEntry& e) {
+    Backend* b = backend();
+    if (!b->device) return;
+    if (e.view == VK_NULL_HANDLE && e.image == VK_NULL_HANDLE &&
+        e.memory == VK_NULL_HANDLE && e.stagingBuffer == VK_NULL_HANDLE &&
+        e.stagingMemory == VK_NULL_HANDLE) return;
+    DeferredDestroy d;
+    d.image = e.image;
+    d.view  = e.view;
+    d.memory = e.memory;
+    b->disposalQueue[b->currentFrame].push_back(d);
+    // Staging buffer/memory go in a separate entry (they may be independently
+    // non-null while the main image is null, e.g. during staging resize).
+    if (e.stagingBuffer != VK_NULL_HANDLE || e.stagingMemory != VK_NULL_HANDLE) {
+        DeferredDestroy ds;
+        ds.buffer = e.stagingBuffer;
+        ds.memory = e.stagingMemory;
+        b->disposalQueue[b->currentFrame].push_back(ds);
+    }
+    e.view = VK_NULL_HANDLE;
+    e.image = VK_NULL_HANDLE;
+    e.memory = VK_NULL_HANDLE;
+    e.stagingBuffer = VK_NULL_HANDLE;
+    e.stagingMemory = VK_NULL_HANDLE;
+    e.stagingSize = 0;
+}
+
+void defer_destroy_sampler_entry(SamplerEntry& e) {
+    Backend* b = backend();
+    if (!b->device || e.sampler == VK_NULL_HANDLE) return;
+    DeferredDestroy d;
+    d.sampler = e.sampler;
+    b->disposalQueue[b->currentFrame].push_back(d);
+    e.sampler = VK_NULL_HANDLE;
+}
+
 // ---- GL internalFormat -> VkFormat / host texel bytes / aspect mask ----
 // (Moved to FormatMap.{h,cpp} so they can be unit-tested without linking the
 // rest of the Vulkan backend. See FormatMap.h for the declarations.)
@@ -116,8 +174,17 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     size_t staging = tight_row * (size_t)h * (size_t)d;
 
     if (tex.stagingSize < staging) {
-        if (tex.stagingBuffer) { vkDestroyBuffer(b->device, tex.stagingBuffer, nullptr); tex.stagingBuffer = VK_NULL_HANDLE; }
-        if (tex.stagingMemory) { vkFreeMemory(b->device, tex.stagingMemory, nullptr); tex.stagingMemory = VK_NULL_HANDLE; }
+        // Deferred-destroy the old staging buffer — it may still be referenced
+        // by an in-flight command buffer's vkCmdCopyBufferToImage. Immediate
+        // destruction here was another source of the Metal UAF crash.
+        if (tex.stagingBuffer != VK_NULL_HANDLE || tex.stagingMemory != VK_NULL_HANDLE) {
+            DeferredDestroy ds;
+            ds.buffer = tex.stagingBuffer;
+            ds.memory = tex.stagingMemory;
+            b->disposalQueue[b->currentFrame].push_back(ds);
+            tex.stagingBuffer = VK_NULL_HANDLE;
+            tex.stagingMemory = VK_NULL_HANDLE;
+        }
         BufferEntry tmp;
         if (create_buffer(tmp, staging,
                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT, nullptr)) {
@@ -357,7 +424,7 @@ VkBuffer backend_get_or_create_buffer(GLuint name, const void* data, size_t size
     if (it != tbl.end() && it->second.size >= (VkDeviceSize)size && !data) {
         return it->second.buffer;
     }
-    if (it != tbl.end()) mithril::vk::destroy_buffer_entry(it->second);
+    if (it != tbl.end()) mithril::vk::defer_destroy_buffer_entry(it->second);
     mithril::vk::BufferEntry e;
     if (!mithril::vk::create_buffer(e, size,
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
@@ -390,7 +457,7 @@ void backend_delete_buffer(GLuint name) {
     auto& tbl = mithril::vk::buffer_table();
     auto it = tbl.find(name);
     if (it == tbl.end()) return;
-    mithril::vk::destroy_buffer_entry(it->second);
+    mithril::vk::defer_destroy_buffer_entry(it->second);
     tbl.erase(it);
 }
 
@@ -423,7 +490,7 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
         it->second.depth == depth) {
         return it->second.image;
     }
-    if (it != tbl.end()) mithril::vk::destroy_texture_entry(it->second);
+    if (it != tbl.end()) mithril::vk::defer_destroy_texture_entry(it->second);
 
     mithril::vk::TextureEntry e;
     e.format = fmt;
@@ -527,7 +594,7 @@ void backend_delete_texture(GLuint name) {
     auto& tbl = mithril::vk::texture_table();
     auto it = tbl.find(name);
     if (it == tbl.end()) return;
-    mithril::vk::destroy_texture_entry(it->second);
+    mithril::vk::defer_destroy_texture_entry(it->second);
     tbl.erase(it);
 }
 

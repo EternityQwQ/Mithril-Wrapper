@@ -217,6 +217,16 @@ bool ensure_command_buffer_recording() {
             return false;
         }
         b->fencePending[b->currentFrame] = false;
+        // The fence wait guarantees all GPU work submitted to this slot has
+        // completed. Any resources deferred to this slot's disposal queue
+        // (glDeleteBuffers / glBufferData orphan / glDeleteTextures from the
+        // frame that last used this slot) are now safe to actually destroy.
+        // Without this drain, the deferred VkBuffer/VkImage handles would
+        // leak until the slot is reused again (kMaxFramesInFlight later),
+        // and more critically, the drain would happen too late — the
+        // disposal queue would accumulate unboundedly during rapid buffer
+        // churn (e.g. MC's per-frame uniform buffer updates).
+        drain_disposal_queue(b->currentFrame);
     }
 
     // Switch the alias to the current slot's buffer and reset+begin it.
@@ -882,6 +892,11 @@ void drain_and_detach_swapchain() {
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
         b->fencePending[i] = false;
     }
+    // vkDeviceWaitIdle also guarantees all deferred resources are safe to
+    // destroy now — drain every slot's disposal queue before detaching the
+    // swapchain so no stale Vulkan handles outlive the swapchain they were
+    // created for.
+    drain_all_disposal_queues();
     // The command buffer alias still points at whatever slot was current when
     // commit_frame advanced. Mark it not-recording so the next
     // ensure_command_buffer_recording() will reset+begin it (safe now, since

@@ -520,6 +520,10 @@ void delete_program_resources(GLuint program) {
     if (it == tbl.end()) return;
     ProgramResources& pr = it->second;
     if (b->device) vkDeviceWaitIdle(b->device);
+    // vkDeviceWaitIdle guarantees all GPU work is complete — drain any
+    // deferred buffer/texture/sampler destruction queued by previous frames
+    // so no stale Vulkan handles outlive the program's shader modules.
+    drain_all_disposal_queues();
     for (auto& kv : pr.pipelines) {
         if (kv.second) vkDestroyPipeline(b->device, kv.second, nullptr);
     }

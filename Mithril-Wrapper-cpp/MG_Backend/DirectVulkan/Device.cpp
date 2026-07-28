@@ -36,6 +36,27 @@ bool backend_is_device_lost() {
     return backend()->deviceLost;
 }
 
+void drain_disposal_queue(int slot) {
+    Backend* b = backend();
+    if (!b->device || slot < 0 || slot >= kMaxFramesInFlight) return;
+    auto& q = b->disposalQueue[slot];
+    if (q.empty()) return;
+    for (auto& d : q) {
+        if (d.buffer)  vkDestroyBuffer(b->device, d.buffer, nullptr);
+        if (d.image)   vkDestroyImage(b->device, d.image, nullptr);
+        if (d.view)    vkDestroyImageView(b->device, d.view, nullptr);
+        if (d.memory)  vkFreeMemory(b->device, d.memory, nullptr);
+        if (d.sampler) vkDestroySampler(b->device, d.sampler, nullptr);
+    }
+    q.clear();
+}
+
+void drain_all_disposal_queues() {
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        drain_disposal_queue(i);
+    }
+}
+
 namespace {
 
 bool has_extension(const std::vector<VkExtensionProperties>& props, const char* name) {
@@ -416,6 +437,9 @@ void shutdown_device() {
     Backend* b = backend();
     if (!b->initialized) return;
     if (b->device) vkDeviceWaitIdle(b->device);
+    // After vkDeviceWaitIdle, all GPU work is complete — safe to destroy any
+    // deferred resources still sitting in the disposal queues.
+    drain_all_disposal_queues();
     if (b->pipelineCache) { vkDestroyPipelineCache(b->device, b->pipelineCache, nullptr); b->pipelineCache = VK_NULL_HANDLE; }
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
         if (b->frameFences[i]) { vkDestroyFence(b->device, b->frameFences[i], nullptr); b->frameFences[i] = VK_NULL_HANDLE; }

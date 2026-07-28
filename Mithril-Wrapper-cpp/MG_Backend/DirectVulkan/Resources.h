@@ -62,9 +62,23 @@ bool create_buffer(BufferEntry& out, VkDeviceSize size,
                    VkBufferUsageFlags usage, const void* data);
 
 // Destroy a buffer entry's Vulkan resources (does not erase the table slot).
+// Immediate destruction — only safe when no in-flight command buffer references
+// the buffer (e.g. create_buffer error paths, shutdown after vkDeviceWaitIdle).
 void destroy_buffer_entry(BufferEntry& e);
 // Destroy a texture entry's Vulkan resources (does not erase the table slot).
+// Immediate destruction — same safety constraint as destroy_buffer_entry.
 void destroy_texture_entry(TextureEntry& e);
+
+// Deferred destruction: move the entry's Vulkan handles into the current
+// frame slot's disposal queue and null out the entry. The handles are
+// actually destroyed kMaxFramesInFlight later when the slot's fence is waited
+// (see drain_disposal_queue in Device.cpp). Use this for any resource that
+// might be referenced by an in-flight command buffer (i.e. any resource
+// deleted during normal rendering — glDeleteBuffers, glDeleteTextures,
+// glBufferData orphan-rename, texture re-specification, staging buffer resize).
+void defer_destroy_buffer_entry(BufferEntry& e);
+void defer_destroy_texture_entry(TextureEntry& e);
+void defer_destroy_sampler_entry(SamplerEntry& e);
 
 // One-shot staging buffer -> image copy. Records into the active command
 // buffer (caller must have a recording command buffer). `format`/`type` are

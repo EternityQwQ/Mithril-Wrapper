@@ -14,12 +14,37 @@
 #define MITHRIL_DIRECTVULKAN_DEVICE_H
 
 #include <vulkan/vulkan.h>
+#include <vector>
 
 namespace mithril {
 namespace vk {
 
 // Minimum/maximum swapchain images in-flight (default 2; allows up to 3).
 constexpr int kMaxFramesInFlight = 2;
+
+// Deferred Vulkan resource destruction entry. When a GL buffer/texture/sampler
+// is deleted or orphaned (glBufferData rename), its underlying VkBuffer/VkImage/
+// VkDeviceMemory/VkImageView/VkSampler handles are pushed into a per-frame-slot
+// disposal queue instead of being destroyed immediately. The queue for slot S
+// is drained when ensure_command_buffer_recording() waits on fence[S] — at that
+// point all command buffers submitted to slot S have completed on the GPU, so
+// any Metal resources referenced by those command buffers are no longer in use.
+//
+// This fixes the Metal resource Use-After-Free crash (objc_retain of a zombie
+// IOGPUMetalResource in MVKGraphicsResourcesCommandEncoderState::encodeBindings
+// during vkEndCommandBuffer → MVKCmdDrawIndexed::encode). The crash occurred
+// because glDeleteBuffers / glBufferData orphan destroyed VkBuffers immediately
+// while MoltenVK's deferred encoding (MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1)
+// still held references to the corresponding MTLBuffer wrappers. With deferred
+// destruction, the VkBuffer (and its MTLBuffer) survives until the GPU finishes
+// all in-flight command buffers that reference it.
+struct DeferredDestroy {
+    VkBuffer       buffer = VK_NULL_HANDLE;
+    VkImage        image = VK_NULL_HANDLE;
+    VkImageView    view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkSampler      sampler = VK_NULL_HANDLE;
+};
 
 // Global Vulkan backend state. A single instance lives for the process; it is
 // created by backend_init() and torn down by backend_shutdown().
@@ -104,6 +129,15 @@ struct Backend {
     // 跳过实际 GPU 操作，避免日志死循环刷屏。
     bool             deviceLost = false;
     int              consecutiveSubmitFailures = 0;
+
+    // Deferred destruction queue: one bucket per frame slot. When a GL
+    // buffer/texture/sampler is deleted or orphaned, its Vulkan handles are
+    // pushed into disposalQueue[currentFrame] instead of being destroyed
+    // immediately. The bucket is drained in ensure_command_buffer_recording()
+    // after waiting on that slot's fence — at that point the GPU has finished
+    // all work submitted to that slot, so the deferred resources are safe to
+    // destroy. See DeferredDestroy above for the full rationale.
+    std::vector<DeferredDestroy> disposalQueue[kMaxFramesInFlight];
 };
 
 // Access the singleton backend state. Allocated on first call.
@@ -120,6 +154,17 @@ bool init_device();
 // Tear down everything created by init_device() (instance-level resources).
 // Resource/pipeline/swapchain objects are owned by their respective modules.
 void shutdown_device();
+
+// Drain the disposal queue for `slot`: actually call vkDestroy* / vkFreeMemory
+// for every deferred entry. MUST only be called after the GPU has finished all
+// work submitted to that slot (i.e. after vkWaitForFences on frameFences[slot]
+// or vkDeviceWaitIdle). Called by ensure_command_buffer_recording() after the
+// per-slot fence wait, and by drain_all_disposal_queues() after vkDeviceWaitIdle.
+void drain_disposal_queue(int slot);
+
+// Drain ALL disposal queue buckets. Called after vkDeviceWaitIdle (which
+// guarantees all GPU work is complete) and during shutdown_device().
+void drain_all_disposal_queues();
 
 } // namespace vk
 } // namespace mithril
