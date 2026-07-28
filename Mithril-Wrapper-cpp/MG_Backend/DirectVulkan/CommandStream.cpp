@@ -900,28 +900,39 @@ void drain_and_detach_swapchain() {
         return;
     }
     end_render_pass();
+
+    // FIX (IOSurfaceBindAccel SIGSEGV): Detach the swapchain BEFORE
+    // commit_frame so commit_frame does NOT execute the dummy render pass
+    // or layout transition on the newly-acquired image.
+    //
+    // When the swapchain is being rebuilt due to a size change,
+    // swapchain_present_and_acquire (called by eglSwapBuffers just before
+    // ensure_swapchain) already presented the old image and acquired the
+    // next one. That newly-acquired image's IOSurface has the OLD swapchain
+    // size, while the CAMetalLayer's drawableSize has already changed to
+    // the NEW size. If commit_frame runs its dummy render pass against this
+    // mismatched IOSurface, MoltenVK's IOSurfaceBindAccel dereferences an
+    // invalid/stale IOSurface → SIGSEGV (crash log: IOSurface+0x19cc).
+    //
+    // Since we are about to destroy the swapchain anyway, there is no need
+    // to transition layouts or bind IOSurfaces. Detaching first makes
+    // commit_frame see sc=nullptr, which sets shouldSubmit=false (when
+    // hasCommands is also false — the common case after eglSwapBuffers
+    // already committed), so it returns immediately without recording
+    // anything against the dying swapchain.
+    //
+    // This mirrors MobileGL's RecreateSwapchain (VulkanRenderer.cpp:7786+),
+    // which calls vkDeviceWaitIdle unconditionally and never records new
+    // commands against the dying swapchain.
+    set_active_swapchain(nullptr);
     commit_frame();
     vkDeviceWaitIdle(b->device);
 
-    // After vkDeviceWaitIdle, all in-flight command buffers across ALL slots
-    // have completed. Clear fencePending so the next ensure_command_buffer_recording()
-    // on any slot doesn't wait on an already-signaled fence (benign but wasteful,
-    // and the state should be clean for the new swapchain's first frame).
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
         b->fencePending[i] = false;
     }
-    // vkDeviceWaitIdle also guarantees all deferred resources are safe to
-    // destroy now — drain every slot's disposal queue before detaching the
-    // swapchain so no stale Vulkan handles outlive the swapchain they were
-    // created for.
     drain_all_disposal_queues();
-    // The command buffer alias still points at whatever slot was current when
-    // commit_frame advanced. Mark it not-recording so the next
-    // ensure_command_buffer_recording() will reset+begin it (safe now, since
-    // vkDeviceWaitIdle guarantees no buffer is pending).
     b->commandBufferRecording = false;
-
-    set_active_swapchain(nullptr);
 }
 
 } // namespace vk
