@@ -27,7 +27,8 @@ namespace vk {
 // SPIRV-Cross reflection (see DescriptorSet.cpp), and the cache of pipelines
 // derived from that program.
 struct ProgramResources {
-    VkShaderModule vertexModule = VK_NULL_HANDLE;
+    VkShaderModule vertexModule = VK_NULL_HANDLE;        // non-flipped (user FBO)
+    VkShaderModule vertexModuleFlipped = VK_NULL_HANDLE; // Y-flipped (default FBO)
     VkShaderModule fragmentModule = VK_NULL_HANDLE;
     // Cached pipelines keyed by a 64-bit signature (see Pipeline.cpp).
     std::unordered_map<uint64_t, VkPipeline> pipelines;
@@ -87,6 +88,10 @@ std::unordered_map<GLuint, ProgramResources>& program_table();
 //                      glColorMask changes create distinct pipelines.
 //   blend_src_alpha / blend_dst_alpha : GL blend factors for the alpha
 //                      channel (independent from RGB); part of the signature.
+//   is_default_fbo  : 1 when drawing to the default framebuffer (FBO 0),
+//                      which selects the Y-flipped vertex shader module and
+//                      is part of the pipeline signature hash so the two
+//                      SPIR-V variants get distinct cache entries.
 VkPipeline get_or_create_pipeline(GLuint program,
                                   const uint32_t* vertex_spirv, int vertex_word_count,
                                   const uint32_t* fragment_spirv, int fragment_word_count,
@@ -96,7 +101,8 @@ VkPipeline get_or_create_pipeline(GLuint program,
                                   int blend_enabled, GLenum blend_src, GLenum blend_dst,
                                   GLenum blend_src_alpha, GLenum blend_dst_alpha,
                                   int color_write_mask,
-                                  GLenum gl_primitive_mode);
+                                  GLenum gl_primitive_mode,
+                                  int is_default_fbo);
 
 // Release all Vulkan resources owned by a program (shader modules + pipelines).
 void delete_program_resources(GLuint program);

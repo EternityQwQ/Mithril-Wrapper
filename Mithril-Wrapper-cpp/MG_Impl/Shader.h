@@ -26,7 +26,7 @@ namespace mithril {
 
 // Translate a desktop GLSL Core Profile source string into Vulkan SPIR-V
 // words. Returns true on success. On failure, out_info_log is populated.
-// Results are cached by (stage, source hash, attrib bindings hash).
+// Results are cached by (stage, source hash, attrib bindings hash, flip_y).
 //
 // attrib_bindings maps attribute names to the location the application
 // requested via glBindAttribLocation(). When non-empty, the translator injects
@@ -34,9 +34,18 @@ namespace mithril {
 // that the SPIR-V stage_input locations match the application's vertex
 // descriptor layout. Pass nullptr when no explicit bindings are needed (falls
 // back to glslang auto-mapping).
+//
+// flip_y (vertex shaders only): when true, the translator injects a Y-flip
+// (gl_Position.y = -gl_Position.y) in addition to the always-applied Z remap
+// (gl_Position.z = (z+w)*0.5). The Y-flipped variant is used for draws into
+// the default framebuffer (FBO 0, rendered to the on-screen drawable); the
+// non-flipped variant is used for draws into user-created FBOs (whose
+// textures are sampled by GL shaders using GL Y-up coords). Fragment shaders
+// ignore flip_y. Deep reference: MobileGL GetShaderTransformFlags.
 bool shader_translate(GLenum gl_stage, const std::string& glsl_source,
                       std::vector<uint32_t>& out_spirv, std::string& out_info_log,
-                      const std::unordered_map<std::string, GLuint>* attrib_bindings = nullptr);
+                      const std::unordered_map<std::string, GLuint>* attrib_bindings = nullptr,
+                      bool flip_y = false);
 
 } // namespace mithril
 

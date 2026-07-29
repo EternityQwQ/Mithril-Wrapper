@@ -130,7 +130,15 @@ struct Program {
     // generated SPIR-V stage_input locations match the app's vertex descriptor.
     std::unordered_map<std::string, GLuint> attribBindings;
     // SPIR-V for each linked stage (consumed by backend_get_or_create_pipeline).
+    // vertexSpirv:        Z remap, NO Y flip — for user-created FBOs whose
+    //                     textures are sampled by GL shaders (GL Y-up coords).
+    // vertexSpirvYFlipped: Z remap + Y flip — for the default framebuffer (FBO 0)
+    //                     rendered directly to the on-screen drawable (Vulkan/Metal
+    //                     Y-down coords). Deep reference: MobileGL
+    //                     GetShaderTransformFlags (PositionYFlip only when
+    //                     currentDrawFBO->IsDefaultFramebuffer()).
     std::vector<uint32_t> vertexSpirv;
+    std::vector<uint32_t> vertexSpirvYFlipped;
     std::vector<uint32_t> fragmentSpirv;
 };
 

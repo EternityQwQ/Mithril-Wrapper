@@ -26,20 +26,33 @@ static void prepare_draw(GLenum mode) {
     // Resolve current program + its SPIR-V.
     mithril::Program* prog = mithril::state_get_program(g_state->currentProgram);
     if (!prog || !prog->linked) return;
+
+    // Determine whether we are drawing to the default framebuffer (FBO 0) or a
+    // user-created FBO. This selects the Y-flipped vs non-flipped vertex SPIR-V
+    // variant: the default framebuffer renders to the on-screen drawable
+    // (Vulkan/Metal Y-down), so it needs the Y-flipped variant; user FBOs
+    // render into textures sampled by GL shaders (GL Y-up), so they use the
+    // non-flipped variant. Deep reference: MobileGL GetShaderTransformFlags.
+    bool is_default_fbo = (g_state->currentDrawFBO == 0);
+    const std::vector<uint32_t>& vs_spirv = is_default_fbo
+        ? prog->vertexSpirvYFlipped : prog->vertexSpirv;
+
     // Defensive: skip draws whose shader translation produced no SPIR-V
     // (e.g. glslang failed on an unrecognised construct). Issuing the draw
     // would pass null/0 to backend_get_or_create_pipeline, which would
     // either crash on the SPIR-V pointer or fail pipeline creation silently
     // and leave the screen black. Logging once per program id keeps the log
     // readable when the host retries the same broken shader every frame.
-    if (prog->vertexSpirv.empty() || prog->fragmentSpirv.empty()) {
+    if (vs_spirv.empty() || prog->fragmentSpirv.empty()) {
         static GLuint last_warned = 0;
         if (last_warned != prog->id) {
             last_warned = prog->id;
             MITHRIL_LOG_WARN("gl", "prepare_draw: program %u has empty SPIR-V "
-                              "(vertex=%zu fragment=%zu words); skipping draw",
+                              "(vertex=%zu vertexYFlip=%zu fragment=%zu words, "
+                              "is_default_fbo=%d); skipping draw",
                               prog->id, prog->vertexSpirv.size(),
-                              prog->fragmentSpirv.size());
+                              prog->vertexSpirvYFlipped.size(),
+                              prog->fragmentSpirv.size(), (int)is_default_fbo);
         }
         return;
     }
@@ -135,7 +148,7 @@ static void prepare_draw(GLenum mode) {
     if (g_state->colorMask[3]) cwm_bits |= 8;
     VkPipeline pipeline = backend_get_or_create_pipeline(
         prog->id,
-        prog->vertexSpirv.data(),   (int)prog->vertexSpirv.size(),
+        vs_spirv.data(),            (int)vs_spirv.size(),
         prog->fragmentSpirv.data(), (int)prog->fragmentSpirv.size(),
         attribs, attrib_count,
         color_formats, color_count,
@@ -146,7 +159,8 @@ static void prepare_draw(GLenum mode) {
         g_state->blendSrcA,
         g_state->blendDstA,
         cwm_bits,
-        mode);
+        mode,
+        is_default_fbo ? 1 : 0);
     if (pipeline == VK_NULL_HANDLE) return;
 
     // Begin render pass (Load action preserves previous contents).
@@ -175,16 +189,35 @@ static void prepare_draw(GLenum mode) {
     } else {
         backend_set_scissor(0, 0, g_state->viewportW, g_state->viewportH);
     }
-    // FIX (root cause H): ALWAYS set cull mode. VK_DYNAMIC_STATE_CULL_MODE is
-    // dynamic; skipping the call when cullFace is disabled leaves the previous
-    // draw's cull mode active → stale culling culls geometry incorrectly.
-    // When cullFace is off, explicitly set VK_CULL_MODE_NONE.
+    // FIX (root cause H + Y-flip winding fix): ALWAYS set cull mode.
+    // VK_DYNAMIC_STATE_CULL_MODE is dynamic; skipping the call when cullFace is
+    // disabled leaves the previous draw's cull mode active → stale culling
+    // culls geometry incorrectly. When cullFace is off, explicitly set
+    // VK_CULL_MODE_NONE.
+    //
+    // Y-flip winding adjustment (deep reference: MobileGL
+    // ConvertCullFaceModeToVkEnum + VulkanRenderer frontFace=CLOCKWISE):
+    // When the vertex Y is flipped (default framebuffer), triangle winding
+    // inverts (CCW→CW, CW→CCW). To keep the GL-intended faces visible:
+    //   - Swap the cull mode: GL_FRONT→VK_BACK, GL_BACK→VK_FRONT
+    //   - Hardcode frontFace to CLOCKWISE (the inverted winding makes GL's
+    //     CCW triangles appear as CW in Vulkan). MobileGL does the same.
+    // User FBOs (no Y flip) keep the original cull mode and frontFace.
     if (g_state->cullFace) {
-        int mode_cull = 0;
-        if (g_state->cullMode == GL_FRONT) mode_cull = 1;
-        else if (g_state->cullMode == GL_BACK) mode_cull = 2;
-        backend_set_cull_mode(mode_cull);
-        backend_set_front_face(g_state->frontFace == GL_CCW ? 1 : 0);
+        bool invert_clockwise = is_default_fbo;  // Y flipped → winding inverted
+        int vk_cull = 0;
+        if (g_state->cullMode == GL_FRONT) {
+            vk_cull = invert_clockwise ? 2 /*VK_BACK*/ : 1 /*VK_FRONT*/;
+        } else if (g_state->cullMode == GL_BACK) {
+            vk_cull = invert_clockwise ? 1 /*VK_FRONT*/ : 2 /*VK_BACK*/;
+        } else {  // GL_FRONT_AND_BACK
+            vk_cull = 3;  // VK_CULL_MODE_FRONT_AND_BACK (unaffected by invert)
+        }
+        backend_set_cull_mode(vk_cull);
+        // frontFace hardcoded CLOCKWISE for Y-flipped draws; for user FBOs use
+        // the GL frontFace directly (CCW=1, CW=0).
+        backend_set_front_face(invert_clockwise ? 0 /*CW*/ :
+                               (g_state->frontFace == GL_CCW ? 1 : 0));
     } else {
         backend_set_cull_mode(0);  // VK_CULL_MODE_NONE
     }
