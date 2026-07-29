@@ -872,29 +872,49 @@ void commit_frame() {
     vkResetFences(b->device, 1, &fence);
     r = vkQueueSubmit(b->graphicsQueue, 1, &si, fence);
     if (r != VK_SUCCESS) {
-        // Classify the failure: VK_ERROR_OUT_OF_DATE_KHR / VK_SUBOPTIMAL_KHR
-        // are swapchain-rebuild signals handled by the eglSwapBuffers path,
-        // NOT fatal GPU faults. Every other non-success result (DEVICE_LOST,
-        // OUT_OF_DEVICE_MEMORY, OUT_OF_HOST_MEMORY, INVALID_EXTERNAL_HANDLE,
-        // and any other negative VkResult) indicates a persistent GPU fault
-        // and is counted toward the deviceLost threshold.
-        if (r != VK_ERROR_OUT_OF_DATE_KHR && r != VK_SUBOPTIMAL_KHR) {
-            b->consecutiveSubmitFailures++;
-            if (b->consecutiveSubmitFailures >= 3 && !b->deviceLost) {
-                b->deviceLost = true;
-                MITHRIL_LOG_ERROR("vk", "Persistent GPU fault detected after %d "
-                                  "consecutive submit failures — rendering "
-                                  "suspended to prevent log flooding",
-                                  b->consecutiveSubmitFailures);
+        // FIX (rendering suspended 根因): 彻底重新设计 submit 失败处理。
+        //
+        // 原实现：连续 3 次 submit 失败 → deviceLost=true → "rendering suspended"
+        // 这导致 OOM 时渲染被永久挂起，即使后续显存已释放也无法恢复。
+        //
+        // 新策略（参考 MobileGL TryDrainFrameTransients）：
+        // - VK_ERROR_OUT_OF_DATE_KHR / VK_SUBOPTIMAL_KHR → 重建 swapchain，不挂起
+        // - VK_ERROR_DEVICE_LOST → 设置 deviceLost（真正的设备丢失，需要重建）
+        // - VK_ERROR_OUT_OF_DEVICE_MEMORY → 触发 OOM GC，跳过当前帧，不挂起
+        // - 其他错误 → 跳过当前帧，不挂起
+        //
+        // 关键改变：OOM 不再导致永久挂起。每帧 OOM 时触发 GC 释放资源，
+        // 下一帧重试。只有真正的 VK_ERROR_DEVICE_LOST 才设置 deviceLost，
+        // 且 deviceLost 可被 EGL 恢复路径清除。
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) {
+            // swapchain 过期：标记重建，不计数，不挂起
+            if (sc) sc->needsRebuild = true;
+        } else if (r == VK_ERROR_DEVICE_LOST) {
+            // 真正的设备丢失：设置 deviceLost，让 EGL 恢复路径处理
+            b->deviceLost = true;
+            static int deviceLostLogCount = 0;
+            deviceLostLogCount++;
+            if (deviceLostLogCount <= 3 || deviceLostLogCount % 100 == 0) {
+                MITHRIL_LOG_ERROR("vk", "vkQueueSubmit returned VK_ERROR_DEVICE_LOST "
+                                  "(occurrence #%d) — deviceLost set, EGL will "
+                                  "attempt recovery", deviceLostLogCount);
             }
-        }
-        // Throttle the per-failure log: first failure, then every 100th.
-        // Once deviceLost is set, commit_frame returns early above and this
-        // path is no longer reached.
-        if (b->consecutiveSubmitFailures == 1 ||
-            b->consecutiveSubmitFailures % 100 == 0) {
-            MITHRIL_LOG_ERROR("vk", "vkQueueSubmit failed (rc=%d) — marking "
-                              "swapchain for rebuild", (int)r);
+        } else {
+            // OOM 或其他错误：触发 OOM GC，不设置 deviceLost
+            b->consecutiveSubmitFailures++;
+            static int submitFailCount = 0;
+            submitFailCount++;
+            if (submitFailCount <= 3 || submitFailCount % 100 == 0) {
+                MITHRIL_LOG_ERROR("vk", "vkQueueSubmit failed (rc=%d, occurrence "
+                                  "#%d) — triggering OOM GC, skipping frame",
+                                  (int)r, submitFailCount);
+            }
+            // OOM 主动 GC：等待 GPU 完成 + 释放所有延迟资源
+            // 参考 MobileGL TryDrainFrameTransients（每帧 present 前主动 drain）
+            if (b->device) {
+                vkDeviceWaitIdle(b->device);
+            }
+            drain_all_disposal_queues();
         }
         // vkQueueSubmit failure (e.g. VK_ERROR_OUT_OF_DEVICE_MEMORY /
         // VK_ERROR_DEVICE_LOST) means the command buffer was NOT consumed.
@@ -983,6 +1003,20 @@ void commit_frame() {
     b->frameGeneration++;
 
     e.hasCommands = false;  // fresh command buffer, no commands yet
+
+    // FIX (显存耗尽根因 - 主动式 GC，深度参考 MobileGL):
+    // 提交成功后立即非阻塞 poll 所有 slot 的 fence。刚提交的 slot 不会
+    // 立即完成（GPU 还在执行），但 OTHER slot（kMaxFramesInFlight-1 帧前
+    // 提交的）可能已经完成，其 disposalQueue 可以立即 drain。
+    //
+    // 这镜像 MobileGL Present() 末尾的 m_textureManager->BeginFrame() +
+    // m_bufferManager.BeginFrame()，在帧边界释放已完成帧的延迟资源。
+    // 相比只在 eglSwapBuffers 开头 poll，这里多一次机会：commit_frame
+    // 可能在 eglWaitClient（mid-frame flush）中被调用，此时 poll 能更早
+    // 释放资源，降低后续 stage_and_copy_image 的显存压力。
+    //
+    // 非阻塞：vkGetFenceStatus 立即返回，不影响渲染性能。
+    backend_poll_completed_frames();
 }
 
 /*

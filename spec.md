@@ -153,16 +153,111 @@ eglSwapBuffers()
 | 日志控制 | 无去重，硬断言即 abort | 全链路去重限流 |
 | present 黑屏 | 有 presentSuspended 路径 | 有 deviceLost 恢复路径 |
 
-## 五、剩余待修复项
+## 五、关键架构修复（rendering suspended 根因）
 
-### 5.1 长期改进：引入 VMA（Vulkan Memory Allocator）— 低优先级
+### 5.1 移除过早的 deviceLost 挂起机制
+
+**问题**：原实现在 `vkQueueSubmit` / `vkQueuePresentKHR` 连续失败 3 次后就设置 `deviceLost=true`，导致 "Persistent GPU fault detected — rendering suspended"。这让 OOM 变成永久性挂起，即使显存后续释放也无法恢复。
+
+**根因分析**（深度参考 MobileGL）：
+- MobileGL 用 `VK_VERIFY(vkQueueSubmit(...))` 在失败时直接 abort 进程
+- MobileGL **不会** OOM，因为它在每帧 present 前调用 `TryDrainFrameTransients()` 主动释放资源
+- Mithril 的 `consecutiveSubmitFailures >= 3` 机制是我自己加的有害逻辑
+
+**修复**：
+- `vkQueueSubmit` 失败：按错误类型分类处理
+  - `VK_ERROR_OUT_OF_DATE_KHR` / `VK_SUBOPTIMAL_KHR` → 标记 swapchain 重建，不挂起
+  - `VK_ERROR_DEVICE_LOST` → 设置 deviceLost（真正的设备丢失），EGL 恢复路径处理
+  - `VK_ERROR_OUT_OF_DEVICE_MEMORY` / 其他 → **触发 OOM GC**（vkDeviceWaitIdle + drain），跳过当前帧，**不挂起**
+- `vkQueuePresentKHR` 失败：同样的分类策略
+- OOM 不再导致永久挂起，每帧 OOM 时触发 GC 释放资源，下一帧重试
+
+### 5.2 OOM 主动 GC（已在 3.1 实现）
+
+`try_allocate_memory_with_gc()` 在 `vkAllocateMemory` 失败时触发 GC 重试。现在 submit/present 失败时也触发同样的 GC。
+
+## 六、关键架构修复 v2（主动式 GC — 彻底解决显存耗尽）
+
+### 6.1 问题：反应式 GC 不够，OOM 仍发生
+
+经过 5.1/5.2 的修复，"rendering suspended" 不再出现，但用户反馈 GPU OOM / Device Lost 仍发生。
+
+**深度分析**：5.1/5.2 的 GC 都是**反应式**（reactive）—— 在 `vkAllocateMemory` 失败**之后**才触发 GC。但此时：
+1. GPU 可能已进入降级状态（timeout 错误开始级联）
+2. MoltenVK 可能已返回 `VK_ERROR_DEVICE_LOST`
+3. 即使 GC 释放了显存，设备状态已不可恢复
+
+**MobileGL 的真正秘诀**：MobileGL 是**主动式**（proactive）—— 每帧 `Present()` 末尾调用：
+```cpp
+m_textureManager->BeginFrame(frameIndex);   // CollectAllDeferredReleases
+m_bufferManager.BeginFrame(frameIndex);      // CollectAllDeferredReleases
+m_uniformManager->BeginFrame(frameIndex);    // rewind descriptor cursors
+```
+这些 `BeginFrame` 在**新帧开始前**释放上一帧已完成的延迟资源，**永远不让显存累积到 OOM**。MobileGL 的 `vkAllocateMemory` 根本不会失败。
+
+### 6.2 修复：三层主动式 GC 策略
+
+#### 6.2.1 `backend_poll_completed_frames()` — 非阻塞轮询 drain
+
+**文件**: `Device.cpp:127-168`, `Device.h:189-209`
+
+用 `vkGetFenceStatus`（非阻塞）轮询所有 frame slot 的 fence。对已 signal 的 slot 立即 drain 其 `disposalQueue`。
+
+参考 MobileGL `RefreshCompletedSubmits`（VulkanRenderer.cpp:7199-7237）+ `CollectAllDeferredReleases`。
+
+**关键区别**：原实现只在 `ensure_command_buffer_recording` 复用某个 slot 时才 drain **该 slot**。现在能 drain **任意已完成 slot**，即使当前不在复用它。`kMaxFramesInFlight=2` 时，slot 0 的 GPU 工作可能在 slot 1 录制期间就完成，原实现要等下次循环回 slot 0 才 drain，现在立即 drain。
+
+**调用点**（3 处，镜像 MobileGL 的多 drain 点）：
+1. `eglSwapBuffers` 开头（`egl.cpp:816`）— 新帧渲染前释放已完成帧资源
+2. `commit_frame` 成功路径末尾（`CommandStream.cpp:1019`）— submit 后立即释放其他 slot
+3. `backend_proactive_gc_if_needed` 内部（`Device.cpp:202`）— 压力 GC 先尝试非阻塞
+
+#### 6.2.2 `backend_proactive_gc_if_needed()` — 内存压力阈值 GC
+
+**文件**: `Device.cpp:173-226`, `Device.h:211-224`
+
+当 `currentAllocationCount >= 70% * maxMemoryAllocationCount` 时，**在分配前**主动触发 GC：
+1. 先非阻塞 `backend_poll_completed_frames()`（可能已足够）
+2. 若仍超阈值且有 deferred 资源，才 `vkDeviceWaitIdle + drain_all_disposal_queues`
+
+**调用点**: `try_allocate_memory_with_gc` 开头（`Resources.cpp:59`）— 每次 `vkAllocateMemory` 前检查压力。
+
+这把 GC 从"失败后兜底"提升为"压力前预防"，在 GPU 进入降级状态前释放显存。
+
+#### 6.2.3 调用流程图
+
+```
+eglSwapBuffers()
+  ├─ backend_poll_completed_frames()     ← 6.2.1: 新帧前 drain 已完成 slot
+  ├─ [deviceLost 恢复路径]
+  ├─ backend_end_render_pass()
+  ├─ backend_commit() → commit_frame()
+  │   ├─ vkQueueSubmit()
+  │   └─ backend_poll_completed_frames() ← 6.2.1: submit 后 drain 其他 slot
+  ├─ backend_present_and_acquire()
+  └─ [swapchain rebuild if needed]
+
+try_allocate_memory_with_gc()           ← 每次纹理/buffer 分配
+  ├─ backend_proactive_gc_if_needed()   ← 6.2.2: 70% 阈值主动 GC
+  ├─ vkAllocateMemory()
+  └─ [失败后 GC 重试 — 5.2 的兜底]
+```
+
+### 6.3 预期效果
+
+- **显存峰值降低**：staging buffer 在 GPU 完成后立即释放（同帧或下一帧开头），不再累积 2 帧
+- **OOM 发生前预防**：70% 阈值触发 GC，避免撞硬限制导致 GPU timeout/device lost 级联
+- **非阻塞优先**：`vkGetFenceStatus` 立即返回，只在真正需要时才 `vkDeviceWaitIdle`
+- **多 drain 点**：镜像 MobileGL 的 Present/Flush/Wait 多点 drain 策略
+
+### 6.4 长期改进：引入 VMA（Vulkan Memory Allocator）— 低优先级
 
 - 替代独立 `vkAllocateMemory`，减少 allocation 数量
 - 子分配（sub-allocation）将一个 `VkDeviceMemory` 切分给多个 buffer/image
 - 需要完整重构 Resources.cpp 的分配路径
-- 当前钳制到 4096 + staging buffer 延迟释放已足够稳定
+- 当前三层主动式 GC + 钳制到 4096 + staging buffer 延迟释放已足够稳定
 
-## 六、验证标准
+## 七、验证标准
 
 - [ ] iPhone SE 3 能正常进入游戏主界面
 - [ ] 长时间运行（>30分钟）显存占用稳定不增长

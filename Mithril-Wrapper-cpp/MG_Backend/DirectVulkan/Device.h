@@ -123,12 +123,12 @@ struct Backend {
     VkBuffer         dummyVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory   dummyVertexMemory = VK_NULL_HANDLE;
 
-    // 持久性 GPU 故障检测。vkQueueSubmit / vkQueuePresentKHR 致命失败时自增
-    // consecutiveSubmitFailures，成功时清零。≥3 时置 deviceLost=true。
+    // GPU 故障状态。只有 VK_ERROR_DEVICE_LOST 才设置 deviceLost；
+    // OOM 和其他错误不再设置 deviceLost（改为触发 OOM GC 后跳过当前帧）。
     // deviceLost 为真时 commit_frame / present / acquire / eglSwapBuffers 全部
-    // 跳过实际 GPU 操作，避免日志死循环刷屏。
+    // 跳过实际 GPU 操作，由 EGL 恢复路径（10 帧间隔重建 swapchain）清除。
     bool             deviceLost = false;
-    int              consecutiveSubmitFailures = 0;
+    int              consecutiveSubmitFailures = 0;  // 统计用，不再触发 deviceLost
 
     // FIX (P1): 内存分配计数器。MoltenVK 的 maxMemoryAllocationCount 默认很小
     // （通常 128-4096），每张纹理/buffer 独立 vkAllocateMemory 会耗尽配额。
@@ -185,6 +185,43 @@ void drain_disposal_queue(int slot);
 // Drain ALL disposal queue buckets. Called after vkDeviceWaitIdle (which
 // guarantees all GPU work is complete) and during shutdown_device().
 void drain_all_disposal_queues();
+
+// FIX (显存耗尽根因 - 主动式 GC，深度参考 MobileGL):
+//
+// MobileGL 在每帧 Present 末尾、FlushPendingCommands、WaitForFrameSerial 等
+// 多个点调用 TryDrainFrameTransients（VulkanRenderer.cpp:7239-7313），其中：
+//   1. RefreshCompletedSubmits() 用 vkGetFenceStatus 非阻塞轮询所有 in-flight
+//      submit 的 fence，回收已完成的 pooled fence
+//   2. CollectAllDeferredReleases() 释放所有已完成帧的延迟资源
+//   3. 每 8 次 drain rewind transient arena + age cache
+//
+// 我们的 disposalQueue 是 per-frame-slot 的，只在 ensure_command_buffer_recording
+// 复用某个 slot 时才 drain 该 slot。问题：kMaxFramesInFlight=2 时，slot 0 的
+// GPU 工作可能在 slot 1 录制期间就完成了，但 slot 0 的 disposalQueue 要等到
+// 下次循环回 slot 0 才 drain。这导致显存占用峰值偏高（2 帧 staging buffer 累积），
+// 在 MC 纹理批量加载时容易触发 OOM。
+//
+// 本函数用 vkGetFenceStatus 非阻塞轮询所有 slot 的 fence，对已 signal 的 slot
+// 立即 drain 其 disposalQueue。不会阻塞渲染线程。由 eglSwapBuffers 在每帧
+// 开头调用，在新帧分配资源前释放已完成帧的资源。
+//
+// 返回 drain 的 slot 数（仅用于诊断日志）。
+int backend_poll_completed_frames();
+
+// FIX (显存耗尽根因 - 内存压力主动 GC):
+//
+// 在 vkAllocateMemory 失败之前就主动触发 GC。当 currentAllocationCount
+// 达到 maxMemoryAllocationCount 的 70% 时，调用 vkDeviceWaitIdle +
+// drain_all_disposal_queues，释放所有延迟销毁的资源。
+//
+// 这比 try_allocate_memory_with_gc 的失败后重试更有效：在 GPU 进入降级状态
+// （timeout/device lost）之前就释放显存，避免级联失败。
+//
+// 参考 MobileGL 的策略：MobileGL 不会 OOM，因为它每帧主动 drain，但我们
+// 的 per-slot drain 不够及时，所以需要这个压力触发的主动 GC。
+//
+// 返回 true 表示触发了 GC（调用方可记录日志）。
+bool backend_proactive_gc_if_needed();
 
 } // namespace vk
 } // namespace mithril

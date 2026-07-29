@@ -797,6 +797,24 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     EglSurface* s = (EglSurface*)surface;
     if (!s) { set_error(EGL_BAD_SURFACE); return EGL_FALSE; }
 
+    // FIX (显存耗尽根因 - 主动式 GC，深度参考 MobileGL):
+    // 在每帧渲染开始前，非阻塞轮询所有帧槽位的 fence，对已完成的 slot
+    // 立即 drain 其 disposalQueue。这在新帧分配资源前释放已完成帧的
+    // staging buffer / 旧纹理 / orphaned buffer，降低显存占用峰值。
+    //
+    // MobileGL 在 Present() 末尾调用 m_textureManager->BeginFrame() +
+    // m_bufferManager.BeginFrame() + m_uniformManager->BeginFrame()，这些
+    // BeginFrame 会 CollectAllDeferredReleases 释放已完成帧的延迟资源。
+    // 我们没有分层的 texture/buffer manager，所以用统一的
+    // backend_poll_completed_frames 在帧边界做同样的事。
+    //
+    // 关键：这是非阻塞的（vkGetFenceStatus 立即返回），不会 stall 渲染线程。
+    // 只有 GPU 真正完成的 slot 才 drain，避免 UAF。
+    //
+    // 注意：在 deviceLost 检查之前调用，确保即使 deviceLost 恢复路径也能
+    // 释放已完成帧的资源（poll 只处理 fencePending=true 且 fence=signaled 的 slot）。
+    mithril::vk::backend_poll_completed_frames();
+
     // 持久性 GPU 故障挂起守卫：一旦 backend 进入 deviceLost 状态，立即静默返回，
     // 跳过 ensure_swapchain 重建、present、commit 等所有 GPU 操作，避免每帧尝试
     // 重建 swapchain 形成死循环刷屏（见 latestlog.txt 中 ~3000 行 rebuilding 日志）。

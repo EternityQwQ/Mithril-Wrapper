@@ -108,6 +108,123 @@ void drain_all_disposal_queues() {
     }
 }
 
+// FIX (显存耗尽根因 - 主动式 GC，深度参考 MobileGL):
+// 实现 backend_poll_completed_frames：非阻塞轮询所有帧槽位的 fence，
+// 对已完成的 slot 立即 drain 其 disposalQueue。
+//
+// MobileGL 的 RefreshCompletedSubmits（VulkanRenderer.cpp:7199-7237）用
+// vkGetFenceStatus 做 prefix-only scan，回收已完成的 pooled fence。
+// 我们做类似的事：遍历所有 slot，对 fencePending[s]==true 的 slot 调用
+// vkGetFenceStatus，若 VK_SUCCESS 则 drain 并清除 fencePending 标志。
+//
+// 关键：这是非阻塞的。vkGetFenceStatus 立即返回，不会 stall 渲染线程。
+// 只有当 GPU 真正完成该 slot 的工作时才 drain，避免在 GPU 还在执行时
+// 释放被引用的资源。
+//
+// 注意：drain 后 fencePending[s] 被清除，但 ensure_command_buffer_recording
+// 复用该 slot 时仍会检查 fencePending——为 false 时跳过 vkWaitForFences，
+// 这是正确的（fence 已 signaled，无需等待）。
+int backend_poll_completed_frames() {
+    Backend* b = backend();
+    if (!b->initialized || !b->device) return 0;
+
+    int drainedSlots = 0;
+    for (int s = 0; s < kMaxFramesInFlight; ++s) {
+        if (!b->fencePending[s]) continue;  // 无 pending submit，跳过
+        if (b->disposalQueue[s].empty()) {
+            // 队列为空：但 fence 可能仍 pending。检查 fence 状态以清除
+            // fencePending 标志（让后续 ensure_command_buffer_recording 跳过等待）。
+            // 不计入 drainedSlots（没有实际释放资源）。
+            VkResult fr = vkGetFenceStatus(b->device, b->frameFences[s]);
+            if (fr == VK_SUCCESS) {
+                b->fencePending[s] = false;
+            }
+            continue;
+        }
+        // 有 pending submit 且 disposalQueue 非空：检查 fence
+        VkResult fr = vkGetFenceStatus(b->device, b->frameFences[s]);
+        if (fr == VK_SUCCESS) {
+            // GPU 已完成该 slot 的所有工作，安全 drain
+            drain_disposal_queue(s);
+            b->fencePending[s] = false;
+            drainedSlots++;
+        }
+        // VK_NOT_READY：GPU 还在执行，不 drain（避免 UAF）
+        // 其他错误码（如 VK_ERROR_DEVICE_LOST）：不 drain，交给 deviceLost 恢复路径
+    }
+
+    if (drainedSlots > 0) {
+        // 限流日志：仅在释放了大量资源时打印
+        static int pollDrainLogCount = 0;
+        pollDrainLogCount++;
+        if (pollDrainLogCount <= 5 || pollDrainLogCount % 200 == 0) {
+            MITHRIL_LOG_INFO("vk", "proactive poll: drained %d completed frame "
+                              "slot(s) (occurrence #%d) — freed deferred "
+                              "resources before new allocations",
+                              drainedSlots, pollDrainLogCount);
+        }
+    }
+    return drainedSlots;
+}
+
+// FIX (显存耗尽根因 - 内存压力主动 GC):
+// 当 allocationCount 接近上限时，主动触发 GC。
+// 阈值：70% of maxMemoryAllocationCount。在达到硬限制之前释放资源。
+bool backend_proactive_gc_if_needed() {
+    Backend* b = backend();
+    if (!b->initialized || !b->device) return false;
+    if (b->maxMemoryAllocationCount == 0) return false;  // 未知限制，不触发
+
+    // 70% 阈值：在硬限制之前主动释放
+    uint32_t threshold = (b->maxMemoryAllocationCount * 7) / 10;
+    if (b->currentAllocationCount < threshold) return false;
+
+    // 检查是否有可释放的资源（任一 slot 的 disposalQueue 非空）
+    bool hasDeferred = false;
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (!b->disposalQueue[i].empty()) { hasDeferred = true; break; }
+    }
+    if (!hasDeferred) return false;  // 没有可释放的，GC 无意义
+
+    static int proactiveGcCount = 0;
+    proactiveGcCount++;
+    // 限流日志：首次 + 每 20 次
+    if (proactiveGcCount <= 3 || proactiveGcCount % 20 == 0) {
+        MITHRIL_LOG_WARN("vk", "proactive GC triggered: allocationCount "
+                          "%u/%u (>=70%% threshold %u) — draining before "
+                          "OOM (attempt #%d)",
+                          (unsigned)b->currentAllocationCount,
+                          (unsigned)b->maxMemoryAllocationCount,
+                          (unsigned)threshold, proactiveGcCount);
+    }
+
+    // 先非阻塞 poll（可能已经完成，无需 vkDeviceWaitIdle 阻塞）
+    backend_poll_completed_frames();
+
+    // 如果 poll 后仍超阈值，且仍有 deferred 资源，才阻塞等待
+    bool stillHasDeferred = false;
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (!b->disposalQueue[i].empty()) { stillHasDeferred = true; break; }
+    }
+    if (stillHasDeferred && b->currentAllocationCount >= threshold) {
+        if (b->device) {
+            vkDeviceWaitIdle(b->device);
+        }
+        drain_all_disposal_queues();
+        // 清除所有 fencePending（vkDeviceWaitIdle 后所有 fence 已 signaled）
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            b->fencePending[i] = false;
+        }
+        if (proactiveGcCount <= 3 || proactiveGcCount % 20 == 0) {
+            MITHRIL_LOG_WARN("vk", "proactive GC: vkDeviceWaitIdle + "
+                              "drain_all completed, allocationCount now %u/%u",
+                              (unsigned)b->currentAllocationCount,
+                              (unsigned)b->maxMemoryAllocationCount);
+        }
+    }
+    return true;
+}
+
 namespace {
 
 bool has_extension(const std::vector<VkExtensionProperties>& props, const char* name) {

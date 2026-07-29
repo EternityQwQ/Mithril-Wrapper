@@ -44,6 +44,20 @@ uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props) {
 VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo* info,
                                      const VkAllocationCallbacks* allocator,
                                      VkDeviceMemory* memory) {
+    // FIX (显存耗尽根因 - 主动式 GC，深度参考 MobileGL):
+    // 在尝试分配之前，先检查内存压力。当 allocationCount 接近上限时，
+    // 主动触发 GC（vkDeviceWaitIdle + drain_all_disposal_queues），
+    // 在 GPU 进入降级状态（timeout/device lost）之前释放显存。
+    //
+    // 这是 PREVENTIVE 措施，与下面失败后重试的 REACTIVE 措施配合：
+    // 1. proactive_gc_if_needed: 防止 OOM 发生（70% 阈值触发）
+    // 2. 失败后 GC 重试: 兜底，处理 proactive 没覆盖的情况
+    //
+    // 参考 MobileGL：它每帧 TryDrainFrameTransients 主动 drain，根本不会
+    // 触发 vkAllocateMemory 失败。我们没有 MobileGL 的分层 manager，所以
+    // 在分配路径加这个压力检查。
+    backend_proactive_gc_if_needed();
+
     VkResult r = vkAllocateMemory(device, info, allocator, memory);
     if (r == VK_SUCCESS) return r;
     if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY) return r;

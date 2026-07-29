@@ -433,24 +433,36 @@ void swapchain_present_and_acquire(Swapchain* sc) {
             // VK_ERROR_OUT_OF_DATE_KHR 表示 swapchain 需要重建，是正常路径，
             // 不计入 consecutiveSubmitFailures 计数器。
             sc->needsRebuild = true;
-        } else {
-            // 致命 present 错误（VK_ERROR_OUT_OF_DEVICE_MEMORY /
-            // VK_ERROR_SURFACE_LOST_KHR / VK_ERROR_OUT_OF_HOST_MEMORY 等）：
-            // swapchain 不可用，标记重建；否则下一帧 present 会以同样方式失败，
-            // 渲染线程会在日志风暴中空转。
+        } else if (r == VK_ERROR_DEVICE_LOST) {
+            // 真正的设备丢失：设置 deviceLost，让 EGL 恢复路径处理
             sc->needsRebuild = true;
-            b->consecutiveSubmitFailures++;
-            if (b->consecutiveSubmitFailures >= 3 && !b->deviceLost) {
-                b->deviceLost = true;
-                MITHRIL_LOG_ERROR("vk", "Persistent GPU fault detected after %d "
-                                  "consecutive present failures — rendering suspended",
-                                  b->consecutiveSubmitFailures);
+            b->deviceLost = true;
+            static int presentDeviceLostCount = 0;
+            presentDeviceLostCount++;
+            if (presentDeviceLostCount <= 3 || presentDeviceLostCount % 100 == 0) {
+                MITHRIL_LOG_ERROR("vk", "vkQueuePresentKHR returned "
+                                  "VK_ERROR_DEVICE_LOST (occurrence #%d) — "
+                                  "deviceLost set, EGL will attempt recovery",
+                                  presentDeviceLostCount);
             }
-            // 日志限流：首次失败 + 每 100 次各打印一条，避免日志风暴。
-            if (b->consecutiveSubmitFailures == 1 || b->consecutiveSubmitFailures % 100 == 0) {
-                MITHRIL_LOG_ERROR("vk", "vkQueuePresentKHR failed (rc=%d) — marking "
-                                  "swapchain for rebuild", (int)r);
+        } else {
+            // FIX (rendering suspended 根因): OOM 或其他 present 错误
+            // 不再设置 deviceLost。标记 swapchain 重建 + 触发 OOM GC，
+            // 跳过当前帧继续渲染。
+            sc->needsRebuild = true;
+            static int presentFailCount = 0;
+            presentFailCount++;
+            if (presentFailCount <= 3 || presentFailCount % 100 == 0) {
+                MITHRIL_LOG_ERROR("vk", "vkQueuePresentKHR failed (rc=%d, "
+                                  "occurrence #%d) — marking swapchain for "
+                                  "rebuild, triggering OOM GC",
+                                  (int)r, presentFailCount);
             }
+            // OOM 主动 GC：释放延迟资源
+            if (b->device) {
+                vkDeviceWaitIdle(b->device);
+            }
+            drain_all_disposal_queues();
         }
         // The render-finished signal for THIS image has now been consumed by
         // present (or, on failure, will never be consumed — but we clear the
