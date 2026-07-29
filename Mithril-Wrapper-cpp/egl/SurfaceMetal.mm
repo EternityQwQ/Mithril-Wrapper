@@ -68,6 +68,23 @@ extern "C" void* surface_create(void* native_window, int* out_w, int* out_h) {
     // tries to use the image for non-attachment operations.
     mtlLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     mtlLayer.framebufferOnly = NO;
+    // FIX (IOSurfaceBindAccel SIGSEGV 根因): maximumDrawableCount MUST match
+    // the swapchain's image count. If the host app sets maximumDrawableCount=3
+    // but the swapchain creates only 2 images (clamped by caps.maxImageCount=2),
+    // the IOSurface pool has 3 drawables but the swapchain only tracks 2.
+    // When the Metal driver recycles the 3rd drawable's IOSurface, it is not
+    // in the swapchain's image list → IOSurfaceBindAccel dereferences a stale/
+    // recycled IOSurface → SIGSEGV (crash log: IOSurface+0x19cc).
+    //
+    // Force maximumDrawableCount to match kMaxFramesInFlight (2). This ensures
+    // the IOSurface pool size equals the swapchain image count, preventing
+    // the pool/image mismatch that causes the post-present IOSurfaceBindAccel
+    // crash on iPadOS 16.1.1 (iPad Pro M2).
+    //
+    // Note: MoltenVK reads maximumDrawableCount at vkCreateSwapchainKHR time
+    // and uses it to size the IOSurface pool. Setting it here (before any
+    // swapchain creation) guarantees consistency.
+    mtlLayer.maximumDrawableCount = 2;
     // presentsWithTransaction MUST be NO. When YES, CAMetalLayer blocks on
     // -[CAMetalLayer present:] until the compositor commits the drawable,
     // which serializes the render thread against the UI thread and — under

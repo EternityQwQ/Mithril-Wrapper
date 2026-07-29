@@ -333,6 +333,30 @@ glClear
 - `commit_frame` 中的 dummy render pass（`CommandStream.cpp:706-768`）— 首次渲染时强制绑定 IOSurface
 - `imageAvailable` semaphore 等待（`CommandStream.cpp:821-840`）— 确保 GPU 不在 acquire 完成前渲染
 
+### 7.6 修复缺口 5：IOSurfaceBindAccel SIGSEGV（maximumDrawableCount 与 swapchain image count 不匹配）
+
+**文件**: `SurfaceMetal.mm:71-87`, `SwapchainCommon.cpp:58-75`
+
+**崩溃分析**（iPad Pro 12.9" M2, iOS 16.1.1）：
+```
+SIGSEGV at IOSurface+0x19cc → IOSurfaceBindAccel+0x10
+（首帧 present 后立即崩溃）
+```
+
+日志关键证据：
+```
+CAMetalLayer configured: maximumDrawableCount=3  ← 宿主 app 设置
+swapchain_acquire_color: swapchain images=2      ← MoltenVK 只创建 2 个
+```
+
+**根因**：`maximumDrawableCount=3` 但 swapchain 只创建 2 个 image。IOSurface 池有 3 个 drawable，但 swapchain 只跟踪 2 个。当 Metal 驱动回收第 3 个 drawable 的 IOSurface 时，它不在 swapchain 的 image 列表中 → `IOSurfaceBindAccel` 解引用过期/回收的 IOSurface → SIGSEGV。
+
+**修复**：
+1. `SurfaceMetal.mm`：强制 `mtlLayer.maximumDrawableCount = 2`（匹配 `kMaxFramesInFlight`），覆盖宿主 app 的设置
+2. `SwapchainCommon.cpp`：请求 `imgCount = 2`（而非之前的 3），确保与 `maximumDrawableCount` 一致
+
+**为什么不用 3**：之前注释认为"triple buffering 加深 IOSurface 池"能避免 `IOSurfaceBindAccel` 崩溃，但这是**错误的**——IOSurface 池大小由 `maximumDrawableCount` 决定，不是 swapchain image count。设置 `imgCount > maximumDrawableCount` 无害（多余 image 不会被 acquire），但 `imgCount < maximumDrawableCount` 会导致池/image 不匹配崩溃。现在两者都固定为 2，完全一致。
+
 ## 八、验证标准
 
 - [ ] iPhone SE 3 能正常进入游戏主界面
@@ -341,6 +365,8 @@ glClear
 - [ ] 无 VK_ERROR_DEVICE_LOST
 - [ ] 无红屏/黑屏（有声音无画面）
 - [ ] 无 SIGBUS (BUS_ADRALN) 对齐崩溃（MVKCmdBufferImageCopy::encode）
+- [ ] 无 SIGSEGV (IOSurfaceBindAccel) 崩溃（首帧 present 后）
+- [ ] maximumDrawableCount == swapchain image count == 2
 - [ ] 日志无循环刷屏（每帧日志数 < 10 条）
 - [ ] allocation 数量 < maxMemoryAllocationCount 的 80%
 - [ ] deviceLost 恢复后着色器能正常编译（无 "invalid type 'main0_in'"）

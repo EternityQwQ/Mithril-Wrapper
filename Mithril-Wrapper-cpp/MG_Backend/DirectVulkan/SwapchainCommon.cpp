@@ -55,14 +55,23 @@ Swapchain* create_swapchain_post_surface(VkSurfaceKHR surface, int width, int he
     // Surface capabilities.
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(b->physicalDevice, sc->surface, &caps);
-    // Image count: request at least 3 (triple buffering) for smoother frame
-    // pacing and a deeper IOSurface pool. MobileGL requests
-    // max(minImageCountHint, caps.minImageCount) with minImageCountHint=3
-    // (SwapchainObject.cpp:176). With only minImageCount (typically 2 on
-    // iOS/Metal), the IOSurface pool is shallow and high-FPS rendering
-    // exhausts it, causing IOSurfaceBindAccel to crash when the driver
-    // tries to bind a recycled surface. Clamp to maxImageCount if set.
-    uint32_t imgCount = std::max<uint32_t>(caps.minImageCount, 3);
+    // Image count: MUST match CAMetalLayer.maximumDrawableCount (set to 2 in
+    // SurfaceMetal.mm). A mismatch (e.g. maximumDrawableCount=3 but swapchain
+    // creates 2 images) causes the IOSurface pool to have more drawables than
+    // swapchain images. When the Metal driver recycles the extra drawable's
+    // IOSurface, it is not tracked by the swapchain → IOSurfaceBindAccel
+    // dereferences a stale IOSurface → SIGSEGV (crash log: IOSurface+0x19cc).
+    //
+    // Previous code requested 3 (triple buffering) for a "deeper IOSurface
+    // pool", but this is WRONG: the IOSurface pool size is determined by
+    // maximumDrawableCount, not by swapchain image count. Setting image count
+    // > maximumDrawableCount is harmless (extra images are never acquired),
+    // but setting it < maximumDrawableCount causes the pool/image mismatch
+    // crash. Since we now force maximumDrawableCount=2, request exactly 2.
+    //
+    // Clamp to [minImageCount, maxImageCount] for safety.
+    uint32_t imgCount = 2;  // match kMaxFramesInFlight + maximumDrawableCount
+    if (imgCount < caps.minImageCount) imgCount = caps.minImageCount;
     if (caps.maxImageCount > 0 && imgCount > caps.maxImageCount) imgCount = caps.maxImageCount;
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == 0xFFFFFFFFu || extent.width == 0) {
