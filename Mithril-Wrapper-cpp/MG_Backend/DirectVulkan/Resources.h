@@ -56,6 +56,21 @@ std::unordered_map<GLuint, SamplerEntry>& sampler_table();
 // Find a memory type matching `requirements` and the desired property flags.
 uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props);
 
+// FIX (显存耗尽根因 - OOM 主动 GC):
+// 封装 vkAllocateMemory，在返回 VK_ERROR_OUT_OF_DEVICE_MEMORY 时触发一次
+// 强制垃圾回收（vkDeviceWaitIdle + drain_all_disposal_queues），释放所有
+// 延迟销毁队列中的 VkBuffer/VkImage/VkDeviceMemory，然后重试一次。
+//
+// 这解决了 Minecraft 纹理上传期间的显存耗尽问题：纹理 staging buffer 和
+// 旧纹理（被 glTexImage2D 重新指定）都堆积在 disposalQueue 中等待 GPU
+// 完成，但在高帧率下 disposalQueue 可能尚未被排空就再次尝试分配，
+// 导致 vkAllocateMemory 失败 → 纹理创建失败 → 渲染异常。
+//
+// GC 后重试一次仍失败则返回原错误码，由调用方处理。
+VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo* info,
+                                     const VkAllocationCallbacks* allocator,
+                                     VkDeviceMemory* memory);
+
 // Create + bind a VkBuffer (host-visible/coherent) of the given size. On
 // success fills out the entry. `data` (if non-null) is copied in.
 bool create_buffer(BufferEntry& out, VkDeviceSize size,

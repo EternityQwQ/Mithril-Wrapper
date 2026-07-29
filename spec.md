@@ -98,6 +98,8 @@ eglSwapBuffers()
 | staging buffer 延迟释放 | Resources.cpp | 258-271 | 纹理上传后进 disposalQueue，不再永久持有 |
 | depth buffer OOM 降级禁用 | SwapchainCommon.cpp | 170-177 | swapchain 走降级路径时禁用 depth，节省 ~8-43MB |
 | deviceLost 期间主动 drain | Device.cpp | 64-84 | 恢复前先 vkDeviceWaitIdle + drain，释放显存 |
+| **OOM 主动 GC** | **Resources.cpp** | **44-78** | **vkAllocateMemory 失败时 vkDeviceWaitIdle + drain_all_disposal_queues 后重试** |
+| **default_texture 泄漏修复** | **DescriptorSet.cpp** | **266-292** | **view/sampler 创建失败时销毁已分配的 image+memory，避免重试覆盖句柄泄漏** |
 
 ### 3.2 设备丢失恢复修复
 

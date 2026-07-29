@@ -263,7 +263,15 @@ DefaultTexture& default_texture() {
     vci.subresourceRange.levelCount = 1;
     vci.subresourceRange.baseArrayLayer = 0;
     vci.subresourceRange.layerCount = 1;
-    if (vkCreateImageView(b->device, &vci, nullptr, &dt.view) != VK_SUCCESS) return dt;
+    if (vkCreateImageView(b->device, &vci, nullptr, &dt.view) != VK_SUCCESS) {
+        // FIX (显存泄漏): view 创建失败时必须销毁已分配的 image+memory，
+        // 否则下次重入 default_texture() 会被 vkCreateImage/vkAllocateMemory
+        // 覆盖句柄，导致旧 VkImage+VkDeviceMemory 永久泄漏。每次重试都会
+        // 累积一组泄漏，在显存紧张时加剧 OOM。
+        vkDestroyImage(b->device, dt.image, nullptr); dt.image = VK_NULL_HANDLE;
+        vkFreeMemory(b->device, dt.memory, nullptr); dt.memory = VK_NULL_HANDLE;
+        return dt;
+    }
 
     VkSamplerCreateInfo sci{};
     sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -276,7 +284,10 @@ DefaultTexture& default_texture() {
     sci.minLod = 0.0f;
     sci.maxLod = 0.0f;
     if (vkCreateSampler(b->device, &sci, nullptr, &dt.sampler) != VK_SUCCESS) {
+        // FIX (显存泄漏): sampler 创建失败时同样必须销毁 image+memory+view。
         vkDestroyImageView(b->device, dt.view, nullptr); dt.view = VK_NULL_HANDLE;
+        vkDestroyImage(b->device, dt.image, nullptr); dt.image = VK_NULL_HANDLE;
+        vkFreeMemory(b->device, dt.memory, nullptr); dt.memory = VK_NULL_HANDLE;
         return dt;
     }
     return dt;

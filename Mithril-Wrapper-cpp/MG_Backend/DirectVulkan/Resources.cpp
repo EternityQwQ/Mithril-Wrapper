@@ -32,6 +32,51 @@ uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props) {
     return 0xFFFFFFFFu;
 }
 
+// FIX (显存耗尽根因 - OOM 主动 GC):
+// 封装 vkAllocateMemory。首次分配失败（VK_ERROR_OUT_OF_DEVICE_MEMORY）时
+// 触发一次强制 GC：vkDeviceWaitIdle 等待所有 GPU 工作完成，然后
+// drain_all_disposal_queues 释放所有延迟销毁队列中的资源（staging buffer、
+// 旧纹理、orphaned buffer），腾出显存后重试一次。
+//
+// 参考 MobileGL TryDrainFrameTransients（VulkanRenderer.cpp:7239-7313）：
+// present-suspend 期间主动 drain + rewind transient arena 防止资源累积。
+// 我们在分配失败时做同样的事，避免 OOM 导致渲染永久失败。
+VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo* info,
+                                     const VkAllocationCallbacks* allocator,
+                                     VkDeviceMemory* memory) {
+    VkResult r = vkAllocateMemory(device, info, allocator, memory);
+    if (r == VK_SUCCESS) return r;
+    if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY) return r;
+
+    // OOM：触发一次强制 GC
+    static int gcTriggerCount = 0;
+    gcTriggerCount++;
+    // 限流日志：首次 + 每 50 次
+    if (gcTriggerCount <= 3 || gcTriggerCount % 50 == 0) {
+        MITHRIL_LOG_WARN("vk", "OOM detected (vkAllocateMemory failed), "
+                          "triggering forced GC (attempt #%d): vkDeviceWaitIdle "
+                          "+ drain_all_disposal_queues",
+                          gcTriggerCount);
+    }
+    Backend* b = backend();
+    if (b->device) {
+        // 等待所有 GPU 工作完成，确保 disposalQueue 中的资源不再被引用
+        vkDeviceWaitIdle(b->device);
+    }
+    drain_all_disposal_queues();
+
+    // GC 后重试一次
+    r = vkAllocateMemory(device, info, allocator, memory);
+    if (r == VK_SUCCESS) {
+        if (gcTriggerCount <= 3 || gcTriggerCount % 50 == 0) {
+            MITHRIL_LOG_WARN("vk", "OOM recovery: vkAllocateMemory succeeded "
+                              "after GC (freed delayed resources)");
+        }
+    }
+    // GC 后仍失败则返回原错误码，由调用方处理（可能触发 deviceLost 恢复路径）
+    return r;
+}
+
 bool create_buffer(BufferEntry& out, VkDeviceSize size,
                    VkBufferUsageFlags usage, const void* data) {
     Backend* b = backend();
@@ -52,7 +97,8 @@ bool create_buffer(BufferEntry& out, VkDeviceSize size,
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = mt;
-    if (vkAllocateMemory(b->device, &ai, nullptr, &out.memory) != VK_SUCCESS) {
+    // FIX (OOM 主动 GC): 使用带 GC 的分配函数，OOM 时先排空延迟队列重试
+    if (try_allocate_memory_with_gc(b->device, &ai, nullptr, &out.memory) != VK_SUCCESS) {
         vkDestroyBuffer(b->device, out.buffer, nullptr);
         out.buffer = VK_NULL_HANDLE;
         return false;
@@ -584,7 +630,8 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
     ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     ai.allocationSize = req.size;
     ai.memoryTypeIndex = mt;
-    if (vkAllocateMemory(b->device, &ai, nullptr, &e.memory) != VK_SUCCESS) {
+    // FIX (OOM 主动 GC): 使用带 GC 的分配函数，OOM 时先排空延迟队列重试
+    if (mithril::vk::try_allocate_memory_with_gc(b->device, &ai, nullptr, &e.memory) != VK_SUCCESS) {
         vkDestroyImage(b->device, e.image, nullptr);
         return VK_NULL_HANDLE;
     }
