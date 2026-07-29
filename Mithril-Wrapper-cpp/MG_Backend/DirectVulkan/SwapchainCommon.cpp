@@ -31,6 +31,13 @@ Swapchain* create_swapchain_post_surface(VkSurfaceKHR surface, int width, int he
     Backend* b = backend();
     if (!b->initialized || surface == VK_NULL_HANDLE || width <= 0 || height <= 0) return nullptr;
 
+    if (b->deviceLost) {
+        // deviceLost 状态下 vkCreateSwapchainKHR 行为未定义,三级 fallback 必然失败。
+        // 短路避免无效 vk* 调用与日志刷屏;eglSwapBuffers 恢复路径会在 deviceLost
+        // 清除后重试。
+        return nullptr;
+    }
+
     Swapchain* sc = new Swapchain{};
     sc->width = width;
     sc->height = height;
@@ -169,7 +176,11 @@ pm_done:
             // 降级 3: 只保留 COLOR_ATTACHMENT（最小 usage）
             scci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
             if (vkCreateSwapchainKHR(b->device, &scci, nullptr, &sc->swapchain) != VK_SUCCESS) {
-                MITHRIL_LOG_ERROR("vk", "vkCreateSwapchainKHR failed after all fallbacks");
+                static int failCount = 0;
+                failCount++;
+                if (failCount <= 3 || failCount % 30 == 0) {
+                    MITHRIL_LOG_ERROR("vk", "vkCreateSwapchainKHR failed after all fallbacks (fail #%d)", failCount);
+                }
                 // Surface ownership stays with the caller (see contract above).
                 sc->surface = VK_NULL_HANDLE;
                 delete sc;

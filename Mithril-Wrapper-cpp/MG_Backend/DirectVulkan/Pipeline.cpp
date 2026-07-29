@@ -230,6 +230,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
                                   GLenum gl_primitive_mode) {
     Backend* b = backend();
     if (!b->initialized || program == 0) return VK_NULL_HANDLE;
+    if (b->deviceLost) return VK_NULL_HANDLE;  // deviceLost 时 vkCreateGraphicsPipelines 必然失败,短路避免无效调用
 
     auto& tbl = program_table();
     ProgramResources& pr = tbl[program];
@@ -512,7 +513,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
         // 导致物体消失/红屏（只剩 clear color）。
         //
         // 仅当失败是永久性着色器/格式问题时才加入负缓存：
-        //   VK_ERROR_INVALID_SHADER_NV        (-1000072000) 着色器本身有缺陷
+        //   VK_ERROR_INVALID_SHADER_NV        (-1000012000) 着色器本身有缺陷
         //
         // MobileGL 不做负缓存（VulkanRenderer.cpp:4183 直接返回 null），
         // 但那样会导致每帧重试。我们保留负缓存但仅用于永久性失败。

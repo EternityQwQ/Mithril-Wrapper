@@ -101,6 +101,12 @@ struct EglSurface {
     // swapchainRetryCount 记录连续失败次数，用于日志限流。
     int           swapchainRetryBackoff = 0;
     int           swapchainRetryCount   = 0;
+    // FIX (deviceLost 恢复 per-surface 隔离): 原 static int 计数器是进程级,
+    // 多窗口场景下 surface A 的失败会污染 surface B 的计数器。改为 per-surface。
+    // recoveryAttemptCounter: 每 10 帧触发一次重建尝试(每帧 +1, >=10 时触发并清零)
+    // recoveryFailCount: 连续重建失败次数(成功时清零,>=18 时放弃返回 EGL_FALSE)
+    int           recoveryAttemptCounter = 0;
+    int           recoveryFailCount      = 0;
 };
 
 struct EglContext {
@@ -181,7 +187,7 @@ inline bool valid_config(EGLConfig c) {
 // the old IOSurface-backed images when they are torn down. Without this
 // drain, vkDestroySwapchainKHR frees IOSurfaces that the GPU is still
 // accessing, and the next IOSurfaceBindAccel call crashes with SIGSEGV (UAF).
-bool ensure_swapchain(EglSurface* s) {
+bool ensure_swapchain(EglSurface* s, bool skipBackoff) {
     if (!s || !s->native_window) return false;
     int w = 0, h = 0;
     if (!surface_get_size(s->native_window, &w, &h)) return false;
@@ -193,7 +199,12 @@ bool ensure_swapchain(EglSurface* s) {
     // 会形成死循环刷屏（vkCreateSwapchainKHR failed × N）。引入退避机制：
     // 失败后等待 N 帧再重试，给 GPU 时间释放资源。
     // 这个计数器是 per-surface 的，避免多 surface 互相干扰。
-    if (s->swapchainRetryBackoff > 0) {
+    //
+    // FIX (deviceLost 恢复双层退避): deviceLost 恢复路径传 skipBackoff=true
+    // 绕过此退避。否则双层退避叠加(recoveryAttemptCounter 每 10 帧 ×
+    // swapchainRetryBackoff 30 帧 = 300 帧 = 5 秒),与 spec.md:108 "0.17 秒一次"
+    // 设计意图不符,导致 deviceLost 恢复过慢触发宿主 watchdog exit(0)。
+    if (!skipBackoff && s->swapchainRetryBackoff > 0) {
         s->swapchainRetryBackoff--;
         return false;
     }
@@ -835,11 +846,12 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (mithril::vk::backend_is_device_lost()) {
         // 尝试恢复：每隔 10 帧尝试一次 swapchain 重建（约 0.17 秒 @ 60fps）
         // 原 60 帧间隔太长，Minecraft 可能在等待期间检测到渲染失败而 exit(0)
-        static int recoveryAttemptCounter = 0;
-        static int recoveryFailCount = 0;  // 连续重建失败计数（成功时清零）
-        recoveryAttemptCounter++;
-        if (recoveryAttemptCounter >= 10 && s->native_window) {
-            recoveryAttemptCounter = 0;
+        //
+        // FIX (per-surface 隔离): 原 static int 是进程级,多窗口场景下 surface A
+        // 的失败污染 surface B 的计数器。改为 per-surface 字段(EglSurface 成员)。
+        s->recoveryAttemptCounter++;
+        if (s->recoveryAttemptCounter >= 10 && s->native_window) {
+            s->recoveryAttemptCounter = 0;
             // FIX (黑屏根因 - deviceLost 期间显存不释放):
             // deviceLost 期间 ensure_command_buffer_recording 早退，disposalQueue
             // 不会被排空，延迟释放的 VkBuffer/VkImage/VkDeviceMemory 持续累积，
@@ -857,31 +869,47 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                 backend_destroy_swapchain(s->swapchain_state);
                 s->swapchain_state = nullptr;
             }
-            if (ensure_swapchain(s) && s->swapchain_state) {
+            // FIX (双层退避): 传 skipBackoff=true 绕过 ensure_swapchain 内的
+            // 30 帧退避,否则双层退避叠加 = 300 帧 = 5 秒间隔,与 "0.17 秒一次"
+            // 设计意图不符。deviceLost 是严重故障,需要快速重试。
+            if (ensure_swapchain(s, /*skipBackoff=*/true) && s->swapchain_state) {
                 // 重建成功：重置 deviceLost，恢复渲染
                 // backend_reset_device_lost 会再次 drain + 清除 pipeline 缓存
                 mithril::vk::backend_reset_device_lost();
                 if (t_currentDraw == s) {
                     install_surface_on_state(s);
                 }
-                if (recoveryFailCount > 0) {
+                if (s->recoveryFailCount > 0) {
                     MITHRIL_LOG_WARN("egl", "deviceLost recovery: swapchain rebuilt "
                                       "successfully after %d failed attempts, "
-                                      "resuming rendering", recoveryFailCount);
+                                      "resuming rendering", s->recoveryFailCount);
                 } else {
                     MITHRIL_LOG_WARN("egl", "deviceLost recovery: swapchain rebuilt "
                                       "successfully, resuming rendering");
                 }
-                recoveryFailCount = 0;
+                s->recoveryFailCount = 0;
             } else {
                 // 重建失败：deviceLost 标志未清除，10 帧后重试。
                 // FIX (日志刷屏): 限流 — 首次 + 每 30 次重试（约 5 秒 @ 60fps）
                 // 打印一条，避免持续失败时每 0.17 秒刷一条日志。
-                recoveryFailCount++;
-                if (recoveryFailCount <= 3 || recoveryFailCount % 30 == 0) {
+                s->recoveryFailCount++;
+                if (s->recoveryFailCount <= 3 || s->recoveryFailCount % 30 == 0) {
                     MITHRIL_LOG_WARN("egl", "deviceLost recovery: swapchain rebuild "
                                       "failed (attempt #%d), will retry in 10 frames",
-                                      recoveryFailCount);
+                                      s->recoveryFailCount);
+                }
+                // FIX (放弃阈值): 18 次 × 10 帧/次 ≈ 3 秒 @ 60fps 仍无法恢复,
+                // 放弃并向 EGL 客户端返回 EGL_FALSE + EGL_BAD_ALLOC。原实现永远
+                // 返回 EGL_TRUE,宿主误判渲染正常,只能依赖 watchdog 超时(15+秒)
+                // 退出,反应迟钝。返回 EGL_FALSE 让宿主更快感知故障并决定重启
+                // context 或退出。deviceLost 被清除后(MoltenVK 恢复)恢复正常
+                // 返回 EGL_TRUE(s->recoveryFailCount 在重建成功时清零)。
+                if (s->recoveryFailCount >= 18) {
+                    MITHRIL_LOG_ERROR("egl", "deviceLost recovery: giving up after %d "
+                                      "failed attempts (~3s), returning EGL_FALSE to host",
+                                      s->recoveryFailCount);
+                    set_error(EGL_BAD_ALLOC);
+                    return EGL_FALSE;
                 }
             }
         }
