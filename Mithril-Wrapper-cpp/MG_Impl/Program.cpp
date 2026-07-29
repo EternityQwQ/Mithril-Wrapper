@@ -127,6 +127,7 @@ void glLinkProgram(GLuint program) {
     backend_delete_program_resources(program);
 
     p->vertexSpirv.clear();
+    p->vertexSpirvYFlipped.clear();
     p->fragmentSpirv.clear();
     p->uniforms.clear();
     p->uniformByLocation.clear();
@@ -145,15 +146,16 @@ void glLinkProgram(GLuint program) {
         if (!s) continue;
         if (!s->compiled || s->spirv.empty()) { missing = true; continue; }
         if (s->type == GL_VERTEX_SHADER) {
+            // --- Non-flipped variant (for user-created FBOs) ---
+            // s->spirv (from glCompileShader) already has Z remap injected but
+            // no Y flip and no attrib bindings. Re-translate with bindings if
+            // needed; otherwise reuse s->spirv directly.
             if (has_attrib_bindings) {
-                // Re-translate with bindings (cache key includes bindings, so
-                // a different binding set produces fresh SPIR-V).
                 std::vector<uint32_t> spirv;
                 std::string info;
-                if (mithril::shader_translate(s->type, s->source, spirv, info, &p->attribBindings)) {
+                if (mithril::shader_translate(s->type, s->source, spirv, info, &p->attribBindings, /*flip_y=*/false)) {
                     p->vertexSpirv = std::move(spirv);
                 } else {
-                    // Fall back to the auto-mapped SPIR-V from glCompileShader.
                     MITHRIL_LOG_ERROR("program", "Re-translation with attrib bindings "
                                       "failed for program %u: %s (using auto-mapped SPIR-V)",
                                       program, info.c_str());
@@ -161,6 +163,31 @@ void glLinkProgram(GLuint program) {
                 }
             } else {
                 p->vertexSpirv = s->spirv;
+            }
+
+            // --- Y-flipped variant (for default framebuffer / FBO 0) ---
+            // Always re-translate with flip_y=true so draws to the on-screen
+            // drawable get the Y inversion. Deep reference: MobileGL
+            // GetShaderTransformFlags sets PositionYFlip when
+            // currentDrawFBO->IsDefaultFramebuffer().
+            {
+                std::vector<uint32_t> spirv;
+                std::string info;
+                const auto* bindings_ptr = has_attrib_bindings ? &p->attribBindings : nullptr;
+                if (mithril::shader_translate(s->type, s->source, spirv, info, bindings_ptr, /*flip_y=*/true)) {
+                    p->vertexSpirvYFlipped = std::move(spirv);
+                } else {
+                    // Degraded fallback: use the non-flipped variant. The
+                    // default-FBO draw will have wrong Y orientation but won't
+                    // crash. This path is extremely rare (only if glslang
+                    // accepts the non-flipped source but rejects the flipped
+                    // one, which should never happen since the flip is a pure
+                    // append after the original main).
+                    MITHRIL_LOG_ERROR("program", "Y-flipped vertex translation "
+                                      "failed for program %u: %s (using non-flipped fallback)",
+                                      program, info.c_str());
+                    p->vertexSpirvYFlipped = p->vertexSpirv;
+                }
             }
         } else if (s->type == GL_FRAGMENT_SHADER) {
             p->fragmentSpirv = s->spirv;
@@ -176,14 +203,16 @@ void glLinkProgram(GLuint program) {
         p->linked = false;
         p->infoLog = "link failed: a required stage was missing or uncompiled";
         MITHRIL_LOG_ERROR("program", "Link failed for program %u: missing/empty stage "
-                          "(VS=%zu FS=%zu words)", program,
-                          p->vertexSpirv.size(), p->fragmentSpirv.size());
+                          "(VS=%zu VS_yflip=%zu FS=%zu words)", program,
+                          p->vertexSpirv.size(), p->vertexSpirvYFlipped.size(),
+                          p->fragmentSpirv.size());
         return;
     }
     p->linked = true;
     p->infoLog.clear();
-    MITHRIL_LOG_INFO("program", "Linked program %u (VS=%zu SPIR-V words, FS=%zu SPIR-V words)",
-                     program, p->vertexSpirv.size(), p->fragmentSpirv.size());
+    MITHRIL_LOG_INFO("program", "Linked program %u (VS=%zu VS_yflip=%zu FS=%zu SPIR-V words)",
+                     program, p->vertexSpirv.size(), p->vertexSpirvYFlipped.size(),
+                     p->fragmentSpirv.size());
 }
 
 void glUseProgram(GLuint program) {

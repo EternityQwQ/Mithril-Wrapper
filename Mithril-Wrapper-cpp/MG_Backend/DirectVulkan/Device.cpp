@@ -412,10 +412,16 @@ bool init_device() {
     //   VK_ERROR_DEVICE_LOST by re-creating the VkDevice. Without this, a
     //   single GPU error permanently kills rendering (black screen forever).
     //
-    // MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y=1: MoltenVK flips vertex Y
-    //   during SPIR-V→MSL translation to account for GL(Vulkan) vs Metal NDC
-    //   differences. Our viewport code passes GL coordinates unchanged and
-    //   relies on this flip. (MoltenVK default is 1, set explicitly.)
+    // MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y=0: MoltenVK's global vertex Y
+    //   flip is DISABLED. Y flipping is now handled at the shader-translation
+    //   layer (Shader.cpp inject_position_fixup with flip_y=true) ONLY for the
+    //   default framebuffer (FBO 0). User-created FBOs use the non-flipped
+    //   variant so their textures stay in GL Y-up orientation for correct
+    //   sampling by GL shaders. The global MoltenVK flip applied Y inversion to
+    //   ALL vertex shaders indiscriminately, which turned user-FBO texture
+    //   content upside-down and was the root cause of the red/black screen.
+    //   Deep reference: MobileGL GetShaderTransformFlags applies PositionYFlip
+    //   only when currentDrawFBO->IsDefaultFramebuffer(), never globally.
     //
     // MVK_CONFIG_SUBMIT_COMMAND_BUFFERS_PER_QUEUE=2 (深度参考 MobileGL 缺口):
     //   限制每个 queue 同时未完成的 command buffer 数量。MoltenVK 默认
@@ -432,7 +438,7 @@ bool init_device() {
     setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 1);
     setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "0", 1);
     setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 1);
-    setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "1", 1);
+    setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "0", 1);
     setenv("MVK_CONFIG_SUBMIT_COMMAND_BUFFERS_PER_QUEUE", "2", 1);
 
     // ---- Instance ----

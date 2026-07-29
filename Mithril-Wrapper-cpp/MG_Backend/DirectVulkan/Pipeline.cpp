@@ -128,7 +128,8 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
                         VkFormat depth_format, int blend_enabled,
                         GLenum blend_src, GLenum blend_dst,
                         GLenum blend_src_alpha, GLenum blend_dst_alpha,
-                        int color_write_mask, GLenum prim) {
+                        int color_write_mask, GLenum prim,
+                        int is_default_fbo) {
     uint64_t h = 1469598103934665603ULL;
     auto mix = [&](const void* p, size_t n) {
         const uint8_t* b = (const uint8_t*)p;
@@ -154,6 +155,7 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
     mix(&blend_dst_alpha, sizeof(blend_dst_alpha));
     mix(&color_write_mask, sizeof(color_write_mask));
     mix(&prim, sizeof(prim));
+    mix(&is_default_fbo, sizeof(is_default_fbo));
     return h;
 }
 
@@ -227,27 +229,35 @@ VkPipeline get_or_create_pipeline(GLuint program,
                                   int blend_enabled, GLenum blend_src, GLenum blend_dst,
                                   GLenum blend_src_alpha, GLenum blend_dst_alpha,
                                   int color_write_mask,
-                                  GLenum gl_primitive_mode) {
+                                  GLenum gl_primitive_mode,
+                                  int is_default_fbo) {
     Backend* b = backend();
     if (!b->initialized || program == 0) return VK_NULL_HANDLE;
 
     auto& tbl = program_table();
     ProgramResources& pr = tbl[program];
 
-    // (Re)build shader modules if missing.
-    if (pr.vertexModule == VK_NULL_HANDLE && vertex_spirv && vertex_word_count > 0) {
-        pr.vertexModule = create_module(vertex_spirv, vertex_word_count);
+    // Select the vertex shader module for this framebuffer type. The default
+    // framebuffer (FBO 0) uses the Y-flipped variant so the on-screen drawable
+    // matches Vulkan/Metal's Y-down coordinate system; user FBOs use the
+    // non-flipped variant so their textures stay in GL Y-up orientation for
+    // correct sampling. Deep reference: MobileGL GetShaderTransformFlags.
+    VkShaderModule& vsModule = is_default_fbo ? pr.vertexModuleFlipped : pr.vertexModule;
+    if (vsModule == VK_NULL_HANDLE && vertex_spirv && vertex_word_count > 0) {
+        vsModule = create_module(vertex_spirv, vertex_word_count);
     }
     if (pr.fragmentModule == VK_NULL_HANDLE && fragment_spirv && fragment_word_count > 0) {
         pr.fragmentModule = create_module(fragment_spirv, fragment_word_count);
     }
-    if (pr.vertexModule == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    if (vsModule == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
     // Reflect SPIR-V + build VkDescriptorSetLayout / VkPipelineLayout /
     // VkDescriptorPool once per program (idempotent). The pipeline below binds
     // against pr.pipelineLayout (or the empty fallback for binding-less
     // shaders), and prepare_draw later calls backend_bind_program_descriptors
     // to populate the descriptor set from Program.uniforms + bound textures.
+    // Y flip only modifies gl_Position (a builtin), so both SPIR-V variants
+    // share the same descriptor layout — reflecting either is correct.
     ensure_program_layouts(program, vertex_spirv, vertex_word_count,
                            fragment_spirv, fragment_word_count);
 
@@ -255,7 +265,8 @@ VkPipeline get_or_create_pipeline(GLuint program,
                                   color_count, depth_format, blend_enabled,
                                   blend_src, blend_dst,
                                   blend_src_alpha, blend_dst_alpha,
-                                  color_write_mask, gl_primitive_mode);
+                                  color_write_mask, gl_primitive_mode,
+                                  is_default_fbo);
     auto it = pr.pipelines.find(sig);
     if (it != pr.pipelines.end() && it->second != VK_NULL_HANDLE) return it->second;
 
@@ -429,7 +440,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
     VkPipelineShaderStageCreateInfo vsStage{};
     vsStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     vsStage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-    vsStage.module = pr.vertexModule;
+    vsStage.module = vsModule;
     vsStage.pName = "main";
     stages.push_back(vsStage);
     if (pr.fragmentModule != VK_NULL_HANDLE) {
@@ -608,8 +619,9 @@ void delete_program_resources(GLuint program) {
         if (kv.second) vkDestroyPipeline(b->device, kv.second, nullptr);
     }
     pr.pipelines.clear();
-    if (pr.vertexModule)   { vkDestroyShaderModule(b->device, pr.vertexModule, nullptr);   pr.vertexModule = VK_NULL_HANDLE; }
-    if (pr.fragmentModule) { vkDestroyShaderModule(b->device, pr.fragmentModule, nullptr); pr.fragmentModule = VK_NULL_HANDLE; }
+    if (pr.vertexModule)        { vkDestroyShaderModule(b->device, pr.vertexModule, nullptr);        pr.vertexModule = VK_NULL_HANDLE; }
+    if (pr.vertexModuleFlipped) { vkDestroyShaderModule(b->device, pr.vertexModuleFlipped, nullptr); pr.vertexModuleFlipped = VK_NULL_HANDLE; }
+    if (pr.fragmentModule)      { vkDestroyShaderModule(b->device, pr.fragmentModule, nullptr);      pr.fragmentModule = VK_NULL_HANDLE; }
     // Descriptor resources built by ensure_program_layouts. Pools must be
     // destroyed before the set layout they were created from (Vulkan ordering);
     // destroying a pool implicitly frees all sets allocated from it, so the
@@ -648,7 +660,8 @@ VkPipeline backend_get_or_create_pipeline(GLuint program,
                                           int blend_enabled, GLenum blend_src, GLenum blend_dst,
                                           GLenum blend_src_alpha, GLenum blend_dst_alpha,
                                           int color_write_mask,
-                                          GLenum gl_primitive_mode) {
+                                          GLenum gl_primitive_mode,
+                                          int is_default_fbo) {
     return mithril::vk::get_or_create_pipeline(program, vertex_spirv, vertex_word_count,
                                                fragment_spirv, fragment_word_count,
                                                attribs, attrib_count,
@@ -656,7 +669,8 @@ VkPipeline backend_get_or_create_pipeline(GLuint program,
                                                blend_enabled, blend_src, blend_dst,
                                                blend_src_alpha, blend_dst_alpha,
                                                color_write_mask,
-                                               gl_primitive_mode);
+                                               gl_primitive_mode,
+                                               is_default_fbo);
 }
 
 void backend_delete_program_resources(GLuint program) {

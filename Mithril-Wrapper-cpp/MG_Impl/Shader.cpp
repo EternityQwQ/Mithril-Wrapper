@@ -446,6 +446,51 @@ static void wrap_loose_uniforms(std::string& source) {
     source.insert(version_end, injection);
 }
 
+// ---------------------------------------------------------------------------
+// Position fixup injection (GL -> Vulkan NDC adjustment).
+//
+// Deep reference: MobileGL ProgramFactory::InsertPositionFixup
+// (ProgramFactory.cpp:789-857) applies two position transforms at the SPIR-V
+// level via SPIRV-Tools IRBuilder. Mithril does not link SPIRV-Tools, so we
+// achieve the same result via GLSL source injection before glslang compiles.
+//
+// Transforms applied (vertex shader only):
+//   1. Z remap (ALWAYS): gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5
+//      GL NDC Z is [-1,1]; Vulkan NDC Z is [0,1]. Without this, Vulkan's
+//      clip stage rejects geometry with z/w < 0 (GL's near plane) and depth
+//      testing compares wrong values. Must happen in-shader (before clip),
+//      NOT via viewport minDepth/maxDepth (clip runs before viewport transform).
+//   2. Y flip (only when flip_y=true): gl_Position.y = -gl_Position.y
+//      GL framebuffer origin is bottom-left (Y up); Vulkan/Metal is top-left
+//      (Y down). The default framebuffer (FBO 0) renders directly to the
+//      on-screen drawable, so its image must be Y-flipped to match the
+//      screen's coordinate system. User-created FBOs render into textures
+//      that are subsequently sampled by GL shaders using GL texture coords
+//      (Y up), so they must NOT be flipped — flipping them would make the
+//      sampled content upside-down (root cause of the red/black screen).
+//
+// Mechanism: rename `void main(` -> `void _mithril_original_main(` and append
+// a wrapper main() that calls the original then applies the fixups. This
+// mirrors MobileGL's approach of post-processing the position output, just at
+// the GLSL level instead of the SPIR-V level.
+//
+// Safety: if no `void main(` match is found, the function returns without
+// modifying the source (the shader compiles without fixups — depth testing
+// may be wrong but no crash). Minecraft Java vertex shaders all use the
+// standard `void main()` signature.
+// ---------------------------------------------------------------------------
+void inject_position_fixup(std::string& src, GLenum gl_stage, bool flip_y) {
+    if (gl_stage != GL_VERTEX_SHADER) return;
+    static const std::regex main_re(R"(\bvoid\s+main\s*\()");
+    if (!std::regex_search(src, main_re)) return;
+    src = std::regex_replace(src, main_re, "void _mithril_original_main(");
+    src += "\nvoid main() {\n    _mithril_original_main();\n";
+    if (flip_y) {
+        src += "    gl_Position.y = -gl_Position.y;\n";
+    }
+    src += "    gl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n}\n";
+}
+
 // FNV-1a 64-bit hash for cache keying.
 uint64_t fnv1a(const std::string& s) {
     uint64_t h = 1469598103934665603ULL;
@@ -461,7 +506,8 @@ Cache& cache() { static Cache c; return c; }
 
 bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
                    std::vector<uint32_t>& spirv, std::string& info,
-                   const std::unordered_map<std::string, GLuint>* attrib_bindings) {
+                   const std::unordered_map<std::string, GLuint>* attrib_bindings,
+                   bool flip_y) {
     glslang_init();
     EShLanguage stage = to_esh_stage(gl_stage);
     if (stage == EShLangCount) { info = "unsupported shader stage"; return false; }
@@ -475,6 +521,15 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
     int glsl_version = ensure_glsl_version(source);
     rewrite_desktop_builtins(source, gl_stage);
     apply_attrib_bindings(source, gl_stage, attrib_bindings);
+
+    // Inject GL->Vulkan position fixups (Z remap always; Y flip when flip_y).
+    // Done AFTER ensure_glsl_version/rewrite_builtins/apply_attrib_bindings but
+    // BEFORE the source_unwrapped backup below, so all three compile fallback
+    // paths (wrapped / unwrapped / relaxed) inherit the injection. The wrapper
+    // main() appended here is a function definition — wrap_loose_uniforms only
+    // touches `uniform` declarations, so it never interferes with the injection.
+    // Deep reference: MobileGL GetShaderTransformFlags + InsertPositionFixup.
+    inject_position_fixup(source, gl_stage, flip_y);
 
     // wrap_loose_uniforms() uses std::regex which can throw std::regex_error
     // on pathological inputs (e.g. catastrophic backtracking on a deeply
@@ -670,14 +725,20 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
 
 bool shader_translate(GLenum gl_stage, const std::string& glsl_source,
                       std::vector<uint32_t>& out_spirv, std::string& out_info_log,
-                      const std::unordered_map<std::string, GLuint>* attrib_bindings) {
+                      const std::unordered_map<std::string, GLuint>* attrib_bindings,
+                      bool flip_y) {
     const char* stage_name =
         gl_stage == GL_VERTEX_SHADER ? "vertex" :
         gl_stage == GL_FRAGMENT_SHADER ? "fragment" : "other";
 
     // Cache key includes the bindings so that re-linking with different
     // attribute bindings (e.g. a different VertexFormat) produces fresh SPIR-V.
+    // flip_y is also part of the key so the Y-flipped variant (for default
+    // framebuffer) and the non-flipped variant (for user FBOs) get distinct
+    // cache entries — without this they would collide and the wrong SPIR-V
+    // would be returned for one of the two framebuffer types.
     uint64_t key = fnv1a(glsl_source) ^ (uint64_t)gl_stage * 0x9E3779B97F4A7C15ULL;
+    if (flip_y) key ^= 0xABCD1234567890ABULL;
     if (attrib_bindings) {
         for (const auto& kv : *attrib_bindings) {
             key ^= fnv1a(kv.first) ^ ((uint64_t)kv.second * 0x100000001B3ULL);
@@ -694,11 +755,11 @@ bool shader_translate(GLenum gl_stage, const std::string& glsl_source,
         }
     }
 
-    MITHRIL_LOG_INFO("shader", "Translating %s shader (%zu bytes GLSL)",
-                     stage_name, glsl_source.size());
+    MITHRIL_LOG_INFO("shader", "Translating %s shader (%zu bytes GLSL, flip_y=%d)",
+                     stage_name, glsl_source.size(), (int)flip_y);
 
     std::vector<uint32_t> spirv;
-    if (!glsl_to_spirv(gl_stage, glsl_source, spirv, out_info_log, attrib_bindings)) {
+    if (!glsl_to_spirv(gl_stage, glsl_source, spirv, out_info_log, attrib_bindings, flip_y)) {
         MITHRIL_LOG_ERROR("shader", "GLSL->SPIR-V failed for %s shader: %s",
                           stage_name, out_info_log.c_str());
         return false;
