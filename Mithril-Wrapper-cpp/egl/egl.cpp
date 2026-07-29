@@ -187,7 +187,7 @@ inline bool valid_config(EGLConfig c) {
 // the old IOSurface-backed images when they are torn down. Without this
 // drain, vkDestroySwapchainKHR frees IOSurfaces that the GPU is still
 // accessing, and the next IOSurfaceBindAccel call crashes with SIGSEGV (UAF).
-bool ensure_swapchain(EglSurface* s, bool skipBackoff) {
+bool ensure_swapchain(EglSurface* s, bool skipBackoff = false) {
     if (!s || !s->native_window) return false;
     int w = 0, h = 0;
     if (!surface_get_size(s->native_window, &w, &h)) return false;
