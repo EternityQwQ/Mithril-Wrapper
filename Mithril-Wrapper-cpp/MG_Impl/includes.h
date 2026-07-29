@@ -27,9 +27,18 @@ void proc_init(void);
 }
 #endif
 
-// Lightweight guard placed at the top of each GL entry point: makes sure the
-// state machine + Vulkan backend are up (in case a GL call arrives before the
-// static initialiser ran, e.g. during early dyload interposition).
-#define MITHRIL_ENSURE_INIT() do { if (!::mithril::g_state) ::proc_init(); } while (0)
+// Lightweight guard placed at the top of each GL entry point.
+//
+// P0-1 fix: g_state is now thread_local.  If EGL has been initialised but the
+// current thread has no current context, we must NOT create a phantom global
+// state — GL calls in that situation should produce GL_INVALID_OPERATION per
+// the spec.  Only create the implicit global state when EGL is not in use
+// (e.g. headless unit tests that call GL directly without EGL).
+#define MITHRIL_ENSURE_INIT() \
+    do { \
+        if (!::mithril::g_state) { \
+            if (!::mithril::g_eglInitialized) ::proc_init(); \
+        } \
+    } while (0)
 
 #endif // MITHRIL_INCLUDES_H

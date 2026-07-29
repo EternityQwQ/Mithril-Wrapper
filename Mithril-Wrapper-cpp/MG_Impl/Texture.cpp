@@ -7,12 +7,28 @@
 // backend_texture_set_params / backend_delete_texture) declared in
 // MG_Backend/Backend.h. Vulkan VkImage/VkImageView objects are owned by the
 // backend and keyed by GL texture name.
+//
+// Binding model (rewritten state machine): textures are bound per-unit
+// per-target via g_state->textureBindings[unit][target] (BindingSlot). The
+// legacy flat boundTextures[] / boundTextureTargets[] arrays are gone.
 #include "includes.h"
+
+// Pnames that are standard OpenGL but absent from our minimal glcorearb.h.
+#ifndef GL_TEXTURE_SWIZZLE_RGBA
+#define GL_TEXTURE_SWIZZLE_RGBA       0x8E46
+#endif
+#ifndef GL_TEXTURE_LOD_BIAS
+#define GL_TEXTURE_LOD_BIAS           0x8501
+#endif
+#ifndef GL_TEXTURE_MAX_ANISOTROPY_EXT
+#define GL_TEXTURE_MAX_ANISOTROPY_EXT 0x84FE
+#endif
 
 extern "C" {
 
 void glGenTextures(GLsizei n, GLuint* textures) {
     MITHRIL_ENSURE_INIT();
+    // state_gen_names routes through the NameAllocator (free_list + valid_bits).
     mithril::state_gen_names("texture", n, textures);
     for (GLsizei i = 0; i < n; ++i) {
         mithril::Texture t{};
@@ -27,35 +43,68 @@ void glDeleteTextures(GLsizei n, const GLuint* textures) {
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = textures[i];
         if (name == 0) continue;
+        // Unbind from every unit / every per-target slot.
         for (int u = 0; u < mithril::kMaxTextureUnits; ++u) {
-            if (g_state->boundTextures[u] == name) g_state->boundTextures[u] = 0;
+            for (int t = 0; t < mithril::kTextureTargetCount; ++t) {
+                if (g_state->textureBindings[u][t].name == name)
+                    g_state->textureBindings[u][t].bind(0);
+            }
         }
         backend_delete_texture(name);
         g_state->textures.erase(name);
+        g_state->textureNames.release(name);
     }
 }
 
 void glBindTexture(GLenum target, GLuint texture) {
     MITHRIL_ENSURE_INIT();
-    if (texture != 0 && !mithril::state_get_texture(texture)) {
-        g_state->textures[texture] = mithril::Texture{};
-        g_state->textures[texture].id = texture;
+    mithril::TextureTarget tt = mithril::textureTargetFromGL(target);
+    if (tt == mithril::TextureTarget::Count) {
+        mithril::state_set_error(GL_INVALID_ENUM);
+        return;
     }
     GLuint unit = g_state->activeTextureUnit;
-    if (unit < mithril::kMaxTextureUnits) {
-        g_state->boundTextures[unit] = texture;
-        g_state->boundTextureTargets[unit] = target;
+    if (unit >= mithril::kMaxTextureUnits) return;
+    // Lazy-create on first bind (matches the GL name-allocator semantics).
+    if (texture != 0 && !mithril::state_get_texture(texture)) {
+        mithril::Texture t{};
+        t.id = texture;
+        g_state->textures[texture] = t;
     }
+    g_state->textureBindings[unit][(int)tt].bind(texture);
+    if ((int)unit > g_state->maxTouchedTextureUnit)
+        g_state->maxTouchedTextureUnit = (int)unit;
+    ++g_state->textureBindGeneration;
     if (mithril::Texture* t = mithril::state_get_texture(texture)) {
         t->target = target;
     }
 }
 
-static mithril::Texture* bound_texture_for_unit() {
+/*
+ * Look up the texture bound to the active unit for `target`.
+ *
+ * Replaces the old flat boundTextures[unit] lookup. Because the binding model
+ * is now per-target, callers that already know the target (glTexImage2D etc.)
+ * go straight to the matching slot. The lookup also enforces target
+ * consistency: if the bound texture object already has a target assigned (set
+ * by a prior glBindTexture) and it does not match the target passed here, the
+ * call records GL_INVALID_OPERATION and returns nullptr (P0-5 / spec 4.2).
+ *
+ * For the "first non-zero texture on the unit" case (used by the backend
+ * descriptor set binding), prefer g_state->boundTextureForUnit(unit).
+ */
+static mithril::Texture* bound_texture_for_target(GLenum target) {
+    mithril::TextureTarget tt = mithril::textureTargetFromGL(target);
+    if (tt == mithril::TextureTarget::Count) return nullptr;
     GLuint unit = g_state->activeTextureUnit;
     if (unit >= mithril::kMaxTextureUnits) return nullptr;
-    GLuint id = g_state->boundTextures[unit];
-    return mithril::state_get_texture(id);
+    GLuint id = g_state->textureBindings[unit][(int)tt].name;
+    mithril::Texture* t = mithril::state_get_texture(id);
+    if (t && t->target != target) {
+        mithril::state_set_error(GL_INVALID_OPERATION);
+        return nullptr;
+    }
+    return t;
 }
 
 void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
@@ -85,7 +134,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
         return;
     }
 
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
     if (level == 0) {
         t->internalFormat = internalFormat;
@@ -99,7 +148,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
                                   internalFormat, target, 1);
     if (pixels) {
         backend_texture_upload(t->id, level, 0, 0, 0, width, height, 1,
-                               format, type, pixels, g_state->unpackAlignment);
+                               format, type, pixels, g_state->pixelStore.unpackAlignment);
     }
 }
 
@@ -108,7 +157,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
                   GLenum format, GLenum type, const void* pixels) {
     MITHRIL_ENSURE_INIT();
     if (border != 0) { mithril::state_set_error(GL_INVALID_VALUE); return; }
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
     if (level == 0) {
         t->internalFormat = internalFormat;
@@ -122,7 +171,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
                                   internalFormat, target, 1);
     if (pixels) {
         backend_texture_upload(t->id, level, 0, 0, 0, width, height, depth,
-                               format, type, pixels, g_state->unpackAlignment);
+                               format, type, pixels, g_state->pixelStore.unpackAlignment);
     }
 }
 
@@ -146,13 +195,15 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
 void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat,
                     GLsizei width, GLsizei height) {
     MITHRIL_ENSURE_INIT();
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t || levels <= 0) return;
     t->internalFormat = internalFormat;
     t->width  = width;
     t->height = height;
     t->depth  = 1;
     t->levels = levels;
+    t->immutable = true;
+    t->immutableLevels = levels;
 
     backend_get_or_create_texture(t->id, width, height, 1, levels,
                                   internalFormat, target, 1);
@@ -164,13 +215,15 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat,
 void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat,
                     GLsizei width, GLsizei height, GLsizei depth) {
     MITHRIL_ENSURE_INIT();
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t || levels <= 0) return;
     t->internalFormat = internalFormat;
     t->width  = width;
     t->height = height;
     t->depth  = depth;
     t->levels = levels;
+    t->immutable = true;
+    t->immutableLevels = levels;
 
     backend_get_or_create_texture(t->id, width, height, depth, levels,
                                   internalFormat, target, 1);
@@ -181,12 +234,11 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                      GLsizei width, GLsizei height,
                      GLenum format, GLenum type, const void* pixels) {
     MITHRIL_ENSURE_INIT();
-    (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t || !pixels) return;
     backend_texture_upload(t->id, level, xoffset, yoffset, 0,
                            width, height, 1, format, type, pixels,
-                           g_state->unpackAlignment);
+                           g_state->pixelStore.unpackAlignment);
 }
 
 void glTexSubImage3D(GLenum target, GLint level,
@@ -194,43 +246,57 @@ void glTexSubImage3D(GLenum target, GLint level,
                      GLsizei width, GLsizei height, GLsizei depth,
                      GLenum format, GLenum type, const void* pixels) {
     MITHRIL_ENSURE_INIT();
-    (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t || !pixels) return;
     backend_texture_upload(t->id, level, xoffset, yoffset, zoffset,
                            width, height, depth, format, type, pixels,
-                           g_state->unpackAlignment);
+                           g_state->pixelStore.unpackAlignment);
 }
 
 void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat,
                              GLsizei width, GLsizei height,
                              GLboolean fixedsamplelocations) {
     MITHRIL_ENSURE_INIT();
-    (void)fixedsamplelocations;
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
     t->internalFormat = internalformat;
     t->width  = width;
     t->height = height;
     t->depth  = 1;
+    t->samples = samples;
+    t->fixedSampleLocations = fixedsamplelocations != 0;
     backend_get_or_create_texture(t->id, width, height, 1, 1,
                                   internalformat, target, samples > 1 ? samples : 1);
 }
 
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
     MITHRIL_ENSURE_INIT();
-    (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
     GLint p = (GLint)param;
     switch (pname) {
-        case GL_TEXTURE_MIN_FILTER: t->minFilter = p; break;
-        case GL_TEXTURE_MAG_FILTER: t->magFilter = p; break;
-        case GL_TEXTURE_WRAP_S:     t->wrapS = p; break;
-        case GL_TEXTURE_WRAP_T:     t->wrapT = p; break;
-        case GL_TEXTURE_WRAP_R:     t->wrapR = p; break;
-        default: break;
+        case GL_TEXTURE_MIN_FILTER:        t->minFilter = p; break;
+        case GL_TEXTURE_MAG_FILTER:        t->magFilter = p; break;
+        case GL_TEXTURE_WRAP_S:            t->wrapS = p; break;
+        case GL_TEXTURE_WRAP_T:            t->wrapT = p; break;
+        case GL_TEXTURE_WRAP_R:            t->wrapR = p; break;
+        case GL_TEXTURE_BASE_LEVEL:        t->baseLevel = p; break;
+        case GL_TEXTURE_MAX_LEVEL:         t->maxLevel = p; break;
+        case GL_TEXTURE_MIN_LOD:           t->minLod = param; break;
+        case GL_TEXTURE_MAX_LOD:           t->maxLod = param; break;
+        case GL_TEXTURE_LOD_BIAS:          t->lodBias = param; break;
+        case GL_TEXTURE_MAX_ANISOTROPY_EXT:t->maxAnisotropy = param; break;
+        case GL_TEXTURE_COMPARE_MODE:      t->compareMode = (GLenum)p; break;
+        case GL_TEXTURE_COMPARE_FUNC:       t->compareFunc = (GLenum)p; break;
+        case GL_TEXTURE_SWIZZLE_R:          t->swizzleR = (GLenum)p; break;
+        case GL_TEXTURE_SWIZZLE_G:          t->swizzleG = (GLenum)p; break;
+        case GL_TEXTURE_SWIZZLE_B:          t->swizzleB = (GLenum)p; break;
+        case GL_TEXTURE_SWIZZLE_A:          t->swizzleA = (GLenum)p; break;
+        default:
+            mithril::state_set_error(GL_INVALID_ENUM);
+            return;
     }
+    ++t->paramsVersion;
     backend_texture_set_params(t->id, t->minFilter, t->magFilter,
                                t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
@@ -242,27 +308,104 @@ void glTexParameteri(GLenum target, GLenum pname, GLint param) {
 void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params) {
     MITHRIL_ENSURE_INIT();
     if (!params) return;
-    if (pname == GL_TEXTURE_BORDER_COLOR) {
-        mithril::Texture* t = bound_texture_for_unit();
-        if (!t) return;
-        for (int i = 0; i < 4; ++i) t->borderColor[i] = params[i];
-        backend_texture_set_params(t->id, t->minFilter, t->magFilter,
-                                   t->wrapS, t->wrapT, t->wrapR, t->borderColor);
-        return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    switch (pname) {
+        case GL_TEXTURE_BORDER_COLOR:
+            for (int i = 0; i < 4; ++i) t->borderColor[i] = params[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            t->swizzleR = (GLenum)params[0];
+            t->swizzleG = (GLenum)params[1];
+            t->swizzleB = (GLenum)params[2];
+            t->swizzleA = (GLenum)params[3];
+            break;
+        default:
+            // Scalar pnames share the scalar path (which bumps version +
+            // pushes params to the backend + records GL_INVALID_ENUM on unknown).
+            glTexParameterf(target, pname, params[0]);
+            return;
     }
-    glTexParameterf(target, pname, params[0]);
+    ++t->paramsVersion;
+    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+                               t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
 
 void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
     MITHRIL_ENSURE_INIT();
     if (!params) return;
-    glTexParameterf(target, pname, (GLfloat)params[0]);
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    switch (pname) {
+        case GL_TEXTURE_BORDER_COLOR:
+            for (int i = 0; i < 4; ++i) t->borderColor[i] = (GLfloat)params[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            t->swizzleR = (GLenum)params[0];
+            t->swizzleG = (GLenum)params[1];
+            t->swizzleB = (GLenum)params[2];
+            t->swizzleA = (GLenum)params[3];
+            break;
+        default:
+            glTexParameterf(target, pname, (GLfloat)params[0]);
+            return;
+    }
+    ++t->paramsVersion;
+    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+                               t->wrapS, t->wrapT, t->wrapR, t->borderColor);
+}
+
+void glTexParameterIiv(GLenum target, GLenum pname, const GLint* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    switch (pname) {
+        case GL_TEXTURE_BORDER_COLOR:
+            for (int i = 0; i < 4; ++i) t->borderColorI[i] = params[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            t->swizzleR = (GLenum)params[0];
+            t->swizzleG = (GLenum)params[1];
+            t->swizzleB = (GLenum)params[2];
+            t->swizzleA = (GLenum)params[3];
+            break;
+        default:
+            glTexParameterf(target, pname, (GLfloat)params[0]);
+            return;
+    }
+    ++t->paramsVersion;
+    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+                               t->wrapS, t->wrapT, t->wrapR, t->borderColor);
+}
+
+void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    switch (pname) {
+        case GL_TEXTURE_BORDER_COLOR:
+            for (int i = 0; i < 4; ++i) t->borderColorUI[i] = (GLint)params[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            t->swizzleR = (GLenum)params[0];
+            t->swizzleG = (GLenum)params[1];
+            t->swizzleB = (GLenum)params[2];
+            t->swizzleA = (GLenum)params[3];
+            break;
+        default:
+            glTexParameterf(target, pname, (GLfloat)params[0]);
+            return;
+    }
+    ++t->paramsVersion;
+    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+                               t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
 
 void glGenerateMipmap(GLenum target) {
     MITHRIL_ENSURE_INIT();
-    (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
     // Compute mip level count if the app never called glTexStorage*(levels=N).
     // glGenerateMipmap is the legacy way to request a full mip chain: the
@@ -273,6 +416,168 @@ void glGenerateMipmap(GLenum target) {
     // modern pipeline uses glTexStorage2D for mipmapped textures).
     t->generateMipmaps = true;
     backend_generate_mipmaps(t->id);
+}
+
+/* ---- Texture parameter queries (P1-4) ----
+ * Return the REAL values tracked on the Texture struct (the previous stubs
+ * unconditionally wrote 0). All pnames accepted by glTexParameter* are
+ * accepted here. The Iiv/Iuiv variants return the integer border color from
+ * borderColorI[] / borderColorUI[] respectively.
+ */
+void glGetTexParameteriv(GLenum target, GLenum pname, GLint* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) { *params = 0; return; }
+    switch (pname) {
+        case GL_TEXTURE_MIN_FILTER:        *params = t->minFilter; break;
+        case GL_TEXTURE_MAG_FILTER:        *params = t->magFilter; break;
+        case GL_TEXTURE_WRAP_S:            *params = t->wrapS; break;
+        case GL_TEXTURE_WRAP_T:            *params = t->wrapT; break;
+        case GL_TEXTURE_WRAP_R:            *params = t->wrapR; break;
+        case GL_TEXTURE_BASE_LEVEL:        *params = t->baseLevel; break;
+        case GL_TEXTURE_MAX_LEVEL:         *params = t->maxLevel; break;
+        case GL_TEXTURE_MIN_LOD:           *params = (GLint)t->minLod; break;
+        case GL_TEXTURE_MAX_LOD:           *params = (GLint)t->maxLod; break;
+        case GL_TEXTURE_LOD_BIAS:          *params = (GLint)t->lodBias; break;
+        case GL_TEXTURE_MAX_ANISOTROPY_EXT:*params = (GLint)t->maxAnisotropy; break;
+        case GL_TEXTURE_COMPARE_MODE:      *params = (GLint)t->compareMode; break;
+        case GL_TEXTURE_COMPARE_FUNC:      *params = (GLint)t->compareFunc; break;
+        case GL_TEXTURE_SWIZZLE_R:         *params = (GLint)t->swizzleR; break;
+        case GL_TEXTURE_SWIZZLE_G:         *params = (GLint)t->swizzleG; break;
+        case GL_TEXTURE_SWIZZLE_B:         *params = (GLint)t->swizzleB; break;
+        case GL_TEXTURE_SWIZZLE_A:         *params = (GLint)t->swizzleA; break;
+        case GL_TEXTURE_BORDER_COLOR:
+            for (int i = 0; i < 4; ++i) params[i] = (GLint)t->borderColor[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            params[0] = (GLint)t->swizzleR;
+            params[1] = (GLint)t->swizzleG;
+            params[2] = (GLint)t->swizzleB;
+            params[3] = (GLint)t->swizzleA;
+            break;
+        default:
+            mithril::state_set_error(GL_INVALID_ENUM);
+            *params = 0;
+            break;
+    }
+}
+
+void glGetTexParameterfv(GLenum target, GLenum pname, GLfloat* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) { *params = 0; return; }
+    switch (pname) {
+        case GL_TEXTURE_MIN_FILTER:        *params = (GLfloat)t->minFilter; break;
+        case GL_TEXTURE_MAG_FILTER:        *params = (GLfloat)t->magFilter; break;
+        case GL_TEXTURE_WRAP_S:            *params = (GLfloat)t->wrapS; break;
+        case GL_TEXTURE_WRAP_T:            *params = (GLfloat)t->wrapT; break;
+        case GL_TEXTURE_WRAP_R:            *params = (GLfloat)t->wrapR; break;
+        case GL_TEXTURE_BASE_LEVEL:        *params = (GLfloat)t->baseLevel; break;
+        case GL_TEXTURE_MAX_LEVEL:         *params = (GLfloat)t->maxLevel; break;
+        case GL_TEXTURE_MIN_LOD:           *params = t->minLod; break;
+        case GL_TEXTURE_MAX_LOD:           *params = t->maxLod; break;
+        case GL_TEXTURE_LOD_BIAS:          *params = t->lodBias; break;
+        case GL_TEXTURE_MAX_ANISOTROPY_EXT:*params = t->maxAnisotropy; break;
+        case GL_TEXTURE_COMPARE_MODE:      *params = (GLfloat)t->compareMode; break;
+        case GL_TEXTURE_COMPARE_FUNC:      *params = (GLfloat)t->compareFunc; break;
+        case GL_TEXTURE_SWIZZLE_R:         *params = (GLfloat)t->swizzleR; break;
+        case GL_TEXTURE_SWIZZLE_G:         *params = (GLfloat)t->swizzleG; break;
+        case GL_TEXTURE_SWIZZLE_B:         *params = (GLfloat)t->swizzleB; break;
+        case GL_TEXTURE_SWIZZLE_A:         *params = (GLfloat)t->swizzleA; break;
+        case GL_TEXTURE_BORDER_COLOR:
+            for (int i = 0; i < 4; ++i) params[i] = t->borderColor[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            params[0] = (GLfloat)t->swizzleR;
+            params[1] = (GLfloat)t->swizzleG;
+            params[2] = (GLfloat)t->swizzleB;
+            params[3] = (GLfloat)t->swizzleA;
+            break;
+        default:
+            mithril::state_set_error(GL_INVALID_ENUM);
+            *params = 0;
+            break;
+    }
+}
+
+void glGetTexParameterIiv(GLenum target, GLenum pname, GLint* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) { *params = 0; return; }
+    switch (pname) {
+        case GL_TEXTURE_BORDER_COLOR:
+            // Integer border color (signed).
+            for (int i = 0; i < 4; ++i) params[i] = t->borderColorI[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            params[0] = (GLint)t->swizzleR;
+            params[1] = (GLint)t->swizzleG;
+            params[2] = (GLint)t->swizzleB;
+            params[3] = (GLint)t->swizzleA;
+            break;
+        default: {
+            // Fall back to the plain iv query for non-integer-valued pnames.
+            GLint iv = 0;
+            glGetTexParameteriv(target, pname, &iv);
+            *params = iv;
+            break;
+        }
+    }
+}
+
+void glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) { *params = 0; return; }
+    switch (pname) {
+        case GL_TEXTURE_BORDER_COLOR:
+            // Unsigned integer border color.
+            for (int i = 0; i < 4; ++i) params[i] = (GLuint)t->borderColorUI[i];
+            break;
+        case GL_TEXTURE_SWIZZLE_RGBA:
+            params[0] = (GLuint)t->swizzleR;
+            params[1] = (GLuint)t->swizzleG;
+            params[2] = (GLuint)t->swizzleB;
+            params[3] = (GLuint)t->swizzleA;
+            break;
+        default: {
+            GLint iv = 0;
+            glGetTexParameteriv(target, pname, &iv);
+            *params = (GLuint)iv;
+            break;
+        }
+    }
+}
+
+/*
+ * glGetTexImage: basic CPU readback from shadow data.
+ *
+ * The current Texture struct does not shadow pixel data on the CPU side —
+ * uploads go straight to the Vulkan VkImage via backend_texture_upload, and
+ * no host copy is retained. Real GPU readback would require a
+ * backend_read_texture_image() path (vkCmdCopyImageToBuffer on the texture's
+ * VkImage) which is not wired up yet. Until that exists this leaves the
+ * caller's buffer untouched (matching the previous stub behaviour) rather
+ * than returning garbage. When shadow data is added to the Texture struct,
+ * the readback path goes here.
+ */
+void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels) {
+    MITHRIL_ENSURE_INIT();
+    if (!pixels) return;
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    (void)level; (void)format; (void)type;
+    // TODO: once t->data shadow copy exists (or backend_read_texture_image is
+    // added), perform the CPU readback here.
+}
+
+GLboolean glIsTexture(GLuint texture) {
+    if (!g_state) return GL_FALSE;
+    return g_state->textureNames.valid(texture) ? GL_TRUE : GL_FALSE;
 }
 
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,

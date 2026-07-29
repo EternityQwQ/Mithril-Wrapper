@@ -32,6 +32,17 @@
 #define GL_TEXTURE_INTERNAL_FORMAT   0x1003
 #endif
 
+/*
+ * Pixel-store constants missing from our minimal glcorearb.h. The matching
+ * pack/unpack state lives in mithril::PixelStoreState (g_state->pixelStore).
+ */
+#ifndef GL_PACK_IMAGE_HEIGHT
+#define GL_PACK_IMAGE_HEIGHT         0x806F
+#endif
+#ifndef GL_PACK_SKIP_IMAGES
+#define GL_PACK_SKIP_IMAGES          0x806B
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -189,7 +200,12 @@ GLAPI void GLAPIENTRY glGetPointerv(GLenum pname, void** params);
 GLAPI void GLAPIENTRY glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint* params);
 GLAPI void GLAPIENTRY glGetTexParameteriv(GLenum target, GLenum pname, GLint* params);
 GLAPI void GLAPIENTRY glGetTexParameterfv(GLenum target, GLenum pname, GLfloat* params);
+GLAPI void GLAPIENTRY glGetTexParameterIiv(GLenum target, GLenum pname, GLint* params);
+GLAPI void GLAPIENTRY glGetTexParameterIuiv(GLenum target, GLenum pname, GLuint* params);
 GLAPI void GLAPIENTRY glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void* pixels);
+GLAPI void GLAPIENTRY glTexParameterIiv(GLenum target, GLenum pname, const GLint* params);
+GLAPI void GLAPIENTRY glTexParameterIuiv(GLenum target, GLenum pname, const GLuint* params);
+GLAPI GLboolean GLAPIENTRY glIsTexture(GLuint texture);
 GLAPI GLboolean GLAPIENTRY glAreTexturesResident(GLsizei n, const GLuint* textures, GLboolean* residences);
 GLAPI void GLAPIENTRY glPrioritizeTextures(GLsizei n, const GLuint* textures, const GLclampf* priorities);
 GLAPI void GLAPIENTRY glDepthBoundsEXT(GLclampd zmin, GLclampd zmax);

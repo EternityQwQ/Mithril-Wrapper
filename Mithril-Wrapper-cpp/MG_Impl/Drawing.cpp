@@ -14,6 +14,38 @@
 // (backend_*) declared in MG_Backend/Backend.h. Render passes use Vulkan 1.2
 // dynamic rendering (VK_KHR_dynamic_rendering) instead of Metal render
 // encoders.
+// Sync object + transform-feedback constants — standard GL values missing
+// from our minimal glcorearb.h. Guarded so a future header update won't
+// conflict. Defined before includes so State.h (which uses them as default
+// field values) sees them.
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#endif
+#ifndef GL_SYNC_FENCE
+#define GL_SYNC_FENCE                0x9116
+#endif
+#ifndef GL_SYNC_CONDITION
+#define GL_SYNC_CONDITION            0x9118
+#endif
+#ifndef GL_SYNC_FLAGS
+#define GL_SYNC_FLAGS                0x9115
+#endif
+#ifndef GL_SYNC_STATUS
+#define GL_SYNC_STATUS               0x9119
+#endif
+#ifndef GL_SIGNALED
+#define GL_SIGNALED                  0x911E
+#endif
+#ifndef GL_UNSIGNALED
+#define GL_UNSIGNALED                0x911F
+#endif
+#ifndef GL_OBJECT_TYPE
+#define GL_OBJECT_TYPE               0x9112
+#endif
+#ifndef GL_INTERLEAVED_ATTRIBS
+#define GL_INTERLEAVED_ATTRIBS       0x8C8C
+#endif
+
 #include "includes.h"
 #include "Framebuffer.h"
 
@@ -142,10 +174,10 @@ static void prepare_draw(GLenum mode) {
     // the signature and colorWriteMask was hardcoded RGBA-all-on, so different
     // blend/mask configs collided in the cache and glColorMask was a no-op).
     int cwm_bits = 0;
-    if (g_state->colorMask[0]) cwm_bits |= 1;
-    if (g_state->colorMask[1]) cwm_bits |= 2;
-    if (g_state->colorMask[2]) cwm_bits |= 4;
-    if (g_state->colorMask[3]) cwm_bits |= 8;
+    if (g_state->colorMask[0][0]) cwm_bits |= 1;
+    if (g_state->colorMask[0][1]) cwm_bits |= 2;
+    if (g_state->colorMask[0][2]) cwm_bits |= 4;
+    if (g_state->colorMask[0][3]) cwm_bits |= 8;
     VkPipeline pipeline = backend_get_or_create_pipeline(
         prog->id,
         vs_spirv.data(),            (int)vs_spirv.size(),
@@ -153,11 +185,11 @@ static void prepare_draw(GLenum mode) {
         attribs, attrib_count,
         color_formats, color_count,
         depth_format,
-        g_state->blend ? 1 : 0,
-        g_state->blendSrcRGB,
-        g_state->blendDstRGB,
-        g_state->blendSrcA,
-        g_state->blendDstA,
+        g_state->blends[0].enabled ? 1 : 0,
+        g_state->blends[0].srcRGB,
+        g_state->blends[0].dstRGB,
+        g_state->blends[0].srcA,
+        g_state->blends[0].dstA,
         cwm_bits,
         mode,
         is_default_fbo ? 1 : 0);
@@ -222,8 +254,8 @@ static void prepare_draw(GLenum mode) {
         backend_set_cull_mode(0);  // VK_CULL_MODE_NONE
     }
     backend_set_color_write_mask(
-        g_state->colorMask[0], g_state->colorMask[1],
-        g_state->colorMask[2], g_state->colorMask[3]);
+        g_state->colorMask[0][0], g_state->colorMask[0][1],
+        g_state->colorMask[0][2], g_state->colorMask[0][3]);
     backend_set_depth_test(
         g_state->depthTest ? 1 : 0,
         g_state->depthMask ? 1 : 0,
@@ -231,7 +263,7 @@ static void prepare_draw(GLenum mode) {
     if (g_state->polygonOffsetFill) {
         backend_set_depth_bias(g_state->polygonOffsetUnits, 0.0f);
     }
-    if (g_state->blend) {
+    if (g_state->blends[0].enabled) {
         backend_set_blend_color(
             g_state->blendColor[0], g_state->blendColor[1],
             g_state->blendColor[2], g_state->blendColor[3]);
@@ -284,8 +316,34 @@ static int index_type_to_int(GLenum type) {
     return (type == GL_UNSIGNED_INT) ? 1 : 0;
 }
 
+// P1-9: Validate primitive mode + vertex count for draw calls.
+// Returns true if the draw may proceed; otherwise records a GL error and
+// returns false. Mode must be one of the GL 3.3 Core primitive modes; count
+// must be non-negative.
+static bool validate_draw_call(GLenum mode, GLsizei count) {
+    switch (mode) {
+        case GL_POINTS:
+        case GL_LINES:
+        case GL_LINE_STRIP:
+        case GL_LINE_LOOP:
+        case GL_TRIANGLES:
+        case GL_TRIANGLE_STRIP:
+        case GL_TRIANGLE_FAN:
+            break;
+        default:
+            mithril::state_set_error(GL_INVALID_ENUM);
+            return false;
+    }
+    if (count < 0) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return false;
+    }
+    return true;
+}
+
 void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     MITHRIL_ENSURE_INIT();
+    if (!validate_draw_call(mode, count)) return;
     prepare_draw(mode);
     backend_draw_arrays((int)mode, (int)first, (int)count);
     end_draw();
@@ -309,6 +367,7 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
 
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
     MITHRIL_ENSURE_INIT();
+    if (!validate_draw_call(mode, count)) return;
     prepare_draw(mode);
     // If a VBO is bound for GL_ELEMENT_ARRAY_BUFFER, indices is an offset into it.
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
@@ -411,35 +470,79 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
     }
 }
 
-/* ---- Sync objects ---- */
+/* ---- Sync objects (P1-16 FIX) ---- */
+// Real state tracking via g_state->syncObjects. Handles are allocated from
+// g_state->nextSyncHandle (monotonic, avoids the sentinel 0x1). CPU-side
+// fences are considered immediately signaled, matching the previous stub
+// behaviour but with proper existence/identity checks.
 GLsync glFenceSync(GLenum condition, GLbitfield flags) {
     MITHRIL_ENSURE_INIT();
-    (void)condition; (void)flags;
-    // Return a non-null sentinel pointer. Real implementation would create a
-    // VkFence/VkSemaphore; sufficient for the sync-id pattern used by most GL
-    // apps (glClientWaitSync returning ALREADY_SIGNALED immediately).
-    return (GLsync)0x1;
+    if (condition != GL_SYNC_GPU_COMMANDS_COMPLETE) {
+        mithril::state_set_error(GL_INVALID_ENUM);
+        return nullptr;
+    }
+    mithril::Sync sync;
+    sync.handle = g_state->nextSyncHandle;
+    sync.condition = condition;
+    sync.flags = flags;
+    sync.signaled = true;  // CPU-side fence is immediately signaled
+    sync.markedForDeletion = false;
+    g_state->syncObjects[sync.handle] = sync;
+    g_state->nextSyncHandle = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(g_state->nextSyncHandle) + 1);
+    return reinterpret_cast<GLsync>(sync.handle);
 }
 
 void glDeleteSync(GLsync sync) {
     MITHRIL_ENSURE_INIT();
-    (void)sync;
+    if (!sync) return;
+    void* handle = reinterpret_cast<void*>(sync);
+    g_state->syncObjects.erase(handle);
 }
 
 GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
     MITHRIL_ENSURE_INIT();
-    (void)sync; (void)flags; (void)timeout;
-    return GL_ALREADY_SIGNALED;
+    (void)flags; (void)timeout;
+    if (!sync) return GL_WAIT_FAILED;
+    void* handle = reinterpret_cast<void*>(sync);
+    auto it = g_state->syncObjects.find(handle);
+    if (it == g_state->syncObjects.end()) return GL_WAIT_FAILED;
+    return it->second.signaled ? GL_ALREADY_SIGNALED : GL_TIMEOUT_EXPIRED;
 }
 
 void glWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
     MITHRIL_ENSURE_INIT();
     (void)sync; (void)flags; (void)timeout;
+    // No-op: CPU-side fences are immediately signaled.
 }
 
 GLboolean glIsSync(GLsync sync) {
     MITHRIL_ENSURE_INIT();
-    return sync ? GL_TRUE : GL_FALSE;
+    if (!sync) return GL_FALSE;
+    void* handle = reinterpret_cast<void*>(sync);
+    return g_state->syncObjects.find(handle) != g_state->syncObjects.end()
+        ? GL_TRUE : GL_FALSE;
+}
+
+void glGetSynciv(GLsync sync, GLenum pname, GLsizei bufSize, GLsizei* length, GLint* values) {
+    MITHRIL_ENSURE_INIT();
+    if (length) *length = 0;
+    if (bufSize < 0 || !values || bufSize == 0) return;
+    if (!sync) return;
+    void* handle = reinterpret_cast<void*>(sync);
+    auto it = g_state->syncObjects.find(handle);
+    if (it == g_state->syncObjects.end()) return;
+    const mithril::Sync& s = it->second;
+    GLint v = 0;
+    switch (pname) {
+        case GL_OBJECT_TYPE:    v = GL_SYNC_FENCE; break;
+        case GL_SYNC_CONDITION: v = (GLint)s.condition; break;
+        case GL_SYNC_FLAGS:     v = (GLint)s.flags; break;
+        case GL_SYNC_STATUS:    v = s.signaled ? GL_SIGNALED : GL_UNSIGNALED; break;
+        default: return;
+    }
+    values[0] = v;
+    if (length) *length = 1;
 }
 
 } // extern "C"

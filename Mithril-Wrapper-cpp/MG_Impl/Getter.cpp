@@ -118,16 +118,16 @@ void glGetBooleanv(GLenum pname, GLboolean* params) {
     switch (pname) {
         case GL_DEPTH_WRITEMASK: *params = g_state->depthMask ? GL_TRUE : GL_FALSE; break;
         case GL_DEPTH_TEST:      *params = g_state->depthTest ? GL_TRUE : GL_FALSE; break;
-        case GL_BLEND:           *params = g_state->blend ? GL_TRUE : GL_FALSE; break;
+        case GL_BLEND:           *params = g_state->blends[0].enabled ? GL_TRUE : GL_FALSE; break;
         case GL_STENCIL_TEST:    *params = g_state->stencilTest ? GL_TRUE : GL_FALSE; break;
         case GL_CULL_FACE:       *params = g_state->cullFace ? GL_TRUE : GL_FALSE; break;
         case GL_SCISSOR_TEST:    *params = g_state->scissorTest ? GL_TRUE : GL_FALSE; break;
         case GL_DITHER:          *params = g_state->dither ? GL_TRUE : GL_FALSE; break;
         case GL_COLOR_WRITEMASK:
-            params[0] = g_state->colorMask[0] ? GL_TRUE : GL_FALSE;
-            params[1] = g_state->colorMask[1] ? GL_TRUE : GL_FALSE;
-            params[2] = g_state->colorMask[2] ? GL_TRUE : GL_FALSE;
-            params[3] = g_state->colorMask[3] ? GL_TRUE : GL_FALSE;
+            params[0] = g_state->colorMask[0][0] ? GL_TRUE : GL_FALSE;
+            params[1] = g_state->colorMask[0][1] ? GL_TRUE : GL_FALSE;
+            params[2] = g_state->colorMask[0][2] ? GL_TRUE : GL_FALSE;
+            params[3] = g_state->colorMask[0][3] ? GL_TRUE : GL_FALSE;
             break;
         default: *params = GL_FALSE; break;
     }
@@ -181,9 +181,13 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         case GL_MAX_COLOR_ATTACHMENTS:        *params = mithril::kMaxColorAttachments; break;
         case GL_MAX_TEXTURE_UNITS:            *params = mithril::kMaxTextureUnits; break;
         case GL_ACTIVE_TEXTURE:               *params = (GLint)(GL_TEXTURE0 + g_state->activeTextureUnit); break;
-        case GL_ARRAY_BUFFER_BINDING:         *params = (GLint)g_state->currentArrayBuffer; break;
-        case GL_ELEMENT_ARRAY_BUFFER_BINDING: *params = (GLint)g_state->currentIndexBuffer; break;
-        case GL_UNIFORM_BUFFER_BINDING:       *params = (GLint)g_state->currentUniformBuffer; break;
+        case GL_ARRAY_BUFFER_BINDING:         *params = (GLint)g_state->bufferBindings[(int)mithril::BufferTarget::Array].name; break;
+        case GL_ELEMENT_ARRAY_BUFFER_BINDING: {
+            mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+            *params = vao ? (GLint)vao->elementArrayBuffer : 0;
+            break;
+        }
+        case GL_UNIFORM_BUFFER_BINDING:       *params = (GLint)g_state->bufferBindings[(int)mithril::BufferTarget::Uniform].name; break;
         case GL_VERTEX_ARRAY_BINDING:         *params = (GLint)g_state->currentVAO; break;
         case GL_CURRENT_PROGRAM:              *params = (GLint)g_state->currentProgram; break;
         // GL_DRAW_FRAMEBUFFER_BINDING and GL_FRAMEBUFFER_BINDING share the same
@@ -208,17 +212,17 @@ void glGetIntegerv(GLenum pname, GLint* params) {
                                                  params[1] = (GLint)g_state->polygonModeBack; break;
         case GL_LINE_WIDTH:                   *params = (GLint)g_state->lineWidth; break;
         case GL_POINT_SIZE:                   *params = (GLint)g_state->pointSize; break;
-        case GL_UNPACK_ALIGNMENT:             *params = g_state->unpackAlignment; break;
-        case GL_PACK_ALIGNMENT:               *params = g_state->packAlignment; break;
-        case GL_UNPACK_ROW_LENGTH:            *params = g_state->unpackRowLength; break;
-        case GL_UNPACK_IMAGE_HEIGHT:          *params = g_state->unpackImageHeight; break;
-        case GL_TEXTURE_BINDING_2D:           *params = (GLint)g_state->boundTextures[g_state->activeTextureUnit]; break;
-        case GL_BLEND_SRC_RGB:                *params = (GLint)g_state->blendSrcRGB; break;
-        case GL_BLEND_DST_RGB:                *params = (GLint)g_state->blendDstRGB; break;
-        case GL_BLEND_SRC_ALPHA:              *params = (GLint)g_state->blendSrcA; break;
-        case GL_BLEND_DST_ALPHA:              *params = (GLint)g_state->blendDstA; break;
-        case GL_BLEND_EQUATION_RGB:           *params = (GLint)g_state->blendEqRGB; break;
-        case GL_BLEND_EQUATION_ALPHA:         *params = (GLint)g_state->blendEqA; break;
+        case GL_UNPACK_ALIGNMENT:             *params = g_state->pixelStore.unpackAlignment; break;
+        case GL_PACK_ALIGNMENT:               *params = g_state->pixelStore.packAlignment; break;
+        case GL_UNPACK_ROW_LENGTH:            *params = g_state->pixelStore.unpackRowLength; break;
+        case GL_UNPACK_IMAGE_HEIGHT:          *params = g_state->pixelStore.unpackImageHeight; break;
+        case GL_TEXTURE_BINDING_2D:           *params = (GLint)g_state->textureBindings[g_state->activeTextureUnit][(int)mithril::TextureTarget::_2D].name; break;
+        case GL_BLEND_SRC_RGB:                *params = (GLint)g_state->blends[0].srcRGB; break;
+        case GL_BLEND_DST_RGB:                *params = (GLint)g_state->blends[0].dstRGB; break;
+        case GL_BLEND_SRC_ALPHA:              *params = (GLint)g_state->blends[0].srcA; break;
+        case GL_BLEND_DST_ALPHA:              *params = (GLint)g_state->blends[0].dstA; break;
+        case GL_BLEND_EQUATION_RGB:           *params = (GLint)g_state->blends[0].eqRGB; break;
+        case GL_BLEND_EQUATION_ALPHA:         *params = (GLint)g_state->blends[0].eqA; break;
         case GL_STENCIL_WRITEMASK:            *params = (GLint)g_state->stencilMask; break;
         case GL_STENCIL_BACK_WRITEMASK:       *params = (GLint)g_state->stencilBackMask; break;
         case GL_STENCIL_FUNC:                 *params = (GLint)g_state->stencilFunc; break;
@@ -272,8 +276,40 @@ void glGetInteger64v(GLenum pname, GLint64* params) {
 
 void glGetIntegeri_v(GLenum pname, GLuint index, GLint* params) {
     MITHRIL_ENSURE_INIT();
-    (void)pname; (void)index;
-    if (params) *params = 0;
+    if (!params) return;
+    *params = 0;
+    if (index >= mithril::kMaxIndexedBindings) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    // Indexed buffer binding queries (UBO / TF / AtomicCounter / SSBO).
+    // Determine which indexed category the pname belongs to.
+    mithril::IndexedBufferTarget cat = mithril::IndexedBufferTarget::Count;
+    bool isStart = false, isSize = false, isBinding = false;
+
+    switch (pname) {
+        case GL_UNIFORM_BUFFER_BINDING:        cat = mithril::IndexedBufferTarget::Uniform; isBinding = true; break;
+        case 0x8F29 /*GL_UNIFORM_BUFFER_START*/:cat = mithril::IndexedBufferTarget::Uniform; isStart = true; break;
+        case 0x8F2A /*GL_UNIFORM_BUFFER_SIZE*/: cat = mithril::IndexedBufferTarget::Uniform; isSize = true; break;
+        case 0x8C7A /*GL_TRANSFORM_FEEDBACK_BUFFER_BINDING*/: cat = mithril::IndexedBufferTarget::TransformFeedback; isBinding = true; break;
+        case 0x8C84 /*GL_TRANSFORM_FEEDBACK_BUFFER_START*/:   cat = mithril::IndexedBufferTarget::TransformFeedback; isStart = true; break;
+        case 0x8C85 /*GL_TRANSFORM_FEEDBACK_BUFFER_SIZE*/:    cat = mithril::IndexedBufferTarget::TransformFeedback; isSize = true; break;
+        case 0x92C1 /*GL_ATOMIC_COUNTER_BUFFER_BINDING*/:     cat = mithril::IndexedBufferTarget::AtomicCounter; isBinding = true; break;
+        case 0x92C2 /*GL_ATOMIC_COUNTER_BUFFER_START*/:       cat = mithril::IndexedBufferTarget::AtomicCounter; isStart = true; break;
+        case 0x92C3 /*GL_ATOMIC_COUNTER_BUFFER_SIZE*/:        cat = mithril::IndexedBufferTarget::AtomicCounter; isSize = true; break;
+        case 0x90D3 /*GL_SHADER_STORAGE_BUFFER_BINDING*/:     cat = mithril::IndexedBufferTarget::ShaderStorage; isBinding = true; break;
+        case 0x90D4 /*GL_SHADER_STORAGE_BUFFER_START*/:       cat = mithril::IndexedBufferTarget::ShaderStorage; isStart = true; break;
+        case 0x90D5 /*GL_SHADER_STORAGE_BUFFER_SIZE*/:        cat = mithril::IndexedBufferTarget::ShaderStorage; isSize = true; break;
+        default:
+            // For non-indexed pnames (e.g. GL_COLOR_WRITEMASK with index), fall back.
+            return;
+    }
+    if (cat == mithril::IndexedBufferTarget::Count) return;
+    const mithril::IndexedBindingSlot& slot =
+        g_state->indexedBufferBindings[(int)cat][index];
+    if (isBinding) *params = (GLint)slot.name;
+    else if (isStart) *params = (GLint)slot.offset;
+    else if (isSize)  *params = (GLint)slot.size;
 }
 
 const GLubyte* glGetString(GLenum name) {

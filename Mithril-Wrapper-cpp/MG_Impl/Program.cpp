@@ -17,7 +17,8 @@ extern "C" {
 
 GLuint glCreateShader(GLenum type) {
     MITHRIL_ENSURE_INIT();
-    GLuint name = g_state->nextName++;
+    GLuint name = 0;
+    mithril::state_gen_names("shader", 1, &name);
     mithril::Shader s{};
     s.id = name;
     s.type = type;
@@ -27,12 +28,22 @@ GLuint glCreateShader(GLenum type) {
 
 void glDeleteShader(GLuint shader) {
     MITHRIL_ENSURE_INIT();
-    g_state->shaders.erase(shader);
+    mithril::Shader* s = mithril::state_get_shader(shader);
+    if (!s) return;
+    // P1-5 deferred deletion: mark now, erase only when no program references
+    // it. If attachCount > 0 the shader stays alive until the last detach
+    // triggers the actual erase from glDetachShader.
+    s->markedForDeletion = true;
+    if (s->attachCount == 0) {
+        g_state->shaders.erase(shader);
+        g_state->shaderNames.release(shader);
+    }
 }
 
 GLuint glCreateProgram(void) {
     MITHRIL_ENSURE_INIT();
-    GLuint name = g_state->nextName++;
+    GLuint name = 0;
+    mithril::state_gen_names("program", 1, &name);
     mithril::Program p{};
     p.id = name;
     g_state->programs[name] = p;
@@ -41,10 +52,19 @@ GLuint glCreateProgram(void) {
 
 void glDeleteProgram(GLuint program) {
     MITHRIL_ENSURE_INIT();
-    if (g_state->currentProgram == program) g_state->currentProgram = 0;
-    // Release the Vulkan shader modules + cached pipelines owned by this program.
-    backend_delete_program_resources(program);
-    g_state->programs.erase(program);
+    mithril::Program* p = mithril::state_get_program(program);
+    if (!p) return;
+    // P1-5 deferred deletion: mark now. If this program is NOT the current
+    // program, erase immediately. If it IS current, keep it alive until
+    // glUseProgram(0) (or another program) replaces it — glUseProgram triggers
+    // the erase for the previously-current program.
+    p->markedForDeletion = true;
+    if (g_state->currentProgram != program) {
+        // Release the Vulkan shader modules + cached pipelines owned by this program.
+        backend_delete_program_resources(program);
+        g_state->programs.erase(program);
+        g_state->programNames.release(program);
+    }
 }
 
 void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length) {
@@ -97,6 +117,10 @@ void glAttachShader(GLuint program, GLuint shader) {
     if (!p) return;
     for (GLuint id : p->attachedShaders) if (id == shader) return;
     p->attachedShaders.push_back(shader);
+    // P1-5: track attach count so glDeleteShader's deferred deletion can fire
+    // only when the last program detaches the shader.
+    mithril::Shader* s = mithril::state_get_shader(shader);
+    if (s) ++s->attachCount;
 }
 
 void glDetachShader(GLuint program, GLuint shader) {
@@ -105,6 +129,16 @@ void glDetachShader(GLuint program, GLuint shader) {
     if (!p) return;
     auto& v = p->attachedShaders;
     v.erase(std::remove(v.begin(), v.end(), shader), v.end());
+    mithril::Shader* s = mithril::state_get_shader(shader);
+    if (s && s->attachCount > 0) {
+        --s->attachCount;
+        // P1-5 deferred deletion: if this was the last detach AND the shader
+        // was previously marked for deletion, finish the deletion now.
+        if (s->attachCount == 0 && s->markedForDeletion) {
+            g_state->shaders.erase(shader);
+            g_state->shaderNames.release(shader);
+        }
+    }
 }
 
 void glLinkProgram(GLuint program) {
@@ -221,6 +255,19 @@ void glUseProgram(GLuint program) {
         mithril::state_set_error(GL_INVALID_OPERATION);
         return;
     }
+    // P1-5 deferred deletion: if the previously-current program was marked
+    // for deletion and is being replaced (by 0 or another program), finish
+    // the deletion now. This is the trigger for programs deleted while
+    // current — glDeleteProgram left them alive precisely for this moment.
+    GLuint prev = g_state->currentProgram;
+    if (prev != 0 && prev != program) {
+        mithril::Program* pp = mithril::state_get_program(prev);
+        if (pp && pp->markedForDeletion) {
+            backend_delete_program_resources(prev);
+            g_state->programs.erase(prev);
+            g_state->programNames.release(prev);
+        }
+    }
     g_state->currentProgram = program;
 }
 
@@ -308,17 +355,16 @@ void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLui
 GLint glGetUniformLocation(GLuint program, const GLchar* name) {
     MITHRIL_ENSURE_INIT();
     mithril::Program* p = mithril::state_get_program(program);
-    if (!p || !p->linked || !name) return -1;
-    auto it = p->uniforms.find(name);
-    if (it == p->uniforms.end()) {
-        // Allocate a synthetic location on first query so subsequent setters work.
-        mithril::Uniform u{};
-        u.name = name;
-        u.location = (GLint)p->uniforms.size();
-        p->uniforms[name] = u;
-        p->uniformByLocation[u.location] = name;
-        return u.location;
+    if (!p || !name) return -1;
+    // P1-6 FIX: querying a location on an unlinked program is GL_INVALID_OPERATION.
+    // Never insert a synthetic uniform entry as a side effect of the query —
+    // only return locations for uniforms that exist in the program's table.
+    if (!p->linked) {
+        mithril::state_set_error(GL_INVALID_OPERATION);
+        return -1;
     }
+    auto it = p->uniforms.find(name);
+    if (it == p->uniforms.end()) return -1;
     return it->second.location;
 }
 
@@ -408,7 +454,9 @@ void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex,
 
 void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) {
     MITHRIL_ENSURE_INIT();
-    (void)program; (void)uniformBlockIndex; (void)uniformBlockBinding;
+    mithril::Program* p = mithril::state_get_program(program);
+    if (!p) return;
+    p->uniformBlockBindings[uniformBlockIndex] = uniformBlockBinding;
 }
 
 /* ---- Uniform setters ----
@@ -490,5 +538,18 @@ void glUniformMatrix2x4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) {
 void glUniformMatrix4x2fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 8); }
 void glUniformMatrix3x4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 12); }
 void glUniformMatrix4x3fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 12); }
+
+GLboolean glIsProgram(GLuint program) {
+    // P1-5: validity is O(1) via NameAllocator::valid(). This covers both
+    // never-allocated names (valid_bits unset) and deleted-and-released names
+    // (release() marks invalid + pushes to freeList for reuse).
+    return (mithril::g_state && mithril::g_state->programNames.valid(program))
+        ? GL_TRUE : GL_FALSE;
+}
+
+GLboolean glIsShader(GLuint shader) {
+    return (mithril::g_state && mithril::g_state->shaderNames.valid(shader))
+        ? GL_TRUE : GL_FALSE;
+}
 
 } // extern "C"

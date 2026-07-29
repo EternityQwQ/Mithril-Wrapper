@@ -9,6 +9,18 @@
 // / backend_delete_buffer) declared in MG_Backend/Backend.h.
 #include "includes.h"
 
+/* GL buffer parameter / query constants not always present in the minimal
+ * glcorearb.h we ship. Standard GL 3.3 Core values. */
+#ifndef GL_BUFFER_MAPPED
+#define GL_BUFFER_MAPPED                0x88BC
+#endif
+#ifndef GL_BUFFER_MAP_OFFSET
+#define GL_BUFFER_MAP_OFFSET            0x9121
+#endif
+#ifndef GL_BUFFER_MAP_LENGTH
+#define GL_BUFFER_MAP_LENGTH            0x9120
+#endif
+
 extern "C" {
 
 void glGenBuffers(GLsizei n, GLuint* buffers) {
@@ -27,44 +39,55 @@ void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = buffers[i];
         if (name == 0) continue;
-        if (g_state->currentArrayBuffer == name)   g_state->currentArrayBuffer = 0;
-        if (g_state->currentIndexBuffer == name)   g_state->currentIndexBuffer = 0;
-        if (g_state->currentUniformBuffer == name) g_state->currentUniformBuffer = 0;
+        // Unbind from all non-indexed buffer binding slots.
+        for (int s = 0; s < mithril::kBufferTargetCount; ++s) {
+            if (g_state->bufferBindings[s].name == name) g_state->bufferBindings[s].bind(0);
+        }
+        // Unbind from all indexed buffer binding slots (UBO/SSBO/TF/AtomicCounter).
+        for (int c = 0; c < mithril::kIndexedBufferCategoryCount; ++c) {
+            for (int s = 0; s < mithril::kMaxIndexedBindings; ++s) {
+                if (g_state->indexedBufferBindings[c][s].name == name) {
+                    g_state->indexedBufferBindings[c][s].bind(0);
+                }
+            }
+        }
+        // ELEMENT_ARRAY_BUFFER lives in the current VAO — clear it if matched.
+        if (mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO)) {
+            if (vao->elementArrayBuffer == name) vao->elementArrayBuffer = 0;
+        }
+        // P2-7: cached GL_ARRAY_BUFFER-attrib-bind-time references live in every VAO.
+        for (auto& kv : g_state->vaos) {
+            for (int a = 0; a < mithril::kMaxVertexAttribs; ++a) {
+                if (kv.second.attribs[a].boundBuffer == name) {
+                    kv.second.attribs[a].boundBuffer = 0;
+                }
+            }
+        }
         backend_delete_buffer(name);
         g_state->buffers.erase(name);
+        g_state->bufferNames.release(name);
     }
 }
 
 static mithril::Buffer* bound_buffer_for_target(GLenum target) {
-    GLuint* slot = nullptr;
-    switch (target) {
-        case GL_ARRAY_BUFFER:         slot = &g_state->currentArrayBuffer; break;
-        case GL_ELEMENT_ARRAY_BUFFER: {
-            mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
-            if (!vao) return nullptr;
-            return mithril::state_get_buffer(vao->elementArrayBuffer);
-        }
-        case GL_UNIFORM_BUFFER:         slot = &g_state->currentUniformBuffer; break;
-        case GL_PIXEL_PACK_BUFFER:
-        case GL_PIXEL_UNPACK_BUFFER:
-        case GL_COPY_READ_BUFFER:
-        case GL_COPY_WRITE_BUFFER:
-        case GL_TRANSFORM_FEEDBACK_BUFFER:
-        case GL_SHADER_STORAGE_BUFFER:
-        case GL_ATOMIC_COUNTER_BUFFER:
-        case GL_DRAW_INDIRECT_BUFFER:
-            slot = &g_state->currentArrayBuffer; break;
-        default:
-            mithril::state_set_error(GL_INVALID_ENUM);
-            return nullptr;
+    // ELEMENT_ARRAY_BUFFER lives only in the current VAO (no global slot).
+    if (target == GL_ELEMENT_ARRAY_BUFFER) {
+        mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+        if (!vao) return nullptr;
+        return mithril::state_get_buffer(vao->elementArrayBuffer);
     }
-    if (!slot) return nullptr;
-    mithril::Buffer* b = mithril::state_get_buffer(*slot);
-    if (!b && *slot != 0) {
+    mithril::BufferTarget t = mithril::bufferTargetFromGL(target);
+    if (t == mithril::BufferTarget::Count) {
+        mithril::state_set_error(GL_INVALID_ENUM);
+        return nullptr;
+    }
+    GLuint name = g_state->bufferBindings[(int)t].name;
+    mithril::Buffer* b = mithril::state_get_buffer(name);
+    if (!b && name != 0) {
         // The name was reserved by glGen* but not yet inserted into the table.
-        g_state->buffers[*slot] = mithril::Buffer{};
-        b = mithril::state_get_buffer(*slot);
-        b->id = *slot;
+        g_state->buffers[name] = mithril::Buffer{};
+        b = mithril::state_get_buffer(name);
+        b->id = name;
     }
     return b;
 }
@@ -75,19 +98,17 @@ void glBindBuffer(GLenum target, GLuint buffer) {
         g_state->buffers[buffer] = mithril::Buffer{};
         g_state->buffers[buffer].id = buffer;
     }
-    switch (target) {
-        case GL_ARRAY_BUFFER:         g_state->currentArrayBuffer = buffer; break;
-        case GL_UNIFORM_BUFFER:       g_state->currentUniformBuffer = buffer; break;
-        case GL_ELEMENT_ARRAY_BUFFER: {
-            mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
-            if (vao) vao->elementArrayBuffer = buffer;
-            g_state->currentIndexBuffer = buffer;
-            break;
+    if (target == GL_ELEMENT_ARRAY_BUFFER) {
+        // ELEMENT_ARRAY_BUFFER is stored on the current VAO, never globally.
+        mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+        if (vao) vao->elementArrayBuffer = buffer;
+    } else {
+        mithril::BufferTarget t = mithril::bufferTargetFromGL(target);
+        if (t == mithril::BufferTarget::Count) {
+            mithril::state_set_error(GL_INVALID_ENUM);
+            return;
         }
-        default:
-            // Other targets bind to the array slot for simplicity.
-            g_state->currentArrayBuffer = buffer;
-            break;
+        g_state->bufferBindings[(int)t].bind(buffer);
     }
     if (mithril::Buffer* b = mithril::state_get_buffer(buffer)) {
         b->lastTarget = target;
@@ -191,10 +212,13 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
     mithril::Buffer* b = bound_buffer_for_target(target);
     if (!b) { *params = 0; return; }
     switch (pname) {
-        case GL_BUFFER_SIZE:  *params = (GLint)b->size;  break;
-        case GL_BUFFER_USAGE: *params = (GLint)b->usage; break;
-        case GL_BUFFER_ACCESS:*params = (GLint)b->mapAccess; break;
-        default:              *params = 0; break;
+        case GL_BUFFER_SIZE:        *params = (GLint)b->size;  break;
+        case GL_BUFFER_USAGE:       *params = (GLint)b->usage; break;
+        case GL_BUFFER_ACCESS:      *params = (GLint)b->mapAccess; break;
+        case GL_BUFFER_MAPPED:      *params = (b->mapped != nullptr) ? GL_TRUE : GL_FALSE; break;
+        case GL_BUFFER_MAP_OFFSET:  *params = (GLint)b->mapOffset; break;
+        case GL_BUFFER_MAP_LENGTH:  *params = (GLint)b->mapLength; break;
+        default:                    *params = 0; break;
     }
 }
 
@@ -209,15 +233,76 @@ void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* d
 
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
     MITHRIL_ENSURE_INIT();
-    (void)index;
-    glBindBuffer(target, buffer);
+    mithril::IndexedBufferTarget cat = mithril::indexedBufferTargetFromGL(target);
+    if (cat == mithril::IndexedBufferTarget::Count) {
+        mithril::state_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (index >= mithril::kMaxIndexedBindings) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (buffer != 0 && !mithril::state_get_buffer(buffer)) {
+        g_state->buffers[buffer] = mithril::Buffer{};
+        g_state->buffers[buffer].id = buffer;
+    }
+    g_state->indexedBufferBindings[(int)cat][index].bind(buffer);
+    if ((int)index + 1 > g_state->touchedIndexed[(int)cat]) {
+        g_state->touchedIndexed[(int)cat] = (int)index + 1;
+    }
+    // Per GL spec, glBindBufferBase also binds to the generic (non-indexed) target.
+    mithril::BufferTarget bt = mithril::bufferTargetFromGL(target);
+    if (bt != mithril::BufferTarget::Count) {
+        g_state->bufferBindings[(int)bt].bind(buffer);
+    }
+    if (mithril::Buffer* b = mithril::state_get_buffer(buffer)) {
+        b->lastTarget = target;
+    }
 }
 
 void glBindBufferRange(GLenum target, GLuint index, GLuint buffer,
                        GLintptr offset, GLsizeiptr size) {
     MITHRIL_ENSURE_INIT();
-    (void)index; (void)offset; (void)size;
-    glBindBuffer(target, buffer);
+    mithril::IndexedBufferTarget cat = mithril::indexedBufferTargetFromGL(target);
+    if (cat == mithril::IndexedBufferTarget::Count) {
+        mithril::state_set_error(GL_INVALID_ENUM);
+        return;
+    }
+    if (index >= mithril::kMaxIndexedBindings) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (size <= 0) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    // GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT is implementation-defined; approximate
+    // with 256 (a common desktop value). Enforced only for uniform buffers.
+    if (target == GL_UNIFORM_BUFFER && (offset % 256) != 0) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    if (buffer != 0 && !mithril::state_get_buffer(buffer)) {
+        g_state->buffers[buffer] = mithril::Buffer{};
+        g_state->buffers[buffer].id = buffer;
+    }
+    g_state->indexedBufferBindings[(int)cat][index].bindRange(buffer, offset, size);
+    if ((int)index + 1 > g_state->touchedIndexed[(int)cat]) {
+        g_state->touchedIndexed[(int)cat] = (int)index + 1;
+    }
+    // Per GL spec, glBindBufferRange also binds to the generic (non-indexed) target.
+    mithril::BufferTarget bt = mithril::bufferTargetFromGL(target);
+    if (bt != mithril::BufferTarget::Count) {
+        g_state->bufferBindings[(int)bt].bind(buffer);
+    }
+    if (mithril::Buffer* b = mithril::state_get_buffer(buffer)) {
+        b->lastTarget = target;
+    }
+}
+
+GLboolean glIsBuffer(GLuint buffer) {
+    if (!g_state) return GL_FALSE;
+    return g_state->bufferNames.valid(buffer) ? GL_TRUE : GL_FALSE;
 }
 
 } // extern "C"

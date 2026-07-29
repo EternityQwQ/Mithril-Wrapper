@@ -7,6 +7,39 @@
 // path (Drawing.cpp) reads these attribs to build the VkPipelineVertexInputState.
 #include "includes.h"
 
+/* GL vertex-attrib query constants not always present in the minimal
+ * glcorearb.h we ship. Standard GL 3.3 Core values. */
+#ifndef GL_VERTEX_ATTRIB_ARRAY_ENABLED
+#define GL_VERTEX_ATTRIB_ARRAY_ENABLED         0x8622
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_SIZE
+#define GL_VERTEX_ATTRIB_ARRAY_SIZE            0x8623
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_STRIDE
+#define GL_VERTEX_ATTRIB_ARRAY_STRIDE          0x8624
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_TYPE
+#define GL_VERTEX_ATTRIB_ARRAY_TYPE            0x8625
+#endif
+#ifndef GL_CURRENT_VERTEX_ATTRIB
+#define GL_CURRENT_VERTEX_ATTRIB               0x8626
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_POINTER
+#define GL_VERTEX_ATTRIB_ARRAY_POINTER         0x8645
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_NORMALIZED
+#define GL_VERTEX_ATTRIB_ARRAY_NORMALIZED      0x886A
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING
+#define GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING  0x889F
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_INTEGER
+#define GL_VERTEX_ATTRIB_ARRAY_INTEGER         0x88FD
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_DIVISOR
+#define GL_VERTEX_ATTRIB_ARRAY_DIVISOR         0x88FE
+#endif
+
 extern "C" {
 
 void glGenVertexArrays(GLsizei n, GLuint* arrays) {
@@ -27,6 +60,7 @@ void glDeleteVertexArrays(GLsizei n, const GLuint* arrays) {
         if (name == 0) continue;
         if (g_state->currentVAO == name) g_state->currentVAO = 0;
         g_state->vaos.erase(name);
+        g_state->vaoNames.release(name);
     }
 }
 
@@ -37,11 +71,6 @@ void glBindVertexArray(GLuint array) {
         g_state->vaos[array].id = array;
     }
     g_state->currentVAO = array;
-    mithril::VertexArray* vao = mithril::state_get_vao(array);
-    if (vao) {
-        // The element array binding follows the VAO.
-        g_state->currentIndexBuffer = vao->elementArrayBuffer;
-    }
 }
 
 void glEnableVertexAttribArray(GLuint index) {
@@ -79,8 +108,7 @@ void glVertexAttribPointer(GLuint index, GLint size, GLenum type,
     a.integer      = false;
     a.stride       = stride;
     a.pointer      = pointer;
-    a.boundBuffer  = g_state->currentArrayBuffer;
-    a.divisor      = a.divisor; // preserve
+    a.boundBuffer  = g_state->bufferBindings[(int)mithril::BufferTarget::Array].name;
 }
 
 void glVertexAttribIPointer(GLuint index, GLint size, GLenum type,
@@ -96,7 +124,7 @@ void glVertexAttribIPointer(GLuint index, GLint size, GLenum type,
     a.integer      = true;
     a.stride       = stride;
     a.pointer      = pointer;
-    a.boundBuffer  = g_state->currentArrayBuffer;
+    a.boundBuffer  = g_state->bufferBindings[(int)mithril::BufferTarget::Array].name;
 }
 
 void glVertexAttribDivisor(GLuint index, GLuint divisor) {
@@ -146,6 +174,80 @@ GLint glGetAttribLocation(GLuint program, const GLchar* name) {
     auto it = p->attribs.find(name ? name : "");
     if (it == p->attribs.end()) return -1;
     return it->second.location;
+}
+
+GLboolean glIsVertexArray(GLuint array) {
+    if (!g_state) return GL_FALSE;
+    return g_state->vaoNames.valid(array) ? GL_TRUE : GL_FALSE;
+}
+
+void glGetVertexAttribiv(GLuint index, GLenum pname, GLint* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    if (index >= mithril::kMaxVertexAttribs) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (!vao) { *params = 0; return; }
+    const mithril::VertexAttrib& a = vao->attribs[index];
+    switch (pname) {
+        case GL_VERTEX_ATTRIB_ARRAY_ENABLED:        *params = a.enabled ? GL_TRUE : GL_FALSE; break;
+        case GL_VERTEX_ATTRIB_ARRAY_SIZE:           *params = a.size; break;
+        case GL_VERTEX_ATTRIB_ARRAY_TYPE:           *params = (GLint)a.type; break;
+        case GL_VERTEX_ATTRIB_ARRAY_NORMALIZED:     *params = a.normalized ? GL_TRUE : GL_FALSE; break;
+        case GL_VERTEX_ATTRIB_ARRAY_STRIDE:         *params = a.stride; break;
+        case GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: *params = (GLint)a.boundBuffer; break;
+        case GL_VERTEX_ATTRIB_ARRAY_DIVISOR:        *params = (GLint)a.divisor; break;
+        case GL_VERTEX_ATTRIB_ARRAY_INTEGER:        *params = a.integer ? GL_TRUE : GL_FALSE; break;
+        default:                                    *params = 0; break;
+    }
+}
+
+void glGetVertexAttribfv(GLuint index, GLenum pname, GLfloat* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    GLint iv = 0;
+    glGetVertexAttribiv(index, pname, &iv);
+    *params = (GLfloat)iv;
+}
+
+void glGetVertexAttribdv(GLuint index, GLenum pname, GLdouble* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    GLint iv = 0;
+    glGetVertexAttribiv(index, pname, &iv);
+    *params = (GLdouble)iv;
+}
+
+void glGetVertexAttribIiv(GLuint index, GLenum pname, GLint* params) {
+    MITHRIL_ENSURE_INIT();
+    glGetVertexAttribiv(index, pname, params);
+}
+
+void glGetVertexAttribIuiv(GLuint index, GLenum pname, GLuint* params) {
+    MITHRIL_ENSURE_INIT();
+    if (!params) return;
+    GLint iv = 0;
+    glGetVertexAttribiv(index, pname, &iv);
+    *params = (GLuint)iv;
+}
+
+void glGetVertexAttribPointerv(GLuint index, GLenum pname, void** pointer) {
+    MITHRIL_ENSURE_INIT();
+    if (!pointer) return;
+    if (index >= mithril::kMaxVertexAttribs) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        *pointer = nullptr;
+        return;
+    }
+    if (pname != GL_VERTEX_ATTRIB_ARRAY_POINTER) {
+        *pointer = nullptr;
+        return;
+    }
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (!vao) { *pointer = nullptr; return; }
+    *pointer = const_cast<void*>(vao->attribs[index].pointer);
 }
 
 } // extern "C"

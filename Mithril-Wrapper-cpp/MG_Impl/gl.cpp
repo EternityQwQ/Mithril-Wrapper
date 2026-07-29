@@ -59,57 +59,57 @@ void glClear(GLbitfield mask) {
     backend_commit();
 }
 
-/* ---- Enable / Disable ---- */
+/* ---- Enable / Disable ----
+ * P0-6: capabilities are now managed solely by GLState::setCapability /
+ * isCapabilityEnabled (bool fields). The old enabledCaps set is gone, so
+ * there is a single source of truth — no possibility of the set and the
+ * fields drifting out of sync.
+ */
 void glEnable(GLenum cap) {
     MITHRIL_ENSURE_INIT();
-    g_state->enabledCaps.insert(cap);
-    switch (cap) {
-        case GL_DEPTH_TEST:    g_state->depthTest = true; break;
-        case GL_BLEND:         g_state->blend = true; break;
-        case GL_STENCIL_TEST:  g_state->stencilTest = true; break;
-        case GL_CULL_FACE:     g_state->cullFace = true; break;
-        case GL_SCISSOR_TEST:  g_state->scissorTest = true; break;
-        case GL_DITHER:        g_state->dither = true; break;
-        case GL_MULTISAMPLE:   g_state->multisample = true; break;
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: g_state->sampleAlphaToCoverage = true; break;
-        case GL_SAMPLE_COVERAGE:          g_state->sampleCoverage = true; break;
-        case GL_POLYGON_OFFSET_FILL:      g_state->polygonOffsetFill = true; break;
-        case GL_PROGRAM_POINT_SIZE:       g_state->programPointSize = true; break;
-        case GL_PRIMITIVE_RESTART:        g_state->primitiveRestart = true; break;
-        case GL_FRAMEBUFFER_SRGB:         g_state->framebufferSRGB = true; break;
-        default: break;
-    }
+    g_state->setCapability(cap, true);
 }
 
 void glDisable(GLenum cap) {
     MITHRIL_ENSURE_INIT();
-    g_state->enabledCaps.erase(cap);
-    switch (cap) {
-        case GL_DEPTH_TEST:    g_state->depthTest = false; break;
-        case GL_BLEND:         g_state->blend = false; break;
-        case GL_STENCIL_TEST:  g_state->stencilTest = false; break;
-        case GL_CULL_FACE:     g_state->cullFace = false; break;
-        case GL_SCISSOR_TEST:  g_state->scissorTest = false; break;
-        case GL_DITHER:        g_state->dither = false; break;
-        case GL_MULTISAMPLE:   g_state->multisample = false; break;
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: g_state->sampleAlphaToCoverage = false; break;
-        case GL_SAMPLE_COVERAGE:          g_state->sampleCoverage = false; break;
-        case GL_POLYGON_OFFSET_FILL:      g_state->polygonOffsetFill = false; break;
-        case GL_PROGRAM_POINT_SIZE:       g_state->programPointSize = false; break;
-        case GL_PRIMITIVE_RESTART:        g_state->primitiveRestart = false; break;
-        case GL_FRAMEBUFFER_SRGB:         g_state->framebufferSRGB = false; break;
-        default: break;
-    }
+    g_state->setCapability(cap, false);
 }
 
 GLboolean glIsEnabled(GLenum cap) {
-    MITHRIL_ENSURE_INIT();
-    return g_state->enabledCaps.count(cap) ? GL_TRUE : GL_FALSE;
+    if (!g_state) return GL_FALSE;
+    return g_state->isCapabilityEnabled(cap) ? GL_TRUE : GL_FALSE;
 }
 
-void glEnablei(GLenum cap, GLuint index) { (void)index; glEnable(cap); }
-void glDisablei(GLenum cap, GLuint index) { (void)index; glDisable(cap); }
-GLboolean glIsEnabledi(GLenum cap, GLuint index) { (void)index; return glIsEnabled(cap); }
+/* Indexed enable/disable: GL_BLEND is the only capability that is per-draw-
+ * buffer. For all other caps the index is ignored (GL_INVALID_OPERATION is
+ * not required by the spec for caps that are not per-buffer). */
+void glEnablei(GLenum cap, GLuint index) {
+    MITHRIL_ENSURE_INIT();
+    if (cap == GL_BLEND && index < mithril::kMaxColorAttachments) {
+        g_state->blends[index].enabled = true;
+        g_state->bumpRenderVersion();
+        return;
+    }
+    g_state->setCapability(cap, true);
+}
+
+void glDisablei(GLenum cap, GLuint index) {
+    MITHRIL_ENSURE_INIT();
+    if (cap == GL_BLEND && index < mithril::kMaxColorAttachments) {
+        g_state->blends[index].enabled = false;
+        g_state->bumpRenderVersion();
+        return;
+    }
+    g_state->setCapability(cap, false);
+}
+
+GLboolean glIsEnabledi(GLenum cap, GLuint index) {
+    if (!g_state) return GL_FALSE;
+    if (cap == GL_BLEND && index < mithril::kMaxColorAttachments) {
+        return g_state->blends[index].enabled ? GL_TRUE : GL_FALSE;
+    }
+    return g_state->isCapabilityEnabled(cap) ? GL_TRUE : GL_FALSE;
+}
 
 /* ---- Viewport / scissor / depth range ---- */
 void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
@@ -136,28 +136,43 @@ void glScissor(GLint x, GLint y, GLsizei w, GLsizei h) {
     g_state->scissorH = h;
 }
 
-/* ---- Blend ---- */
+/* ---- Blend (per-draw-buffer) ----
+ * The non-indexed variants set the blend state for ALL draw buffers (GL spec).
+ * The *i variants set the state for a single draw buffer `buf`.
+ */
 void glBlendFunc(GLenum sf, GLenum df) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendSrcRGB = g_state->blendSrcA = sf;
-    g_state->blendDstRGB = g_state->blendDstA = df;
+    for (int i = 0; i < mithril::kMaxColorAttachments; ++i) {
+        g_state->blends[i].srcRGB = sf; g_state->blends[i].srcA = sf;
+        g_state->blends[i].dstRGB = df; g_state->blends[i].dstA = df;
+    }
+    g_state->bumpRenderVersion();
 }
 
 void glBlendFuncSeparate(GLenum sRGB, GLenum dRGB, GLenum sA, GLenum dA) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendSrcRGB = sRGB; g_state->blendDstRGB = dRGB;
-    g_state->blendSrcA   = sA;   g_state->blendDstA   = dA;
+    for (int i = 0; i < mithril::kMaxColorAttachments; ++i) {
+        g_state->blends[i].srcRGB = sRGB; g_state->blends[i].dstRGB = dRGB;
+        g_state->blends[i].srcA   = sA;   g_state->blends[i].dstA   = dA;
+    }
+    g_state->bumpRenderVersion();
 }
 
 void glBlendEquation(GLenum mode) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendEqRGB = g_state->blendEqA = mode;
+    for (int i = 0; i < mithril::kMaxColorAttachments; ++i) {
+        g_state->blends[i].eqRGB = mode; g_state->blends[i].eqA = mode;
+    }
+    g_state->bumpRenderVersion();
 }
 
 void glBlendEquationSeparate(GLenum mRGB, GLenum mA) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendEqRGB = mRGB;
-    g_state->blendEqA   = mA;
+    for (int i = 0; i < mithril::kMaxColorAttachments; ++i) {
+        g_state->blends[i].eqRGB = mRGB;
+        g_state->blends[i].eqA   = mA;
+    }
+    g_state->bumpRenderVersion();
 }
 
 void glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
@@ -168,11 +183,32 @@ void glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
     g_state->blendColor[3] = a;
 }
 
-void glBlendFunci(GLuint buf, GLenum src, GLenum dst) { (void)buf; glBlendFunc(src, dst); }
-void glBlendFuncSeparatei(GLuint buf, GLenum sR, GLenum dR, GLenum sA, GLenum dA) {
-    (void)buf; glBlendFuncSeparate(sR, dR, sA, dA);
+void glBlendFunci(GLuint buf, GLenum src, GLenum dst) {
+    MITHRIL_ENSURE_INIT();
+    if (buf >= mithril::kMaxColorAttachments) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    g_state->blends[buf].srcRGB = src; g_state->blends[buf].srcA = src;
+    g_state->blends[buf].dstRGB = dst; g_state->blends[buf].dstA = dst;
+    g_state->bumpRenderVersion();
 }
-void glBlendEquationi(GLuint buf, GLenum mode) { (void)buf; glBlendEquation(mode); }
+void glBlendFuncSeparatei(GLuint buf, GLenum sR, GLenum dR, GLenum sA, GLenum dA) {
+    MITHRIL_ENSURE_INIT();
+    if (buf >= mithril::kMaxColorAttachments) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    g_state->blends[buf].srcRGB = sR; g_state->blends[buf].dstRGB = dR;
+    g_state->blends[buf].srcA   = sA; g_state->blends[buf].dstA   = dA;
+    g_state->bumpRenderVersion();
+}
+void glBlendEquationi(GLuint buf, GLenum mode) {
+    MITHRIL_ENSURE_INIT();
+    if (buf >= mithril::kMaxColorAttachments) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    g_state->blends[buf].eqRGB = mode; g_state->blends[buf].eqA = mode;
+    g_state->bumpRenderVersion();
+}
+void glBlendEquationSeparatei(GLuint buf, GLenum mRGB, GLenum mA) {
+    MITHRIL_ENSURE_INIT();
+    if (buf >= mithril::kMaxColorAttachments) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    g_state->blends[buf].eqRGB = mRGB; g_state->blends[buf].eqA = mA;
+    g_state->bumpRenderVersion();
+}
 
 /* ---- Depth / stencil / color mask ---- */
 void glDepthFunc(GLenum func) {
@@ -187,10 +223,24 @@ void glDepthMask(GLboolean flag) {
 
 void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
     MITHRIL_ENSURE_INIT();
-    g_state->colorMask[0] = (r != 0);
-    g_state->colorMask[1] = (g != 0);
-    g_state->colorMask[2] = (b != 0);
-    g_state->colorMask[3] = (a != 0);
+    // GL spec: glColorMask sets the mask for ALL draw buffers.
+    for (int i = 0; i < mithril::kMaxColorAttachments; ++i) {
+        g_state->colorMask[i][0] = (r != 0);
+        g_state->colorMask[i][1] = (g != 0);
+        g_state->colorMask[i][2] = (b != 0);
+        g_state->colorMask[i][3] = (a != 0);
+    }
+    g_state->bumpRenderVersion();
+}
+
+void glColorMaski(GLuint buf, GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+    MITHRIL_ENSURE_INIT();
+    if (buf >= mithril::kMaxColorAttachments) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    g_state->colorMask[buf][0] = (r != 0);
+    g_state->colorMask[buf][1] = (g != 0);
+    g_state->colorMask[buf][2] = (b != 0);
+    g_state->colorMask[buf][3] = (a != 0);
+    g_state->bumpRenderVersion();
 }
 
 void glStencilMask(GLuint mask) {
@@ -281,29 +331,44 @@ void glLineWidth(GLfloat w) { MITHRIL_ENSURE_INIT(); g_state->lineWidth = w; }
 void glPointSize(GLfloat s) { MITHRIL_ENSURE_INIT(); g_state->pointSize = s; }
 void glHint(GLenum, GLenum) { MITHRIL_ENSURE_INIT(); /* hints are advisory */ }
 
-/* ---- Pixel store ---- */
+/* ---- Pixel store ----
+ * Pnames map onto the PixelStoreState sub-struct (pack + unpack state was
+ * moved off the flat GLState fields in the rewrite).
+ */
 void glPixelStorei(GLenum pname, GLint param) {
     MITHRIL_ENSURE_INIT();
     switch (pname) {
-        case GL_UNPACK_ALIGNMENT:      g_state->unpackAlignment = param; break;
-        case GL_PACK_ALIGNMENT:        g_state->packAlignment   = param; break;
-        case GL_UNPACK_ROW_LENGTH:     g_state->unpackRowLength = param; break;
-        case GL_UNPACK_IMAGE_HEIGHT:   g_state->unpackImageHeight = param; break;
-        case GL_UNPACK_SKIP_ROWS:      g_state->unpackSkipRows = param; break;
-        case GL_UNPACK_SKIP_PIXELS:    g_state->unpackSkipPixels = param; break;
-        case GL_UNPACK_SKIP_IMAGES:    g_state->unpackSkipImages = param; break;
+        case GL_UNPACK_ALIGNMENT:      g_state->pixelStore.unpackAlignment     = param; break;
+        case GL_PACK_ALIGNMENT:        g_state->pixelStore.packAlignment       = param; break;
+        case GL_UNPACK_ROW_LENGTH:     g_state->pixelStore.unpackRowLength     = param; break;
+        case GL_UNPACK_IMAGE_HEIGHT:   g_state->pixelStore.unpackImageHeight   = param; break;
+        case GL_UNPACK_SKIP_ROWS:      g_state->pixelStore.unpackSkipRows      = param; break;
+        case GL_UNPACK_SKIP_PIXELS:    g_state->pixelStore.unpackSkipPixels    = param; break;
+        case GL_UNPACK_SKIP_IMAGES:    g_state->pixelStore.unpackSkipImages    = param; break;
+        case GL_PACK_ROW_LENGTH:       g_state->pixelStore.packRowLength        = param; break;
+        case GL_PACK_IMAGE_HEIGHT:     g_state->pixelStore.packImageHeight     = param; break;
+        case GL_PACK_SKIP_ROWS:        g_state->pixelStore.packSkipRows        = param; break;
+        case GL_PACK_SKIP_PIXELS:      g_state->pixelStore.packSkipPixels      = param; break;
+        case GL_PACK_SKIP_IMAGES:      g_state->pixelStore.packSkipImages      = param; break;
         default: break;
     }
 }
 
 void glPixelStoref(GLenum pname, GLfloat param) { glPixelStorei(pname, (GLint)param); }
 
-/* ---- Active texture ---- */
+/* ---- Active texture ----
+ * P1-13: validate the texture unit index. glActiveTexture accepts
+ * GL_TEXTURE0..GL_TEXTUREi where i < GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS.
+ * Out-of-range units must record GL_INVALID_ENUM (per the GL spec) instead of
+ * being silently ignored.
+ */
 void glActiveTexture(GLenum texture) {
     MITHRIL_ENSURE_INIT();
-    if (texture >= GL_TEXTURE0 && texture < GL_TEXTURE0 + mithril::kMaxTextureUnits) {
-        g_state->activeTextureUnit = texture - GL_TEXTURE0;
+    if (texture < GL_TEXTURE0 || texture >= GL_TEXTURE0 + mithril::kMaxTextureUnits) {
+        mithril::state_set_error(GL_INVALID_ENUM);
+        return;
     }
+    g_state->activeTextureUnit = texture - GL_TEXTURE0;
 }
 
 /* ---- Flush / finish ---- */
