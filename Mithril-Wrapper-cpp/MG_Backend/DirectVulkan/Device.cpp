@@ -746,23 +746,6 @@ bool init_device() {
     cacheCI.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
     vkCreatePipelineCache(b->device, &cacheCI, nullptr, &b->pipelineCache);
 
-    // ---- Dummy vertex buffer ----
-    // 16-byte zero buffer for vertex attributes the shader declares but GL
-    // has not enabled (see Pipeline.cpp's get_or_create_pipeline). Provides
-    // valid backing for dummy attribute descriptions so SPIRV-Cross emits
-    // [[attribute(N)]] for every stage_in field, avoiding the Metal
-    // "invalid type ... stage_in" compile error.
-    {
-        static const uint8_t zeros[16] = {0};
-        BufferEntry tmp{};
-        if (create_buffer(tmp, 16, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, zeros)) {
-            b->dummyVertexBuffer = tmp.buffer;
-            b->dummyVertexMemory = tmp.memory;
-        } else {
-            MITHRIL_LOG_WARN("vk", "failed to allocate dummy vertex buffer");
-        }
-    }
-
     // ---- Per-frame transient staging arena (MobileGL pattern) ----
     // 每个 frame slot 一个大的 host-visible VkBuffer，用于纹理上传的 staging。
     // 在 ensure_command_buffer_recording 的 fence wait 后 rewind offset 到 0。
@@ -859,8 +842,6 @@ void shutdown_device() {
         b->commandBuffer = VK_NULL_HANDLE;
     }
     if (b->commandPool) { vkDestroyCommandPool(b->device, b->commandPool, nullptr); b->commandPool = VK_NULL_HANDLE; }
-    if (b->dummyVertexBuffer) { vkDestroyBuffer(b->device, b->dummyVertexBuffer, nullptr); b->dummyVertexBuffer = VK_NULL_HANDLE; }
-    if (b->dummyVertexMemory) { vkFreeMemory(b->device, b->dummyVertexMemory, nullptr); b->dummyVertexMemory = VK_NULL_HANDLE; }
     // Destroy per-frame transient staging arena
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
         if (b->frameStagingMapped[i]) { vkUnmapMemory(b->device, b->frameStagingMemory[i]); b->frameStagingMapped[i] = nullptr; }

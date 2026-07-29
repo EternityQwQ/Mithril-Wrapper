@@ -299,7 +299,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
     // location has no matching attribute description, Metal compilation fails.
     // For each shader location GL has NOT enabled, append a dummy binding +
     // attribute (stride 0, format R32G32B32A32_SFLOAT, offset 0) backed by
-    // b->dummyVertexBuffer at draw time.
+    // backend_get_zero_buffer() at draw time (see Drawing.cpp).
     std::vector<uint32_t> shaderLocations =
         reflect_vertex_input_locations(vertex_spirv, vertex_word_count);
     for (uint32_t loc : shaderLocations) {

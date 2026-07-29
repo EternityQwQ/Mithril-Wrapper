@@ -9,7 +9,9 @@
 // spirv_cross.hpp transitively pulls in SPIRV-Cross's bundled spirv.hpp,
 // which defines the spv:: namespace (spv::DecorationBinding, etc.) used below.
 
+#include <algorithm>
 #include <cstdio>
+#include <utility>
 
 namespace mithril {
 namespace vk {

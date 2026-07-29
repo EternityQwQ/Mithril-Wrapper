@@ -349,28 +349,28 @@ void bind_program_descriptors(GLuint program) {
         dsai.pSetLayouts = &pr.descriptorSetLayout;
         if (vkAllocateDescriptorSets(b->device, &dsai, &set) != VK_SUCCESS) {
             // Pool exhausted mid-frame (>1024 distinct sets this frame for this
-            // program). FIX: 重置描述符池并重试，而不是跳过 draw。
-            // 原实现跳过 draw 会导致渲染残缺，且每帧都会刷屏日志。
-            // 重置池会失效已分配的 set，但由于我们在帧开头已经 rewind 了 cursor，
-            // 当前帧的 set 都是在本次 rewind 后分配的，重置后重新分配是安全的
-            // （前提：当前帧已绑定的 set 不再被后续 draw 使用，因为 pipeline
-            // bind 会覆盖之前的 descriptor bind）。
+            // program). 跳过本次 draw 的 descriptor bind，不重置池。
+            //
+            // 关键：不能 vkResetDescriptorPool 重试。本帧命令缓冲区内此前已通过
+            // vkCmdBindDescriptorSets 绑定的 set 仍引用该池分配的存储；重置池会
+            // 失效这些 set（UAF），提交时 MoltenVK 编码过期引用 →
+            // kIOGPUCommandBufferCallbackErrorInvalidResource (code 9) 级联，
+            // 正是用户报告的 VK_ERROR_OUT_OF_DEVICE_MEMORY/Invalid Resource →
+            // VK_TIMEOUT → 着色器编译失败 → exit(0) 崩溃链的起点。
+            // "pipeline bind 会覆盖之前的 descriptor bind" 的旧辩护错误：已记录进
+            // 命令缓冲区的 vkCmdBindDescriptorSets 不会被后续 bind 覆盖，每条都
+            // 独立编码。1024 set/槽容量充裕（MC 1.21.1 单帧单 program 远低于此），
+            // 耗尽属异常；跳过绑定留下过期绑定远优于 UAF 崩溃。
             static int poolExhaustedLogCount = 0;
             poolExhaustedLogCount++;
             if (poolExhaustedLogCount <= 3 || poolExhaustedLogCount % 100 == 0) {
                 MITHRIL_LOG_WARN("vk", "vkAllocateDescriptorSets failed (program %u, slot %d, "
-                                  "gen %llu) — descriptor pool exhausted; resetting pool "
-                                  "(log %d)",
+                                  "gen %llu) — descriptor pool exhausted; skipping descriptor "
+                                  "bind for this draw (log %d)",
                                   program, slot, (unsigned long long)b->frameGeneration,
                                   poolExhaustedLogCount);
             }
-            vkResetDescriptorPool(b->device, pr.descriptorPools[slot], 0);
-            pr.allocatedSets[slot].clear();
-            pr.setCursor[slot] = 0;
-            // 重试分配
-            if (vkAllocateDescriptorSets(b->device, &dsai, &set) != VK_SUCCESS) {
-                return;  // 重试仍失败，放弃本次 bind
-            }
+            return;
         }
         pr.allocatedSets[slot].push_back(set);
         pr.setCursor[slot]++;

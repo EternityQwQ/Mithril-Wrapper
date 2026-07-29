@@ -22,6 +22,7 @@
 #include "../../MG_State/State.h"
 #include "../../MG_Impl/Log.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 

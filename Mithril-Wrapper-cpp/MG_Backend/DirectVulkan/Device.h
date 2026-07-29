@@ -115,13 +115,6 @@ struct Backend {
     // value seen by every draw within a single frame is constant.
     uint64_t frameGeneration = 0;
 
-    // 默认 16 字节 zero buffer，用于着色器声明但 GL 未 enable 的 vertex attribute
-    // binding。Pipeline.cpp 的 get_or_create_pipeline 为这些 location 提供 dummy
-    // attribute description 指向此 buffer，让 SPIRV-Cross 为每个 stage_in 字段生成
-    // [[attribute(N)]] 限定符，避免 Metal 编译报错。
-    VkBuffer         dummyVertexBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory   dummyVertexMemory = VK_NULL_HANDLE;
-
     // GPU 故障状态。只有 VK_ERROR_DEVICE_LOST 才设置 deviceLost；
     // OOM 和其他错误不再设置 deviceLost（改为触发 OOM GC 后跳过当前帧）。
     // deviceLost 为真时 commit_frame / present / acquire / eglSwapBuffers 全部
