@@ -1,0 +1,4 @@
+build-linux/
+*.o
+*.so
+*.a
