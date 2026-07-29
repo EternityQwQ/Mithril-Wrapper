@@ -7,22 +7,27 @@
 // framebuffer (FBO 0) and backend_get_texture_view() for user FBO color/depth
 // attachments — so the drawing path can build the dynamic-rendering attachment
 // list.
+//
+// Migrated to the modular GLContext API: framebuffer state lives in
+// mithril::glstate::FramebufferState (owned by g_state), per-name records are
+// mithril::glstate::FramebufferObject (SharedPtr-owned), and texture lookups
+// during attachment resolution go through mithril::glstate::TextureState. The
+// Vulkan backend C API (backend_get_texture_view / backend_get_texture_image /
+// backend_blit_images) is unchanged.
 #include "includes.h"
 #include "Framebuffer.h"
+
+#include <vector>
 
 extern "C" {
 
 void glGenFramebuffers(GLsizei n, GLuint* framebuffers) {
     MITHRIL_ENSURE_INIT();
     if (n <= 0 || !framebuffers) return;
+    std::vector<uint32_t> names;
+    g_state->GetFramebufferState().GenFramebufferNames(static_cast<uint32_t>(n), names);
     for (GLsizei i = 0; i < n; ++i) {
-        GLuint name = g_state->nextName++;
-        g_state->framebuffers[name] = mithril::Framebuffer{};
-        g_state->framebuffers[name].id = name;
-        g_state->framebuffers[name].drawBuffers[0] = GL_COLOR_ATTACHMENT0;
-        g_state->framebuffers[name].drawBufferCount = 1;
-        g_state->framebuffers[name].readBuffer = GL_COLOR_ATTACHMENT0;
-        framebuffers[i] = name;
+        framebuffers[i] = names[static_cast<size_t>(i)];
     }
 }
 
@@ -32,37 +37,46 @@ void glDeleteFramebuffers(GLsizei n, const GLuint* framebuffers) {
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = framebuffers[i];
         if (name == 0) continue;
-        if (g_state->currentDrawFBO == name) g_state->currentDrawFBO = 0;
-        if (g_state->currentReadFBO == name) g_state->currentReadFBO = 0;
-        g_state->framebuffers.erase(name);
+        // GL name-layer deletion: detaches the name from the object table and
+        // falls back the current draw/read binding to the default framebuffer
+        // (0) if it was holding this name. The underlying Vulkan resources are
+        // released by the backend disposal queue once in-flight GPU work
+        // referencing them completes.
+        g_state->GetFramebufferState().MarkFramebufferForDeletion(name);
     }
 }
 
 void glBindFramebuffer(GLenum target, GLuint framebuffer) {
     MITHRIL_ENSURE_INIT();
-    if (framebuffer != 0 && g_state->framebuffers.find(framebuffer) == g_state->framebuffers.end()) {
-        g_state->framebuffers[framebuffer] = mithril::Framebuffer{};
-        g_state->framebuffers[framebuffer].id = framebuffer;
-        g_state->framebuffers[framebuffer].drawBuffers[0] = GL_COLOR_ATTACHMENT0;
-        g_state->framebuffers[framebuffer].drawBufferCount = 1;
-        g_state->framebuffers[framebuffer].readBuffer = GL_COLOR_ATTACHMENT0;
+    // Detect first materialisation so we can apply the legacy default
+    // draw/read-buffer configuration (the former glBindFramebuffer set
+    // drawBuffers[0]=GL_COLOR_ATTACHMENT0, drawBufferCount=1,
+    // readBuffer=GL_COLOR_ATTACHMENT0 on every newly created FBO). The default
+    // framebuffer (name 0) is pre-populated with this config by
+    // FramebufferState's constructor, so only non-zero names need it.
+    bool firstMaterialisation = false;
+    if (framebuffer != 0) {
+        firstMaterialisation = !g_state->GetFramebufferState().GetFramebufferObject(framebuffer);
     }
-    if (target == GL_READ_FRAMEBUFFER || target == GL_FRAMEBUFFER) {
-        g_state->currentReadFBO = framebuffer;
-    }
-    if (target == GL_DRAW_FRAMEBUFFER || target == GL_FRAMEBUFFER) {
-        g_state->currentDrawFBO = framebuffer;
+    g_state->GetFramebufferState().BindFramebuffer(target, framebuffer);
+    if (firstMaterialisation) {
+        const auto& fbo = g_state->GetFramebufferState().GetFramebufferObject(framebuffer);
+        if (fbo) {
+            fbo->drawBuffers[0] = GL_COLOR_ATTACHMENT0;
+            fbo->drawBufferCount = 1;
+            fbo->readBuffer = GL_COLOR_ATTACHMENT0;
+        }
     }
 }
 
 void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget,
                             GLuint texture, GLint level) {
     MITHRIL_ENSURE_INIT();
-    mithril::Framebuffer* fbo = (target == GL_READ_FRAMEBUFFER)
-        ? mithril::state_get_framebuffer(g_state->currentReadFBO)
-        : mithril::state_get_framebuffer(g_state->currentDrawFBO);
+    const auto& fbo = (target == GL_READ_FRAMEBUFFER)
+        ? g_state->GetFramebufferState().GetCurrentReadFramebuffer()
+        : g_state->GetFramebufferState().GetCurrentDrawFramebuffer();
     if (!fbo) return;
-    mithril::FBOAttachment a{};
+    mithril::glstate::FBOAttachment a{};
     a.texture = texture;
     a.textarget = textarget;
     a.level = level;
@@ -80,11 +94,11 @@ void glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget,
 void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture,
                                GLint level, GLint layer) {
     MITHRIL_ENSURE_INIT();
-    mithril::Framebuffer* fbo = (target == GL_READ_FRAMEBUFFER)
-        ? mithril::state_get_framebuffer(g_state->currentReadFBO)
-        : mithril::state_get_framebuffer(g_state->currentDrawFBO);
+    const auto& fbo = (target == GL_READ_FRAMEBUFFER)
+        ? g_state->GetFramebufferState().GetCurrentReadFramebuffer()
+        : g_state->GetFramebufferState().GetCurrentDrawFramebuffer();
     if (!fbo) return;
-    mithril::FBOAttachment a{};
+    mithril::glstate::FBOAttachment a{};
     a.texture = texture;
     a.level = level;
     a.layer = layer;
@@ -100,11 +114,11 @@ void glFramebufferTextureLayer(GLenum target, GLenum attachment, GLuint texture,
 
 void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLint level) {
     MITHRIL_ENSURE_INIT();
-    mithril::Framebuffer* fbo = (target == GL_READ_FRAMEBUFFER)
-        ? mithril::state_get_framebuffer(g_state->currentReadFBO)
-        : mithril::state_get_framebuffer(g_state->currentDrawFBO);
+    const auto& fbo = (target == GL_READ_FRAMEBUFFER)
+        ? g_state->GetFramebufferState().GetCurrentReadFramebuffer()
+        : g_state->GetFramebufferState().GetCurrentDrawFramebuffer();
     if (!fbo) return;
-    mithril::FBOAttachment a{};
+    mithril::glstate::FBOAttachment a{};
     a.texture = texture;
     a.level = level;
     a.layered = true;
@@ -119,7 +133,7 @@ void glFramebufferTexture(GLenum target, GLenum attachment, GLuint texture, GLin
 
 void glDrawBuffers(GLsizei n, const GLenum* bufs) {
     MITHRIL_ENSURE_INIT();
-    mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentDrawFBO);
+    const auto& fbo = g_state->GetFramebufferState().GetCurrentDrawFramebuffer();
     if (!fbo || n <= 0 || !bufs) return;
     for (int i = 0; i < 8; ++i) fbo->drawBuffers[i] = GL_NONE;
     fbo->drawBufferCount = 0;
@@ -131,7 +145,7 @@ void glDrawBuffers(GLsizei n, const GLenum* bufs) {
 
 void glDrawBuffer(GLenum mode) {
     MITHRIL_ENSURE_INIT();
-    mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentDrawFBO);
+    const auto& fbo = g_state->GetFramebufferState().GetCurrentDrawFramebuffer();
     if (!fbo) return;
     for (int i = 0; i < 8; ++i) fbo->drawBuffers[i] = GL_NONE;
     if (mode == GL_FRONT || mode == GL_BACK || mode == GL_NONE) {
@@ -145,7 +159,7 @@ void glDrawBuffer(GLenum mode) {
 
 void glReadBuffer(GLenum mode) {
     MITHRIL_ENSURE_INIT();
-    mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentReadFBO);
+    const auto& fbo = g_state->GetFramebufferState().GetCurrentReadFramebuffer();
     if (fbo) fbo->readBuffer = mode;
 }
 
@@ -168,22 +182,24 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
     backend_end_render_pass();
     backend_commit();
 
+    auto& fbState = g_state->GetFramebufferState();
+
     // Resolve the source FBO's colour attachment. The read FBO is the source.
     //   - FBO 0 (EGL default): use the swapchain image installed on g_state.
     //   - User FBO: use the texture attached to GL_COLOR_ATTACHMENT0 (or the
     //     buffer selected by glReadBuffer, but MC Java only uses attachment 0).
     VkImage src_image = VK_NULL_HANDLE;
     VkFormat src_format = VK_FORMAT_UNDEFINED;
-    if (g_state->currentReadFBO == 0) {
-        src_image  = g_state->eglDefaultColorImage;
-        src_format = g_state->eglDefaultColorFormat;
+    if (fbState.GetCurrentReadFBO() == 0) {
+        src_image  = fbState.eglDefaultColorImage;
+        src_format = fbState.eglDefaultColorFormat;
     } else {
-        mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentReadFBO);
+        const auto& fbo = fbState.GetCurrentReadFramebuffer();
         if (fbo) {
             GLuint tex = 0;
             // glReadBuffer selects which color attachment is the read source.
             // Default is GL_COLOR_ATTACHMENT0. MC Java doesn't change this.
-            if (g_state->currentReadFBO == g_state->currentDrawFBO &&
+            if (fbState.GetCurrentReadFBO() == fbState.GetCurrentDrawFBO() &&
                 fbo->readBuffer >= GL_COLOR_ATTACHMENT0 && fbo->readBuffer <= GL_COLOR_ATTACHMENT7) {
                 tex = fbo->colors[fbo->readBuffer - GL_COLOR_ATTACHMENT0].texture;
             } else if (fbo->readBuffer >= GL_COLOR_ATTACHMENT0 && fbo->readBuffer <= GL_COLOR_ATTACHMENT7) {
@@ -193,7 +209,7 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
             }
             if (tex) {
                 src_image = backend_get_texture_image(tex);
-                mithril::Texture* t = mithril::state_get_texture(tex);
+                const auto& t = g_state->GetTextureState().GetTextureObject(tex);
                 if (t) src_format = backend_vk_format_for_gl((GLenum)t->internalFormat);
             }
         }
@@ -203,16 +219,16 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
     // destination.
     VkImage dst_image = VK_NULL_HANDLE;
     VkFormat dst_format = VK_FORMAT_UNDEFINED;
-    if (g_state->currentDrawFBO == 0) {
-        dst_image  = g_state->eglDefaultColorImage;
-        dst_format = g_state->eglDefaultColorFormat;
+    if (fbState.GetCurrentDrawFBO() == 0) {
+        dst_image  = fbState.eglDefaultColorImage;
+        dst_format = fbState.eglDefaultColorFormat;
     } else {
-        mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentDrawFBO);
+        const auto& fbo = fbState.GetCurrentDrawFramebuffer();
         if (fbo) {
             GLuint tex = fbo->colors[0].texture;
             if (tex) {
                 dst_image = backend_get_texture_image(tex);
-                mithril::Texture* t = mithril::state_get_texture(tex);
+                const auto& t = g_state->GetTextureState().GetTextureObject(tex);
                 if (t) dst_format = backend_vk_format_for_gl((GLenum)t->internalFormat);
             }
         }
@@ -237,7 +253,13 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
 void glGenRenderbuffers(GLsizei n, GLuint* rbs) {
     MITHRIL_ENSURE_INIT();
     if (n <= 0 || !rbs) return;
-    for (GLsizei i = 0; i < n; ++i) rbs[i] = g_state->nextName++;
+    // Renderbuffers share the framebuffer name allocator (the former flat
+    // GLState had a single nextName counter shared by every object type).
+    std::vector<uint32_t> names;
+    g_state->GetFramebufferState().GenFramebufferNames(static_cast<uint32_t>(n), names);
+    for (GLsizei i = 0; i < n; ++i) {
+        rbs[i] = names[static_cast<size_t>(i)];
+    }
 }
 void glDeleteRenderbuffers(GLsizei, const GLuint*) { MITHRIL_ENSURE_INIT(); }
 void glBindRenderbuffer(GLenum, GLuint) { MITHRIL_ENSURE_INIT(); }
@@ -253,25 +275,27 @@ int collect_draw_fbo_attachments(VkImageView out_color[8], VkImageView* out_dept
                                  int* out_w, int* out_h) {
     for (int i = 0; i < 8; ++i) out_color[i] = VK_NULL_HANDLE;
     *out_depth = VK_NULL_HANDLE;
-    if (out_w) *out_w = g_state->viewportW;
-    if (out_h) *out_h = g_state->viewportH;
+    auto& fbState = g_state->GetFramebufferState();
+    auto vp = g_state->GetRenderState().GetViewport();
+    if (out_w) *out_w = vp.w;
+    if (out_h) *out_h = vp.h;
 
     /*
      * EGL-backed default framebuffer: when an EGLSurface is current, the
-     * swapchain image's VkImageView is installed on the GLState. GL commands
-     * against framebuffer 0 render straight into the on-screen drawable. EGL
-     * swaps the image view per-frame (eglSwapBuffers acquires the next
-     * swapchain image and replaces this handle).
+     * swapchain image's VkImageView is installed on the FramebufferState. GL
+     * commands against framebuffer 0 render straight into the on-screen
+     * drawable. EGL swaps the image view per-frame (eglSwapBuffers acquires
+     * the next swapchain image and replaces this handle).
      */
-    if (g_state->currentDrawFBO == 0 && g_state->eglDefaultColor != VK_NULL_HANDLE) {
-        out_color[0] = g_state->eglDefaultColor;
-        if (g_state->eglDefaultDepth != VK_NULL_HANDLE) *out_depth = g_state->eglDefaultDepth;
-        if (g_state->eglDefaultWidth > 0 && out_w) *out_w = g_state->eglDefaultWidth;
-        if (g_state->eglDefaultHeight > 0 && out_h) *out_h = g_state->eglDefaultHeight;
+    if (fbState.GetCurrentDrawFBO() == 0 && fbState.eglDefaultColor != VK_NULL_HANDLE) {
+        out_color[0] = fbState.eglDefaultColor;
+        if (fbState.eglDefaultDepth != VK_NULL_HANDLE) *out_depth = fbState.eglDefaultDepth;
+        if (fbState.eglDefaultWidth > 0 && out_w) *out_w = fbState.eglDefaultWidth;
+        if (fbState.eglDefaultHeight > 0 && out_h) *out_h = fbState.eglDefaultHeight;
         return 1;
     }
 
-    Framebuffer* fbo = state_get_framebuffer(g_state->currentDrawFBO);
+    const auto& fbo = fbState.GetCurrentDrawFramebuffer();
     if (!fbo) return 0;
 
     int count = 0;
@@ -285,14 +309,14 @@ int collect_draw_fbo_attachments(VkImageView out_color[8], VkImageView* out_dept
         out_color[i] = view;
         if (view != VK_NULL_HANDLE) { count = i + 1; }
         if (w == 0) {
-            Texture* t = state_get_texture(tex);
+            const auto& t = g_state->GetTextureState().GetTextureObject(tex);
             if (t) { w = t->width; h = t->height; }
         }
     }
     if (fbo->depth.texture) {
         *out_depth = backend_get_texture_view(fbo->depth.texture);
         if (w == 0) {
-            Texture* t = state_get_texture(fbo->depth.texture);
+            const auto& t = g_state->GetTextureState().GetTextureObject(fbo->depth.texture);
             if (t) { w = t->width; h = t->height; }
         }
     }

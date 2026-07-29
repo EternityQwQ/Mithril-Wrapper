@@ -174,18 +174,17 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint* p
     // glTexImage2D(GL_PROXY_TEXTURE_2D, ...) call. If the combo was
     // unsupported, valid=false and width/height are 0.
     if (target == GL_PROXY_TEXTURE_2D) {
+        const mithril::glstate::ProxyTextureState& proxy =
+            g_state->GetTextureState().GetProxyTexture2D();
         switch (pname) {
             case GL_TEXTURE_WIDTH:
-                *params = g_state->proxyTexture2D.valid
-                        ? g_state->proxyTexture2D.width : 0;
+                *params = proxy.valid ? proxy.width : 0;
                 break;
             case GL_TEXTURE_HEIGHT:
-                *params = g_state->proxyTexture2D.valid
-                        ? g_state->proxyTexture2D.height : 0;
+                *params = proxy.valid ? proxy.height : 0;
                 break;
             case GL_TEXTURE_INTERNAL_FORMAT:
-                *params = g_state->proxyTexture2D.valid
-                        ? g_state->proxyTexture2D.internalFormat : 0;
+                *params = proxy.valid ? proxy.internalFormat : 0;
                 break;
             default:
                 *params = 0;
@@ -195,10 +194,10 @@ void glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint* p
     }
 
     // Real texture queries: return the tracked dimensions for level 0.
-    mithril::Texture* t = nullptr;
-    GLuint unit = g_state->activeTextureUnit;
-    if (unit < mithril::kMaxTextureUnits) {
-        t = mithril::state_get_texture(g_state->boundTextures[unit]);
+    uint32_t unit = g_state->GetTextureState().GetActiveTextureUnit();
+    const mithril::glstate::TextureObject* t = nullptr;
+    if (unit < static_cast<uint32_t>(mithril::glstate::kMaxTextureUnits)) {
+        t = g_state->GetTextureState().GetBoundTexture(unit).get();
     }
     if (!t) return;
     switch (pname) {

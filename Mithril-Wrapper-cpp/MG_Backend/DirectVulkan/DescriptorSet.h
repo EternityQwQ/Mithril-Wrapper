@@ -37,7 +37,7 @@ void ensure_program_layouts(GLuint program,
 
 /*
  * Allocate a fresh VkDescriptorSet (from the program's pool, reset once per
- * frame), populate it from the current Program.uniforms + g_state->boundTextures,
+ * frame), populate it from the current ProgramObject.uniforms + g_state->GetTextureState().GetBoundTexture(...),
  * and vkCmdBindDescriptorSets it to the active command buffer. No-op when the
  * program has no descriptor bindings (or no pipeline layout).
  *

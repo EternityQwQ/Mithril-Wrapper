@@ -7,6 +7,12 @@
 // MSL fields (vertexMSL/fragmentMSL) are replaced with SPIR-V word vectors
 // (vertexSpirv/fragmentSpirv); MoltenVK cross-translates the SPIR-V to MSL
 // internally at vkCreateShaderModule time.
+//
+// Migrated to the modular GLContext API: program/shader state lives in
+// mithril::glstate::ProgramState (owned by g_state) and per-name records are
+// mithril::glstate::ProgramObject / ShaderObject (SharedPtr-owned). Object
+// lookup goes through GetProgramState().GetProgramObject/GetShaderObject;
+// errors are recorded via g_state->RecordError(GLToErrorCode(GL_*)).
 #include "includes.h"
 #include "Shader.h"
 
@@ -17,39 +23,30 @@ extern "C" {
 
 GLuint glCreateShader(GLenum type) {
     MITHRIL_ENSURE_INIT();
-    GLuint name = g_state->nextName++;
-    mithril::Shader s{};
-    s.id = name;
-    s.type = type;
-    g_state->shaders[name] = s;
-    return name;
+    return g_state->GetProgramState().CreateShader(type);
 }
 
 void glDeleteShader(GLuint shader) {
     MITHRIL_ENSURE_INIT();
-    g_state->shaders.erase(shader);
+    g_state->GetProgramState().MarkShaderForDeletion(shader);
 }
 
 GLuint glCreateProgram(void) {
     MITHRIL_ENSURE_INIT();
-    GLuint name = g_state->nextName++;
-    mithril::Program p{};
-    p.id = name;
-    g_state->programs[name] = p;
-    return name;
+    return g_state->GetProgramState().CreateProgram();
 }
 
 void glDeleteProgram(GLuint program) {
     MITHRIL_ENSURE_INIT();
-    if (g_state->currentProgram == program) g_state->currentProgram = 0;
     // Release the Vulkan shader modules + cached pipelines owned by this program.
     backend_delete_program_resources(program);
-    g_state->programs.erase(program);
+    g_state->GetProgramState().MarkProgramForDeletion(program);
 }
 
 void glShaderSource(GLuint shader, GLsizei count, const GLchar* const* string, const GLint* length) {
     MITHRIL_ENSURE_INIT();
-    mithril::Shader* s = mithril::state_get_shader(shader);
+    const mithril::glstate::SharedPtr<mithril::glstate::ShaderObject>& s =
+        g_state->GetProgramState().GetShaderObject(shader);
     if (!s || count <= 0 || !string) return;
     s->source.clear();
     for (GLsizei i = 0; i < count; ++i) {
@@ -68,7 +65,8 @@ void glShaderBinary(GLsizei, const GLuint*, GLenum, const void*, GLsizei) {
 
 void glCompileShader(GLuint shader) {
     MITHRIL_ENSURE_INIT();
-    mithril::Shader* s = mithril::state_get_shader(shader);
+    const mithril::glstate::SharedPtr<mithril::glstate::ShaderObject>& s =
+        g_state->GetProgramState().GetShaderObject(shader);
     if (!s) return;
     std::string info;
     std::vector<uint32_t> spirv;
@@ -93,24 +91,24 @@ void glReleaseShaderCompiler(void) { MITHRIL_ENSURE_INIT(); }
 
 void glAttachShader(GLuint program, GLuint shader) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p) return;
-    for (GLuint id : p->attachedShaders) if (id == shader) return;
+    for (uint32_t id : p->attachedShaders) if (id == shader) return;
     p->attachedShaders.push_back(shader);
 }
 
 void glDetachShader(GLuint program, GLuint shader) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
-    if (!p) return;
-    auto& v = p->attachedShaders;
-    v.erase(std::remove(v.begin(), v.end(), shader), v.end());
+    g_state->GetProgramState().DetachShader(program, shader);
+    g_state->GetProgramState().ReleaseShaderNameIfOrphaned(shader);
 }
 
 void glLinkProgram(GLuint program) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
-    if (!p) { mithril::state_set_error(GL_INVALID_OPERATION); return; }
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
+    if (!p) { g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_OPERATION)); return; }
 
     // Release any previously-built Vulkan resources (shader modules, cached
     // pipelines, descriptor layouts, failed-signature negative cache) for
@@ -141,7 +139,8 @@ void glLinkProgram(GLuint program) {
 
     bool missing = false;
     for (GLuint sid : p->attachedShaders) {
-        mithril::Shader* s = mithril::state_get_shader(sid);
+        const mithril::glstate::SharedPtr<mithril::glstate::ShaderObject>& s =
+            g_state->GetProgramState().GetShaderObject(sid);
         if (!s) continue;
         if (!s->compiled || s->spirv.empty()) { missing = true; continue; }
         if (s->type == GL_VERTEX_SHADER) {
@@ -188,16 +187,17 @@ void glLinkProgram(GLuint program) {
 
 void glUseProgram(GLuint program) {
     MITHRIL_ENSURE_INIT();
-    if (program != 0 && !mithril::state_get_program(program)) {
-        mithril::state_set_error(GL_INVALID_OPERATION);
+    if (program != 0 && !g_state->GetProgramState().GetProgramObject(program)) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_OPERATION));
         return;
     }
-    g_state->currentProgram = program;
+    g_state->GetProgramState().UseProgram(program);
 }
 
 void glValidateProgram(GLuint program) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p) return;
     // Validation is a no-op for our purposes; report success if linked.
     (void)p;
@@ -206,7 +206,8 @@ void glValidateProgram(GLuint program) {
 void glGetShaderiv(GLuint shader, GLenum pname, GLint* params) {
     MITHRIL_ENSURE_INIT();
     if (!params) return;
-    mithril::Shader* s = mithril::state_get_shader(shader);
+    const mithril::glstate::SharedPtr<mithril::glstate::ShaderObject>& s =
+        g_state->GetProgramState().GetShaderObject(shader);
     if (!s) { *params = 0; return; }
     switch (pname) {
         case GL_SHADER_TYPE:        *params = (GLint)s->type; break;
@@ -219,7 +220,8 @@ void glGetShaderiv(GLuint shader, GLenum pname, GLint* params) {
 
 void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* infoLog) {
     MITHRIL_ENSURE_INIT();
-    mithril::Shader* s = mithril::state_get_shader(shader);
+    const mithril::glstate::SharedPtr<mithril::glstate::ShaderObject>& s =
+        g_state->GetProgramState().GetShaderObject(shader);
     if (!s || !infoLog || bufSize <= 0) { if (length) *length = 0; return; }
     GLsizei n = (GLsizei)s->infoLog.size();
     if (n > bufSize - 1) n = bufSize - 1;
@@ -230,7 +232,8 @@ void glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar*
 
 void glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* source) {
     MITHRIL_ENSURE_INIT();
-    mithril::Shader* s = mithril::state_get_shader(shader);
+    const mithril::glstate::SharedPtr<mithril::glstate::ShaderObject>& s =
+        g_state->GetProgramState().GetShaderObject(shader);
     if (!s || !source || bufSize <= 0) { if (length) *length = 0; return; }
     GLsizei n = (GLsizei)s->source.size();
     if (n > bufSize - 1) n = bufSize - 1;
@@ -242,7 +245,8 @@ void glGetShaderSource(GLuint shader, GLsizei bufSize, GLsizei* length, GLchar* 
 void glGetProgramiv(GLuint program, GLenum pname, GLint* params) {
     MITHRIL_ENSURE_INIT();
     if (!params) return;
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p) { *params = 0; return; }
     switch (pname) {
         case GL_LINK_STATUS:     *params = p->linked ? GL_TRUE : GL_FALSE; break;
@@ -257,7 +261,8 @@ void glGetProgramiv(GLuint program, GLenum pname, GLint* params) {
 
 void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei* length, GLchar* infoLog) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !infoLog || bufSize <= 0) { if (length) *length = 0; return; }
     GLsizei n = (GLsizei)p->infoLog.size();
     if (n > bufSize - 1) n = bufSize - 1;
@@ -268,7 +273,8 @@ void glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei* length, GLcha
 
 void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLuint* shaders) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !shaders) { if (count) *count = 0; return; }
     GLsizei n = (GLsizei)p->attachedShaders.size();
     if (n > maxCount) n = maxCount;
@@ -278,12 +284,13 @@ void glGetAttachedShaders(GLuint program, GLsizei maxCount, GLsizei* count, GLui
 
 GLint glGetUniformLocation(GLuint program, const GLchar* name) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !p->linked || !name) return -1;
     auto it = p->uniforms.find(name);
     if (it == p->uniforms.end()) {
         // Allocate a synthetic location on first query so subsequent setters work.
-        mithril::Uniform u{};
+        mithril::glstate::Uniform u{};
         u.name = name;
         u.location = (GLint)p->uniforms.size();
         p->uniforms[name] = u;
@@ -296,7 +303,8 @@ GLint glGetUniformLocation(GLuint program, const GLchar* name) {
 void glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize,
                         GLsizei* length, GLint* size, GLenum* type, GLchar* name) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !name || bufSize <= 0) { if (length) *length = 0; return; }
     if (index >= p->uniforms.size()) { if (length) *length = 0; return; }
     // Linear scan to the index-th entry.
@@ -320,7 +328,8 @@ void glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize,
 void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize,
                        GLsizei* length, GLint* size, GLenum* type, GLchar* name) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !name || bufSize <= 0) { if (length) *length = 0; return; }
     if (index >= p->attribs.size()) { if (length) *length = 0; return; }
     GLuint i = 0;
@@ -342,7 +351,8 @@ void glGetActiveAttrib(GLuint program, GLuint index, GLsizei bufSize,
 
 void glGetUniformfv(GLuint program, GLint location, GLfloat* params) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !params) return;
     auto it = p->uniformByLocation.find(location);
     if (it == p->uniformByLocation.end()) { *params = 0; return; }
@@ -353,7 +363,8 @@ void glGetUniformfv(GLuint program, GLint location, GLfloat* params) {
 
 void glGetUniformiv(GLuint program, GLint location, GLint* params) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !params) return;
     auto it = p->uniformByLocation.find(location);
     if (it == p->uniformByLocation.end()) { *params = 0; return; }
@@ -363,7 +374,8 @@ void glGetUniformiv(GLuint program, GLint location, GLint* params) {
 
 GLuint glGetUniformBlockIndex(GLuint program, const GLchar* uniformBlockName) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !uniformBlockName) return 0xFFFFFFFFu;
     auto it = p->uniformBlocks.find(uniformBlockName);
     if (it == p->uniformBlocks.end()) return 0xFFFFFFFFu;
@@ -387,16 +399,16 @@ void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint unif
  * buffers bound by the draw path. Here we just cache the latest value on the
  * program so the draw path can push it into a uniform buffer.
  */
-static mithril::Program* current_program() {
-    return mithril::state_get_program(g_state->currentProgram);
+static const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& current_program() {
+    return g_state->GetProgramState().GetCurrentProgram();
 }
 
 static void store_uniform(GLint location, const GLfloat* v, int count, int comps) {
-    mithril::Program* p = current_program();
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p = current_program();
     if (!p || location < 0 || !v) return;
     auto it = p->uniformByLocation.find(location);
     std::string name = (it != p->uniformByLocation.end()) ? it->second : "";
-    mithril::Uniform& u = p->uniforms[name];
+    mithril::glstate::Uniform& u = p->uniforms[name];
     u.name = name;
     u.location = location;
     u.type = GL_FLOAT;
@@ -404,11 +416,11 @@ static void store_uniform(GLint location, const GLfloat* v, int count, int comps
 }
 
 static void store_uniform_int(GLint location, const GLint* v, int count, int comps) {
-    mithril::Program* p = current_program();
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p = current_program();
     if (!p || location < 0 || !v) return;
     auto it = p->uniformByLocation.find(location);
     std::string name = (it != p->uniformByLocation.end()) ? it->second : "";
-    mithril::Uniform& u = p->uniforms[name];
+    mithril::glstate::Uniform& u = p->uniforms[name];
     u.name = name;
     u.location = location;
     u.type = GL_INT;

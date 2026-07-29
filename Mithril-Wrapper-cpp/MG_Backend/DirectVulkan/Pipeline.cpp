@@ -375,11 +375,12 @@ VkPipeline get_or_create_pipeline(GLuint program,
 
     // ---- Color blend ----
     // FIX (root cause I+J): use independent alpha blend factors (blend_src_alpha/
-    // blend_dst_alpha) and apply the GL colorWriteMask from g_state instead of
-    // hardcoding RGBA all-on. glColorMask now takes effect via the pipeline
-    // signature (color_write_mask is hashed above), so depth-only pre-passes
-    // that disable color writes get a distinct pipeline that does not corrupt
-    // the color buffer.
+    // blend_dst_alpha) and apply the GL colorWriteMask (resolved by the caller
+    // via g_state->GetRenderState().GetColorMask() and passed in as
+    // color_write_mask) instead of hardcoding RGBA all-on. glColorMask now
+    // takes effect via the pipeline signature (color_write_mask is hashed
+    // above), so depth-only pre-passes that disable color writes get a distinct
+    // pipeline that does not corrupt the color buffer.
     VkPipelineColorBlendAttachmentState cbAttach{};
     cbAttach.blendEnable = blend_enabled ? VK_TRUE : VK_FALSE;
     if (blend_enabled) {

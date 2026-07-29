@@ -106,29 +106,48 @@ extern "C" {
 
 GLenum glGetError(void) {
     MITHRIL_ENSURE_INIT();
-    // Mirror MobileGlues: always return GL_NO_ERROR to prevent Minecraft from
-    // spamming the log with GL errors that are harmless in the translation layer.
-    mithril::state_take_error();
-    return GL_NO_ERROR;
+    return g_state->PopGLErrorAsGLenum();
 }
 
 void glGetBooleanv(GLenum pname, GLboolean* params) {
     MITHRIL_ENSURE_INIT();
     if (!params) return;
     switch (pname) {
-        case GL_DEPTH_WRITEMASK: *params = g_state->depthMask ? GL_TRUE : GL_FALSE; break;
-        case GL_DEPTH_TEST:      *params = g_state->depthTest ? GL_TRUE : GL_FALSE; break;
-        case GL_BLEND:           *params = g_state->blend ? GL_TRUE : GL_FALSE; break;
-        case GL_STENCIL_TEST:    *params = g_state->stencilTest ? GL_TRUE : GL_FALSE; break;
-        case GL_CULL_FACE:       *params = g_state->cullFace ? GL_TRUE : GL_FALSE; break;
-        case GL_SCISSOR_TEST:    *params = g_state->scissorTest ? GL_TRUE : GL_FALSE; break;
-        case GL_DITHER:          *params = g_state->dither ? GL_TRUE : GL_FALSE; break;
-        case GL_COLOR_WRITEMASK:
-            params[0] = g_state->colorMask[0] ? GL_TRUE : GL_FALSE;
-            params[1] = g_state->colorMask[1] ? GL_TRUE : GL_FALSE;
-            params[2] = g_state->colorMask[2] ? GL_TRUE : GL_FALSE;
-            params[3] = g_state->colorMask[3] ? GL_TRUE : GL_FALSE;
+        case GL_DEPTH_WRITEMASK:
+            *params = g_state->GetRenderState().GetDepthMask() ? GL_TRUE : GL_FALSE;
             break;
+        case GL_DEPTH_TEST:
+            *params = g_state->GetRenderState().IsCapabilityEnabled(
+                mithril::glstate::CapabilityInput::DepthTest) ? GL_TRUE : GL_FALSE;
+            break;
+        case GL_BLEND:
+            *params = g_state->GetRenderState().IsCapabilityEnabled(
+                mithril::glstate::CapabilityInput::Blend) ? GL_TRUE : GL_FALSE;
+            break;
+        case GL_STENCIL_TEST:
+            *params = g_state->GetRenderState().IsCapabilityEnabled(
+                mithril::glstate::CapabilityInput::StencilTest) ? GL_TRUE : GL_FALSE;
+            break;
+        case GL_CULL_FACE:
+            *params = g_state->GetRenderState().IsCapabilityEnabled(
+                mithril::glstate::CapabilityInput::CullFace) ? GL_TRUE : GL_FALSE;
+            break;
+        case GL_SCISSOR_TEST:
+            *params = g_state->GetRenderState().IsCapabilityEnabled(
+                mithril::glstate::CapabilityInput::ScissorTest) ? GL_TRUE : GL_FALSE;
+            break;
+        case GL_DITHER:
+            *params = g_state->GetRenderState().IsCapabilityEnabled(
+                mithril::glstate::CapabilityInput::Dither) ? GL_TRUE : GL_FALSE;
+            break;
+        case GL_COLOR_WRITEMASK: {
+            mithril::glstate::BoolVec4 mask = g_state->GetRenderState().GetColorMask();
+            params[0] = mask.v[0] ? GL_TRUE : GL_FALSE;
+            params[1] = mask.v[1] ? GL_TRUE : GL_FALSE;
+            params[2] = mask.v[2] ? GL_TRUE : GL_FALSE;
+            params[3] = mask.v[3] ? GL_TRUE : GL_FALSE;
+            break;
+        }
         default: *params = GL_FALSE; break;
     }
 }
@@ -152,7 +171,7 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         case GL_MAX_TEXTURE_IMAGE_UNITS:      *params = 32; break;
         case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:*params = 32; break;
         case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:*params = 80; break;
-        case GL_MAX_VERTEX_ATTRIBS:           *params = mithril::kMaxVertexAttribs; break;
+        case GL_MAX_VERTEX_ATTRIBS:           *params = mithril::glstate::kMaxVertexAttribs; break;
         case GL_MAX_VERTEX_UNIFORM_COMPONENTS:*params = 4096; break;
         case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS:*params = 4096; break;
         case GL_MAX_VIEWPORT_DIMS:            params[0] = 16384; params[1] = 16384; break;
@@ -177,56 +196,183 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         case GL_CONTEXT_PROFILE_MASK:         *params = GL_CONTEXT_CORE_PROFILE_BIT; break;
         case GL_DOUBLEBUFFER:                 *params = GL_TRUE; break;
         case GL_STEREO:                       *params = GL_FALSE; break;
-        case GL_MAX_DRAW_BUFFERS:             *params = 8; break;
-        case GL_MAX_COLOR_ATTACHMENTS:        *params = mithril::kMaxColorAttachments; break;
-        case GL_MAX_TEXTURE_UNITS:            *params = mithril::kMaxTextureUnits; break;
-        case GL_ACTIVE_TEXTURE:               *params = (GLint)(GL_TEXTURE0 + g_state->activeTextureUnit); break;
-        case GL_ARRAY_BUFFER_BINDING:         *params = (GLint)g_state->currentArrayBuffer; break;
-        case GL_ELEMENT_ARRAY_BUFFER_BINDING: *params = (GLint)g_state->currentIndexBuffer; break;
-        case GL_UNIFORM_BUFFER_BINDING:       *params = (GLint)g_state->currentUniformBuffer; break;
-        case GL_VERTEX_ARRAY_BINDING:         *params = (GLint)g_state->currentVAO; break;
-        case GL_CURRENT_PROGRAM:              *params = (GLint)g_state->currentProgram; break;
+        case GL_MAX_DRAW_BUFFERS:             *params = mithril::glstate::kMaxDrawBuffers; break;
+        case GL_MAX_COLOR_ATTACHMENTS:        *params = mithril::glstate::kMaxColorAttachments; break;
+        case GL_MAX_TEXTURE_UNITS:            *params = mithril::glstate::kMaxTextureUnits; break;
+        case GL_ACTIVE_TEXTURE: {
+            *params = (GLint)(GL_TEXTURE0 + g_state->GetTextureState().GetActiveTextureUnit());
+            break;
+        }
+        case GL_ARRAY_BUFFER_BINDING: {
+            const mithril::glstate::SharedPtr<mithril::glstate::BufferObject>& buf =
+                g_state->GetBufferState().GetBoundBuffer(mithril::glstate::BufferTarget::Array);
+            *params = buf ? (GLint)buf->id : 0;
+            break;
+        }
+        case GL_ELEMENT_ARRAY_BUFFER_BINDING: {
+            // GL_ELEMENT_ARRAY_BUFFER is bound into the currently-bound VAO, so
+            // query it through VertexArrayState (BufferState never owns that
+            // slot in the modular binding model).
+            const mithril::glstate::SharedPtr<mithril::glstate::VertexArrayObject>& vao =
+                g_state->GetVertexArrayState().GetCurrentVertexArray();
+            *params = vao ? (GLint)vao->elementArrayBuffer : 0;
+            break;
+        }
+        case GL_UNIFORM_BUFFER_BINDING: {
+            const mithril::glstate::SharedPtr<mithril::glstate::BufferObject>& buf =
+                g_state->GetBufferState().GetBoundBuffer(mithril::glstate::BufferTarget::Uniform);
+            *params = buf ? (GLint)buf->id : 0;
+            break;
+        }
+        case GL_VERTEX_ARRAY_BINDING: {
+            const mithril::glstate::SharedPtr<mithril::glstate::VertexArrayObject>& vao =
+                g_state->GetVertexArrayState().GetCurrentVertexArray();
+            *params = vao ? (GLint)vao->id : 0;
+            break;
+        }
+        case GL_CURRENT_PROGRAM: {
+            const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& prog =
+                g_state->GetProgramState().GetCurrentProgram();
+            *params = prog ? (GLint)prog->id : 0;
+            break;
+        }
         // GL_DRAW_FRAMEBUFFER_BINDING and GL_FRAMEBUFFER_BINDING share the same
         // numeric value (0x8CA6) per the GL spec, so a single case covers both.
-        case GL_FRAMEBUFFER_BINDING:          *params = (GLint)g_state->currentDrawFBO; break;
-        case GL_READ_FRAMEBUFFER_BINDING:     *params = (GLint)g_state->currentReadFBO; break;
-        case GL_VIEWPORT:
-            params[0] = g_state->viewportX; params[1] = g_state->viewportY;
-            params[2] = g_state->viewportW; params[3] = g_state->viewportH;
+        case GL_FRAMEBUFFER_BINDING:
+            *params = (GLint)g_state->GetFramebufferState().GetCurrentDrawFBO();
             break;
-        case GL_SCISSOR_BOX:
-            params[0] = g_state->scissorX; params[1] = g_state->scissorY;
-            params[2] = g_state->scissorW; params[3] = g_state->scissorH;
+        case GL_READ_FRAMEBUFFER_BINDING:
+            *params = (GLint)g_state->GetFramebufferState().GetCurrentReadFBO();
             break;
-        case GL_COLOR_CLEAR_VALUE:
-            for (int i = 0; i < 4; ++i) params[i] = (GLint)g_state->clearColor[i];
+        case GL_VIEWPORT: {
+            mithril::glstate::IntRect vp = g_state->GetRenderState().GetViewport();
+            params[0] = vp.x; params[1] = vp.y;
+            params[2] = vp.w; params[3] = vp.h;
             break;
-        case GL_DEPTH_FUNC:                   *params = (GLint)g_state->depthFunc; break;
-        case GL_CULL_FACE_MODE:               *params = (GLint)g_state->cullMode; break;
-        case GL_FRONT_FACE:                   *params = (GLint)g_state->frontFace; break;
-        case GL_POLYGON_MODE:                 params[0] = (GLint)g_state->polygonModeFront;
-                                                 params[1] = (GLint)g_state->polygonModeBack; break;
-        case GL_LINE_WIDTH:                   *params = (GLint)g_state->lineWidth; break;
-        case GL_POINT_SIZE:                   *params = (GLint)g_state->pointSize; break;
-        case GL_UNPACK_ALIGNMENT:             *params = g_state->unpackAlignment; break;
-        case GL_PACK_ALIGNMENT:               *params = g_state->packAlignment; break;
-        case GL_UNPACK_ROW_LENGTH:            *params = g_state->unpackRowLength; break;
-        case GL_UNPACK_IMAGE_HEIGHT:          *params = g_state->unpackImageHeight; break;
-        case GL_TEXTURE_BINDING_2D:           *params = (GLint)g_state->boundTextures[g_state->activeTextureUnit]; break;
-        case GL_BLEND_SRC_RGB:                *params = (GLint)g_state->blendSrcRGB; break;
-        case GL_BLEND_DST_RGB:                *params = (GLint)g_state->blendDstRGB; break;
-        case GL_BLEND_SRC_ALPHA:              *params = (GLint)g_state->blendSrcA; break;
-        case GL_BLEND_DST_ALPHA:              *params = (GLint)g_state->blendDstA; break;
-        case GL_BLEND_EQUATION_RGB:           *params = (GLint)g_state->blendEqRGB; break;
-        case GL_BLEND_EQUATION_ALPHA:         *params = (GLint)g_state->blendEqA; break;
-        case GL_STENCIL_WRITEMASK:            *params = (GLint)g_state->stencilMask; break;
-        case GL_STENCIL_BACK_WRITEMASK:       *params = (GLint)g_state->stencilBackMask; break;
-        case GL_STENCIL_FUNC:                 *params = (GLint)g_state->stencilFunc; break;
-        case GL_STENCIL_REF:                  *params = g_state->stencilRef; break;
-        case GL_STENCIL_VALUE_MASK:           *params = (GLint)g_state->stencilValueMask; break;
-        case GL_STENCIL_FAIL:                 *params = (GLint)g_state->stencilSfail; break;
-        case GL_STENCIL_PASS_DEPTH_FAIL:     *params = (GLint)g_state->stencilDpfail; break;
-        case GL_STENCIL_PASS_DEPTH_PASS:     *params = (GLint)g_state->stencilDppass; break;
+        }
+        case GL_SCISSOR_BOX: {
+            mithril::glstate::IntRect sb = g_state->GetRenderState().GetScissorBox();
+            params[0] = sb.x; params[1] = sb.y;
+            params[2] = sb.w; params[3] = sb.h;
+            break;
+        }
+        case GL_COLOR_CLEAR_VALUE: {
+            const float* cc = g_state->GetRenderState().GetClearColor();
+            for (int i = 0; i < 4; ++i) params[i] = (GLint)cc[i];
+            break;
+        }
+        case GL_COLOR_WRITEMASK: {
+            // Returns attachment 0's color writemask as 4 GLboolean values.
+            mithril::glstate::BoolVec4 mask = g_state->GetRenderState().GetColorMask();
+            params[0] = mask.v[0] ? GL_TRUE : GL_FALSE;
+            params[1] = mask.v[1] ? GL_TRUE : GL_FALSE;
+            params[2] = mask.v[2] ? GL_TRUE : GL_FALSE;
+            params[3] = mask.v[3] ? GL_TRUE : GL_FALSE;
+            break;
+        }
+        case GL_DEPTH_FUNC:
+            *params = (GLint)mithril::glstate::DepthTestFuncToGL(
+                g_state->GetRenderState().GetDepthFunc());
+            break;
+        case GL_CULL_FACE_MODE:
+            *params = (GLint)mithril::glstate::CullFaceModeToGL(
+                g_state->GetRenderState().GetCullFaceMode());
+            break;
+        case GL_FRONT_FACE:
+            *params = (GLint)mithril::glstate::FrontFaceModeToGL(
+                g_state->GetRenderState().GetFrontFaceMode());
+            break;
+        case GL_POLYGON_MODE:
+            params[0] = (GLint)g_state->GetRenderState().GetPolygonModeFront();
+            params[1] = (GLint)g_state->GetRenderState().GetPolygonModeBack();
+            break;
+        case GL_LINE_WIDTH:
+            *params = (GLint)g_state->GetRenderState().GetLineWidth(); break;
+        case GL_POINT_SIZE:
+            *params = (GLint)g_state->GetRenderState().GetPointSize(); break;
+        case GL_UNPACK_ALIGNMENT:
+            *params = g_state->GetRenderState().GetPixelStoreParam(
+                mithril::glstate::PixelStoreParam::UnpackAlignment); break;
+        case GL_PACK_ALIGNMENT:
+            *params = g_state->GetRenderState().GetPixelStoreParam(
+                mithril::glstate::PixelStoreParam::PackAlignment); break;
+        case GL_UNPACK_ROW_LENGTH:
+            *params = g_state->GetRenderState().GetPixelStoreParam(
+                mithril::glstate::PixelStoreParam::UnpackRowLength); break;
+        case GL_UNPACK_IMAGE_HEIGHT:
+            *params = g_state->GetRenderState().GetPixelStoreParam(
+                mithril::glstate::PixelStoreParam::UnpackImageHeight); break;
+        case GL_TEXTURE_BINDING_2D: {
+            uint32_t unit = g_state->GetTextureState().GetActiveTextureUnit();
+            const mithril::glstate::SharedPtr<mithril::glstate::TextureObject>& tex =
+                g_state->GetTextureState().GetBoundTexture(unit);
+            *params = tex ? (GLint)tex->id : 0;
+            break;
+        }
+        case GL_BLEND_SRC_RGB: {
+            mithril::glstate::BlendFactor sRGB, dRGB, sA, dA;
+            g_state->GetRenderState().GetBlendFunc(sRGB, dRGB, sA, dA);
+            *params = (GLint)mithril::glstate::BlendFactorToGL(sRGB);
+            break;
+        }
+        case GL_BLEND_DST_RGB: {
+            mithril::glstate::BlendFactor sRGB, dRGB, sA, dA;
+            g_state->GetRenderState().GetBlendFunc(sRGB, dRGB, sA, dA);
+            *params = (GLint)mithril::glstate::BlendFactorToGL(dRGB);
+            break;
+        }
+        case GL_BLEND_SRC_ALPHA: {
+            mithril::glstate::BlendFactor sRGB, dRGB, sA, dA;
+            g_state->GetRenderState().GetBlendFunc(sRGB, dRGB, sA, dA);
+            *params = (GLint)mithril::glstate::BlendFactorToGL(sA);
+            break;
+        }
+        case GL_BLEND_DST_ALPHA: {
+            mithril::glstate::BlendFactor sRGB, dRGB, sA, dA;
+            g_state->GetRenderState().GetBlendFunc(sRGB, dRGB, sA, dA);
+            *params = (GLint)mithril::glstate::BlendFactorToGL(dA);
+            break;
+        }
+        case GL_BLEND_EQUATION_RGB: {
+            mithril::glstate::BlendEquation colorEq, alphaEq;
+            g_state->GetRenderState().GetBlendEquation(colorEq, alphaEq);
+            *params = (GLint)mithril::glstate::BlendEquationToGL(colorEq);
+            break;
+        }
+        case GL_BLEND_EQUATION_ALPHA: {
+            mithril::glstate::BlendEquation colorEq, alphaEq;
+            g_state->GetRenderState().GetBlendEquation(colorEq, alphaEq);
+            *params = (GLint)mithril::glstate::BlendEquationToGL(alphaEq);
+            break;
+        }
+        case GL_STENCIL_WRITEMASK:
+            *params = (GLint)g_state->GetRenderState().GetStencilState(
+                mithril::glstate::StencilFace::Front).WriteMask; break;
+        case GL_STENCIL_BACK_WRITEMASK:
+            *params = (GLint)g_state->GetRenderState().GetStencilState(
+                mithril::glstate::StencilFace::Back).WriteMask; break;
+        case GL_STENCIL_FUNC:
+            *params = (GLint)mithril::glstate::DepthTestFuncToGL(
+                g_state->GetRenderState().GetStencilState(
+                    mithril::glstate::StencilFace::Front).Func); break;
+        case GL_STENCIL_REF:
+            *params = g_state->GetRenderState().GetStencilState(
+                mithril::glstate::StencilFace::Front).Ref; break;
+        case GL_STENCIL_VALUE_MASK:
+            *params = (GLint)g_state->GetRenderState().GetStencilState(
+                mithril::glstate::StencilFace::Front).ValueMask; break;
+        case GL_STENCIL_FAIL:
+            *params = (GLint)mithril::glstate::StencilOperationToGL(
+                g_state->GetRenderState().GetStencilState(
+                    mithril::glstate::StencilFace::Front).FailOp); break;
+        case GL_STENCIL_PASS_DEPTH_FAIL:
+            *params = (GLint)mithril::glstate::StencilOperationToGL(
+                g_state->GetRenderState().GetStencilState(
+                    mithril::glstate::StencilFace::Front).PassDepthFailOp); break;
+        case GL_STENCIL_PASS_DEPTH_PASS:
+            *params = (GLint)mithril::glstate::StencilOperationToGL(
+                g_state->GetRenderState().GetStencilState(
+                    mithril::glstate::StencilFace::Front).PassDepthPassOp); break;
         case GL_SHADING_LANGUAGE_VERSION:     *params = 330; break;
         default:                              *params = 0; break;
     }
@@ -238,16 +384,20 @@ void glGetFloatv(GLenum pname, GLfloat* params) {
     GLint ip[4] = {0,0,0,0};
     glGetIntegerv(pname, ip);
     switch (pname) {
-        case GL_COLOR_CLEAR_VALUE:
-            for (int i = 0; i < 4; ++i) params[i] = g_state->clearColor[i];
+        case GL_COLOR_CLEAR_VALUE: {
+            const float* cc = g_state->GetRenderState().GetClearColor();
+            for (int i = 0; i < 4; ++i) params[i] = cc[i];
             return;
-        case GL_LINE_WIDTH:        *params = g_state->lineWidth; return;
-        case GL_POINT_SIZE:        *params = g_state->pointSize; return;
-        case GL_POLYGON_OFFSET_FACTOR: *params = g_state->polygonOffsetFactor; return;
-        case GL_POLYGON_OFFSET_UNITS:  *params = g_state->polygonOffsetUnits;  return;
-        case GL_BLEND_COLOR:
-            for (int i = 0; i < 4; ++i) params[i] = g_state->blendColor[i];
+        }
+        case GL_LINE_WIDTH:        *params = g_state->GetRenderState().GetLineWidth(); return;
+        case GL_POINT_SIZE:        *params = g_state->GetRenderState().GetPointSize(); return;
+        case GL_POLYGON_OFFSET_FACTOR: *params = g_state->GetRenderState().GetPolygonOffsetFactor(); return;
+        case GL_POLYGON_OFFSET_UNITS:  *params = g_state->GetRenderState().GetPolygonOffsetUnits();  return;
+        case GL_BLEND_COLOR: {
+            const float* bc = g_state->GetRenderState().GetBlendColor();
+            for (int i = 0; i < 4; ++i) params[i] = bc[i];
             return;
+        }
         default:
             for (int i = 0; i < 4; ++i) params[i] = (GLfloat)ip[i];
             return;

@@ -1,21 +1,27 @@
 // Mithril-Wrapper - MG_Impl/VertexArray.cpp
 // Vertex Array Objects and vertex attribute pointer state.
 //
-// This is the Vulkan/MoltenVK rewrite of the former gl/vertexattrib.cpp. The
-// VAO/attribute state machine is backend-agnostic (it lives entirely in
-// mithril::GLState); the only backend-specific touchpoint is that the drawing
-// path (Drawing.cpp) reads these attribs to build the VkPipelineVertexInputState.
+// Migrated to the modular GLContext API: VAO state lives in
+// mithril::glstate::VertexArrayState (owned by g_state), per-name records are
+// mithril::glstate::VertexArrayObject (SharedPtr-owned, default VAO name 0
+// pre-installed so GetCurrentVertexArray() never returns null), and the current
+// (non-array) generic vertex attribute values live on VertexArrayState. The
+// currently-bound GL_ARRAY_BUFFER is read from BufferState. The only
+// backend-specific touchpoint is that the drawing path (Drawing.cpp) reads these
+// attribs to build the VkPipelineVertexInputState.
 #include "includes.h"
+
+#include <vector>
 
 extern "C" {
 
 void glGenVertexArrays(GLsizei n, GLuint* arrays) {
     MITHRIL_ENSURE_INIT();
-    mithril::state_gen_names("vao", n, arrays);
+    if (n <= 0 || !arrays) return;
+    std::vector<uint32_t> names;
+    g_state->GetVertexArrayState().GenVertexArrayNames(static_cast<uint32_t>(n), names);
     for (GLsizei i = 0; i < n; ++i) {
-        mithril::VertexArray vao{};
-        vao.id = arrays[i];
-        g_state->vaos[arrays[i]] = vao;
+        arrays[i] = names[static_cast<size_t>(i)];
     }
 }
 
@@ -25,107 +31,123 @@ void glDeleteVertexArrays(GLsizei n, const GLuint* arrays) {
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = arrays[i];
         if (name == 0) continue;
-        if (g_state->currentVAO == name) g_state->currentVAO = 0;
-        g_state->vaos.erase(name);
+        // GL name-layer deletion: erases the name from the table (name 0, the
+        // default VAO, is never erased). If the deleted VAO is currently
+        // bound, the binding falls back to the default VAO. The underlying
+        // Vulkan vertex-input state is released asynchronously by the backend
+        // disposal queue.
+        g_state->GetVertexArrayState().MarkVertexArrayForDeletion(name);
     }
 }
 
 void glBindVertexArray(GLuint array) {
     MITHRIL_ENSURE_INIT();
-    if (array != 0 && !mithril::state_get_vao(array)) {
-        g_state->vaos[array] = mithril::VertexArray{};
-        g_state->vaos[array].id = array;
-    }
-    g_state->currentVAO = array;
-    mithril::VertexArray* vao = mithril::state_get_vao(array);
-    if (vao) {
-        // The element array binding follows the VAO.
-        g_state->currentIndexBuffer = vao->elementArrayBuffer;
-    }
+    g_state->GetVertexArrayState().BindVertexArray(array);
 }
 
 void glEnableVertexAttribArray(GLuint index) {
     MITHRIL_ENSURE_INIT();
-    if (index >= mithril::kMaxVertexAttribs) {
-        mithril::state_set_error(GL_INVALID_VALUE);
+    if (index >= static_cast<GLuint>(mithril::glstate::kMaxVertexAttribs)) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
         return;
     }
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    const mithril::glstate::SharedPtr<mithril::glstate::VertexArrayObject>& vao =
+        g_state->GetVertexArrayState().GetCurrentVertexArray();
     if (!vao) return;
     vao->attribs[index].enabled = true;
+    g_state->GetVertexArrayState().NotifyAttribChanged(index);
 }
 
 void glDisableVertexAttribArray(GLuint index) {
     MITHRIL_ENSURE_INIT();
-    if (index >= mithril::kMaxVertexAttribs) return;
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (index >= static_cast<GLuint>(mithril::glstate::kMaxVertexAttribs)) return;
+    const mithril::glstate::SharedPtr<mithril::glstate::VertexArrayObject>& vao =
+        g_state->GetVertexArrayState().GetCurrentVertexArray();
     if (!vao) return;
     vao->attribs[index].enabled = false;
+    g_state->GetVertexArrayState().NotifyAttribChanged(index);
 }
 
 void glVertexAttribPointer(GLuint index, GLint size, GLenum type,
                            GLboolean normalized, GLsizei stride, const void* pointer) {
     MITHRIL_ENSURE_INIT();
-    if (index >= mithril::kMaxVertexAttribs) {
-        mithril::state_set_error(GL_INVALID_VALUE);
+    if (index >= static_cast<GLuint>(mithril::glstate::kMaxVertexAttribs)) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
         return;
     }
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    const mithril::glstate::SharedPtr<mithril::glstate::VertexArrayObject>& vao =
+        g_state->GetVertexArrayState().GetCurrentVertexArray();
     if (!vao) return;
-    mithril::VertexAttrib& a = vao->attribs[index];
+    // The currently-bound GL_ARRAY_BUFFER is captured at attrib-pointer time.
+    const mithril::glstate::SharedPtr<mithril::glstate::BufferObject>& arrayBuf =
+        g_state->GetBufferState().GetBoundBuffer(mithril::glstate::BufferTarget::Array);
+    mithril::glstate::VertexAttrib& a = vao->attribs[index];
     a.size         = size;
     a.type         = type;
     a.normalized   = (normalized != 0);
     a.integer      = false;
     a.stride       = stride;
     a.pointer      = pointer;
-    a.boundBuffer  = g_state->currentArrayBuffer;
+    a.boundBuffer  = arrayBuf ? arrayBuf->id : 0;
     a.divisor      = a.divisor; // preserve
+    g_state->GetVertexArrayState().NotifyAttribChanged(index);
 }
 
 void glVertexAttribIPointer(GLuint index, GLint size, GLenum type,
                             GLsizei stride, const void* pointer) {
     MITHRIL_ENSURE_INIT();
-    if (index >= mithril::kMaxVertexAttribs) return;
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (index >= static_cast<GLuint>(mithril::glstate::kMaxVertexAttribs)) return;
+    const mithril::glstate::SharedPtr<mithril::glstate::VertexArrayObject>& vao =
+        g_state->GetVertexArrayState().GetCurrentVertexArray();
     if (!vao) return;
-    mithril::VertexAttrib& a = vao->attribs[index];
+    const mithril::glstate::SharedPtr<mithril::glstate::BufferObject>& arrayBuf =
+        g_state->GetBufferState().GetBoundBuffer(mithril::glstate::BufferTarget::Array);
+    mithril::glstate::VertexAttrib& a = vao->attribs[index];
     a.size         = size;
     a.type         = type;
     a.normalized   = false;
     a.integer      = true;
     a.stride       = stride;
     a.pointer      = pointer;
-    a.boundBuffer  = g_state->currentArrayBuffer;
+    a.boundBuffer  = arrayBuf ? arrayBuf->id : 0;
+    g_state->GetVertexArrayState().NotifyAttribChanged(index);
 }
 
 void glVertexAttribDivisor(GLuint index, GLuint divisor) {
     MITHRIL_ENSURE_INIT();
-    if (index >= mithril::kMaxVertexAttribs) return;
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (index >= static_cast<GLuint>(mithril::glstate::kMaxVertexAttribs)) return;
+    const mithril::glstate::SharedPtr<mithril::glstate::VertexArrayObject>& vao =
+        g_state->GetVertexArrayState().GetCurrentVertexArray();
     if (!vao) return;
     vao->attribs[index].divisor = divisor;
+    g_state->GetVertexArrayState().NotifyAttribChanged(index);
 }
 
 void glVertexAttrib1f(GLuint index, GLfloat x) {
     MITHRIL_ENSURE_INIT();
-    (void)index; (void)x;
-    // Generic vertex attributes are not used by Minecraft's modern pipeline.
+    float vals[4] = {x, 0.0f, 0.0f, 1.0f};
+    g_state->GetVertexArrayState().SetCurrentVertexAttributeFloat(index, vals);
 }
 
 void glVertexAttrib4f(GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
     MITHRIL_ENSURE_INIT();
-    (void)index; (void)x; (void)y; (void)z; (void)w;
+    float vals[4] = {x, y, z, w};
+    g_state->GetVertexArrayState().SetCurrentVertexAttributeFloat(index, vals);
 }
 
 void glVertexAttrib4fv(GLuint index, const GLfloat* v) {
     MITHRIL_ENSURE_INIT();
-    (void)index; (void)v;
+    float vals[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (v) {
+        vals[0] = v[0]; vals[1] = v[1]; vals[2] = v[2]; vals[3] = v[3];
+    }
+    g_state->GetVertexArrayState().SetCurrentVertexAttributeFloat(index, vals);
 }
 
 void glBindAttribLocation(GLuint program, GLuint index, const GLchar* name) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !name) return;
     // Record the name -> location mapping. It is consumed by glLinkProgram
     // when translating GLSL to SPIR-V so the generated stage_input locations
@@ -141,7 +163,8 @@ void glBindFragDataLocation(GLuint program, GLuint color, const GLchar* name) {
 
 GLint glGetAttribLocation(GLuint program, const GLchar* name) {
     MITHRIL_ENSURE_INIT();
-    mithril::Program* p = mithril::state_get_program(program);
+    const mithril::glstate::SharedPtr<mithril::glstate::ProgramObject>& p =
+        g_state->GetProgramState().GetProgramObject(program);
     if (!p || !p->linked) return -1;
     auto it = p->attribs.find(name ? name : "");
     if (it == p->attribs.end()) return -1;

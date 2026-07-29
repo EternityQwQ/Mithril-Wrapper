@@ -23,15 +23,16 @@
 //                  swapchain
 //                  images/views, and the depth/stencil VkImage/View
 //                  (VK_FORMAT_D32_SFLOAT_S8_UINT).
-//   EGLContext  -> EglContext holding its own mithril::GLState* (allocated
+//   EGLContext  -> EglContext holding its own mithril::GLContext* (allocated
 //                  via state_create()) so multiple contexts do not share GL
 //                  object tables. eglMakeCurrent swaps mithril::g_state to
 //                  point at the chosen context's state.
 //
 // The render path:
 //   eglMakeCurrent installs the surface's current swapchain image's
-//   VkImageView on g_state->eglDefaultColor (and the depth VkImageView on
-//   g_state->eglDefaultDepth). GL commands against framebuffer 0 then render
+//   VkImageView on g_state->GetFramebufferState().eglDefaultColor (and the
+//   depth VkImageView on g_state->GetFramebufferState().eglDefaultDepth). GL
+//   commands against framebuffer 0 then render
 //   straight into the on-screen drawable (see collect_draw_fbo_attachments).
 //   eglSwapBuffers flushes Mithril's pending Vulkan work, presents the
 //   swapchain image via vkQueuePresentKHR, then acquires the next image for
@@ -103,7 +104,7 @@ struct EglSurface {
 };
 
 struct EglContext {
-    mithril::GLState*   state      = nullptr;
+    mithril::GLContext*  state      = nullptr;
     EGLConfig           config     = nullptr;
     EglContext*         share      = nullptr;
     EGLenum             clientAPI  = EGL_OPENGL_API;
@@ -249,8 +250,8 @@ bool ensure_swapchain(EglSurface* s) {
     return true;
 }
 
-// Push the surface's current swapchain image views into the active GLState so
-// framebuffer-0 renders land on the on-screen drawable. Acquires the next
+// Push the surface's current swapchain image views into the active GLContext
+// so framebuffer-0 renders land on the on-screen drawable. Acquires the next
 // swapchain image if none is currently acquired.
 //
 // Also registers the swapchain with the backend encoder (via
@@ -267,15 +268,13 @@ void install_surface_on_state(EglSurface* s) {
     if (s && s->swapchain_state) {
         VkImageView color = backend_swapchain_acquire_color(s->swapchain_state);
         VkImageView depth = backend_swapchain_acquire_depth(s->swapchain_state);
-        g_state->eglDefaultColor  = color;
-        g_state->eglDefaultDepth  = depth;
         // Also expose the underlying VkImage handles + formats so image-level
         // operations (glBlitFramebuffer / glReadPixels involving FBO 0) can
         // reference the on-screen drawable directly.
-        g_state->eglDefaultColorImage   = backend_swapchain_current_color_image(s->swapchain_state);
-        g_state->eglDefaultColorFormat  = backend_swapchain_color_format(s->swapchain_state);
-        g_state->eglDefaultDepthImage   = backend_swapchain_current_depth_image(s->swapchain_state);
-        g_state->eglDefaultDepthFormat  = backend_swapchain_depth_format(s->swapchain_state);
+        VkImage     colorImg   = backend_swapchain_current_color_image(s->swapchain_state);
+        VkFormat    colorFmt   = backend_swapchain_color_format(s->swapchain_state);
+        VkImage     depthImg   = backend_swapchain_current_depth_image(s->swapchain_state);
+        VkFormat    depthFmt   = backend_swapchain_depth_format(s->swapchain_state);
         // FIX (IOSurfaceBindAccel SIGSEGV): Use the ACTUAL drawable size from
         // the native window (CAMetalLayer.drawableSize), NOT the swapchain's
         // creation-time size (s->width). On MoltenVK/iOS, the swapchain image
@@ -330,8 +329,14 @@ void install_surface_on_state(EglSurface* s) {
             if (drawW < actualW) actualW = drawW;
             if (drawH < actualH) actualH = drawH;
         }
-        g_state->eglDefaultWidth  = actualW;
-        g_state->eglDefaultHeight = actualH;
+        // Inject the per-frame swapchain color/depth VkImageViews + the
+        // underlying VkImage handles + formats + the clamped drawable size
+        // onto FramebufferState so GL commands against framebuffer 0 render
+        // straight into the on-screen drawable. SetEglDefaultFramebuffer
+        // bumps m_version so the backend rebuilds its FBO-0 renderpass /
+        // framebuffer (matching the legacy field-set + version-bump contract).
+        g_state->GetFramebufferState().SetEglDefaultFramebuffer(
+            color, depth, colorImg, depthImg, colorFmt, depthFmt, actualW, actualH);
         // Register the swapchain with the encoder so it can record layout
         // barriers and signal renderFinishedPerImage. Only register when the
         // surface actually has an acquired color view (color != VK_NULL_HANDLE)
@@ -339,14 +344,12 @@ void install_surface_on_state(EglSurface* s) {
         // recorder, which dereferences sc->images[sc->currentImage].
         backend_set_active_swapchain(color != VK_NULL_HANDLE ? s->swapchain_state : nullptr);
     } else {
-        g_state->eglDefaultColor  = VK_NULL_HANDLE;
-        g_state->eglDefaultDepth  = VK_NULL_HANDLE;
-        g_state->eglDefaultColorImage  = VK_NULL_HANDLE;
-        g_state->eglDefaultColorFormat = VK_FORMAT_UNDEFINED;
-        g_state->eglDefaultDepthImage  = VK_NULL_HANDLE;
-        g_state->eglDefaultDepthFormat = VK_FORMAT_UNDEFINED;
-        g_state->eglDefaultWidth  = 0;
-        g_state->eglDefaultHeight = 0;
+        // Headless / surfaceless frame: clear the EGL default framebuffer so
+        // the backend does not render against a stale swapchain image. The
+        // version bump ensures any cached FBO-0 renderpass is invalidated.
+        g_state->GetFramebufferState().SetEglDefaultFramebuffer(
+            VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+            VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED, 0, 0);
         // Detach the swapchain from the encoder so a headless / surfaceless
         // frame (or a frame against a user FBO) does not try to record layout
         // barriers against a destroyed swapchain.
@@ -722,7 +725,7 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
     mithril::g_state = c->state;
 
     // Install the draw surface's swapchain image views on the (now current)
-    // GLState so framebuffer-0 rendering lands on the on-screen surface.
+    // GLContext so framebuffer-0 rendering lands on the on-screen surface.
     if (d) {
         if (!d->swapchain_state && d->native_window) {
             // First make-current on a freshly-created surface whose initial
@@ -731,15 +734,19 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
         }
         install_surface_on_state(d);
         // Initialise the viewport to the surface size if the app hasn't yet.
-        // Use g_state->eglDefaultWidth/Height (the actual drawable size, clamped
-        // to the swapchain size by install_surface_on_state) instead of d->width
-        // (the swapchain creation-time size, which may be stale if the window
-        // was resized after swapchain creation).
-        if (c->state->viewportW <= 0 || c->state->viewportH <= 0) {
-            c->state->viewportX = 0;
-            c->state->viewportY = 0;
-            c->state->viewportW = g_state->eglDefaultWidth;
-            c->state->viewportH = g_state->eglDefaultHeight;
+        // Use g_state->GetFramebufferState().eglDefaultWidth/Height (the actual
+        // drawable size, clamped to the swapchain size by
+        // install_surface_on_state) instead of d->width (the swapchain
+        // creation-time size, which may be stale if the window was resized
+        // after swapchain creation). Operate on g_state (the just-made-current
+        // context, == c->state) via the RenderState domain component rather than
+        // the legacy flat viewportW/H fields.
+        auto& rs = g_state->GetRenderState();
+        auto vp = rs.GetViewport();
+        if (vp.w <= 0 || vp.h <= 0) {
+            int w = g_state->GetFramebufferState().eglDefaultWidth;
+            int h = g_state->GetFramebufferState().eglDefaultHeight;
+            rs.SetViewport(0, 0, w, h);
         }
     } else {
         install_surface_on_state(nullptr);
@@ -892,8 +899,8 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     if (s->native_window && !s->swapchain_state) {
         ensure_swapchain(s);
         if (s->swapchain_state && t_currentDraw == s) {
-            // New swapchain just came up: install it on the current GLState so
-            // the next frame's draws land on the on-screen drawable.
+            // New swapchain just came up: install it on the current GLContext
+            // so the next frame's draws land on the on-screen drawable.
             install_surface_on_state(s);
         }
     }
@@ -961,7 +968,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         }
     }
 
-    // Re-install the (possibly new) swapchain's current image on the GLState
+    // Re-install the (possibly new) swapchain's current image on the GLContext
     // so the next frame's draws land on a valid drawable. This also re-
     // registers the swapchain with the encoder (backend_set_active_swapchain)
     // so layout barriers + per-image renderFinished signaling work next frame.

@@ -14,8 +14,8 @@
 // member offsets reported by SPIRV-Cross's get_active_buffer_ranges().
 //
 // Texture sourcing: a reflected combined-image-sampler at binding B is fed from
-// g_state->boundTextures[B] (the GL texture bound to unit B), matching how the
-// GL frontend binds textures by unit index.
+// g_state->GetTextureState().GetBoundTexture(B) (the GL texture bound to unit
+// B), matching how the GL frontend binds textures by unit index.
 #include "DescriptorSet.h"
 #include "Device.h"
 #include "Pipeline.h"
@@ -313,7 +313,7 @@ void bind_program_descriptors(GLuint program) {
         return;
     }
 
-    mithril::Program* prog = mithril::state_get_program(program);
+    const auto& prog = mithril::g_state->GetProgramState().GetProgramObject(program);
     if (!prog) return;
 
     // Per-slot cursor rewind at the start of each frame. ensure_command_buffer
@@ -435,15 +435,17 @@ void bind_program_descriptors(GLuint program) {
         } else if (db.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
             // Sampler binding B maps to GL texture unit B.
             GLuint tex_id = 0;
-            if (db.binding < mithril::kMaxTextureUnits) {
-                tex_id = mithril::g_state->boundTextures[db.binding];
+            if (db.binding < static_cast<uint32_t>(mithril::glstate::kMaxTextureUnits)) {
+                const auto& tex = mithril::g_state->GetTextureState().GetBoundTexture(db.binding);
+                if (tex) tex_id = tex->id;
             }
             if (!tex_id) {
                 // Fallback: first bound texture, so the descriptor stays valid
                 // (an unbound sampler binding would leave the set incomplete).
-                for (int i = 0; i < mithril::kMaxTextureUnits; ++i) {
-                    if (mithril::g_state->boundTextures[i]) {
-                        tex_id = mithril::g_state->boundTextures[i];
+                for (uint32_t i = 0; i < static_cast<uint32_t>(mithril::glstate::kMaxTextureUnits); ++i) {
+                    const auto& tex = mithril::g_state->GetTextureState().GetBoundTexture(i);
+                    if (tex) {
+                        tex_id = tex->id;
                         break;
                     }
                 }

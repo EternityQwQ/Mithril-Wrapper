@@ -1,23 +1,28 @@
 // Mithril-Wrapper - MG_Impl/Buffer.cpp
 // Buffer object (VBO/IBO/UBO) management. CPU-side shadow storage in
-// mithril::Buffer::data plus a paired VkBuffer via backend_get_or_create_buffer.
+// mithril::glstate::BufferObject::data plus a paired VkBuffer via
+// backend_get_or_create_buffer.
 //
-// This is the Vulkan/MoltenVK rewrite of the former gl/buffer.cpp. The Metal
-// MTLBuffer calls (metal_get_or_create_buffer / metal_buffer_upload /
-// metal_get_buffer / metal_delete_buffer) are replaced with the Vulkan backend
-// C API (backend_get_or_create_buffer / backend_buffer_upload / backend_get_buffer
-// / backend_delete_buffer) declared in MG_Backend/Backend.h.
+// Migrated to the modular GLContext API: buffer state lives in
+// mithril::glstate::BufferState (owned by g_state) and per-name records are
+// mithril::glstate::BufferObject (SharedPtr-owned). GL_ELEMENT_ARRAY_BUFFER is
+// bound into the currently-bound VAO (VertexArrayState), not a global slot.
+// The Vulkan backend C API (backend_get_or_create_buffer /
+// backend_buffer_upload / backend_delete_buffer) is unchanged.
 #include "includes.h"
+
+#include <cstring>
+#include <vector>
 
 extern "C" {
 
 void glGenBuffers(GLsizei n, GLuint* buffers) {
     MITHRIL_ENSURE_INIT();
-    mithril::state_gen_names("buffer", n, buffers);
+    if (n <= 0 || !buffers) return;
+    std::vector<uint32_t> names;
+    g_state->GetBufferState().GenBufferNames(static_cast<uint32_t>(n), names);
     for (GLsizei i = 0; i < n; ++i) {
-        mithril::Buffer b{};
-        b.id = buffers[i];
-        g_state->buffers[buffers[i]] = b;
+        buffers[i] = names[static_cast<size_t>(i)];
     }
 }
 
@@ -27,78 +32,78 @@ void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = buffers[i];
         if (name == 0) continue;
-        if (g_state->currentArrayBuffer == name)   g_state->currentArrayBuffer = 0;
-        if (g_state->currentIndexBuffer == name)   g_state->currentIndexBuffer = 0;
-        if (g_state->currentUniformBuffer == name) g_state->currentUniformBuffer = 0;
+        // GL name-layer deletion: the object is detached from the table; any
+        // binding slot still holding a SharedPtr keeps the BufferObject alive
+        // until it is unbound. The underlying VkBuffer is released by the
+        // backend disposal queue (backend_delete_buffer) once in-flight GPU
+        // work referencing it completes.
+        g_state->GetBufferState().MarkBufferForDeletion(name);
         backend_delete_buffer(name);
-        g_state->buffers.erase(name);
     }
 }
 
-static mithril::Buffer* bound_buffer_for_target(GLenum target) {
-    GLuint* slot = nullptr;
-    switch (target) {
-        case GL_ARRAY_BUFFER:         slot = &g_state->currentArrayBuffer; break;
-        case GL_ELEMENT_ARRAY_BUFFER: {
-            mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
-            if (!vao) return nullptr;
-            return mithril::state_get_buffer(vao->elementArrayBuffer);
-        }
-        case GL_UNIFORM_BUFFER:         slot = &g_state->currentUniformBuffer; break;
-        case GL_PIXEL_PACK_BUFFER:
-        case GL_PIXEL_UNPACK_BUFFER:
-        case GL_COPY_READ_BUFFER:
-        case GL_COPY_WRITE_BUFFER:
-        case GL_TRANSFORM_FEEDBACK_BUFFER:
-        case GL_SHADER_STORAGE_BUFFER:
-        case GL_ATOMIC_COUNTER_BUFFER:
-        case GL_DRAW_INDIRECT_BUFFER:
-            slot = &g_state->currentArrayBuffer; break;
-        default:
-            mithril::state_set_error(GL_INVALID_ENUM);
-            return nullptr;
+// Resolve the buffer object currently bound to `target`. Returns a null
+// SharedPtr when nothing is bound (or when the target is unrecognised, in
+// which case GL_INVALID_ENUM is recorded first). GL_ELEMENT_ARRAY_BUFFER is
+// bound into the currently-bound VAO rather than a global slot, so it is
+// resolved through VertexArrayState.
+static mithril::glstate::SharedPtr<mithril::glstate::BufferObject>
+bound_buffer_for_target(GLenum target) {
+    using namespace mithril::glstate;
+    BufferTarget bt = GLToBufferTarget(target);
+    if (bt == BufferTarget::Unknown) {
+        g_state->RecordError(ErrorState::GLToErrorCode(GL_INVALID_ENUM));
+        return nullptr;
     }
-    if (!slot) return nullptr;
-    mithril::Buffer* b = mithril::state_get_buffer(*slot);
-    if (!b && *slot != 0) {
-        // The name was reserved by glGen* but not yet inserted into the table.
-        g_state->buffers[*slot] = mithril::Buffer{};
-        b = mithril::state_get_buffer(*slot);
-        b->id = *slot;
+    if (bt == BufferTarget::ElementArray) {
+        const SharedPtr<VertexArrayObject>& vao =
+            g_state->GetVertexArrayState().GetCurrentVertexArray();
+        if (!vao || vao->elementArrayBuffer == 0) return nullptr;
+        return g_state->GetBufferState().GetBufferObject(vao->elementArrayBuffer);
     }
-    return b;
+    return g_state->GetBufferState().GetBoundBuffer(bt);
 }
 
 void glBindBuffer(GLenum target, GLuint buffer) {
     MITHRIL_ENSURE_INIT();
-    if (buffer != 0 && !mithril::state_get_buffer(buffer)) {
-        g_state->buffers[buffer] = mithril::Buffer{};
-        g_state->buffers[buffer].id = buffer;
+    using namespace mithril::glstate;
+    BufferTarget bt = GLToBufferTarget(target);
+    if (bt == BufferTarget::Unknown) {
+        g_state->RecordError(ErrorState::GLToErrorCode(GL_INVALID_ENUM));
+        return;
     }
-    switch (target) {
-        case GL_ARRAY_BUFFER:         g_state->currentArrayBuffer = buffer; break;
-        case GL_UNIFORM_BUFFER:       g_state->currentUniformBuffer = buffer; break;
-        case GL_ELEMENT_ARRAY_BUFFER: {
-            mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
-            if (vao) vao->elementArrayBuffer = buffer;
-            g_state->currentIndexBuffer = buffer;
-            break;
+    if (bt == BufferTarget::ElementArray) {
+        // ElementArray binding is owned by the currently-bound VAO
+        // (BufferState does not touch this slot). GetCurrentVertexArray() is
+        // never null because the default VAO (name 0) is always installed.
+        const SharedPtr<VertexArrayObject>& vao =
+            g_state->GetVertexArrayState().GetCurrentVertexArray();
+        if (vao) {
+            vao->elementArrayBuffer = buffer;
+            if (buffer != 0) {
+                const SharedPtr<BufferObject>& obj =
+                    g_state->GetBufferState().CreateBufferObject(buffer);
+                obj->lastTarget = target;
+            }
+            // Bump the VAO version so the backend rebuilds the index binding.
+            g_state->GetVertexArrayState().NotifyAttribChanged(0);
         }
-        default:
-            // Other targets bind to the array slot for simplicity.
-            g_state->currentArrayBuffer = buffer;
-            break;
+        return;
     }
-    if (mithril::Buffer* b = mithril::state_get_buffer(buffer)) {
-        b->lastTarget = target;
-    }
+    g_state->GetBufferState().BindBuffer(bt, buffer);
 }
 
 void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
     MITHRIL_ENSURE_INIT();
-    if (size < 0) { mithril::state_set_error(GL_INVALID_VALUE); return; }
-    mithril::Buffer* b = bound_buffer_for_target(target);
-    if (!b) { mithril::state_set_error(GL_INVALID_OPERATION); return; }
+    if (size < 0) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
+        return;
+    }
+    auto b = bound_buffer_for_target(target);
+    if (!b) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_OPERATION));
+        return;
+    }
     b->size  = size;
     b->usage = usage;
     b->data.assign((size_t)size, 0);
@@ -111,10 +116,13 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
 void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
     MITHRIL_ENSURE_INIT();
     if (!data || size <= 0) return;
-    mithril::Buffer* b = bound_buffer_for_target(target);
-    if (!b) { mithril::state_set_error(GL_INVALID_OPERATION); return; }
+    auto b = bound_buffer_for_target(target);
+    if (!b) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_OPERATION));
+        return;
+    }
     if (offset < 0 || offset + size > b->size) {
-        mithril::state_set_error(GL_INVALID_VALUE);
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
         return;
     }
     std::memcpy(b->data.data() + offset, data, (size_t)size);
@@ -125,12 +133,15 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget,
                          GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size) {
     MITHRIL_ENSURE_INIT();
     if (size <= 0) return;
-    mithril::Buffer* src = bound_buffer_for_target(readTarget);
-    mithril::Buffer* dst = bound_buffer_for_target(writeTarget);
-    if (!src || !dst) { mithril::state_set_error(GL_INVALID_OPERATION); return; }
+    auto src = bound_buffer_for_target(readTarget);
+    auto dst = bound_buffer_for_target(writeTarget);
+    if (!src || !dst) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_OPERATION));
+        return;
+    }
     if (readOffset < 0 || writeOffset < 0 ||
         readOffset + size > src->size || writeOffset + size > dst->size) {
-        mithril::state_set_error(GL_INVALID_VALUE);
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
         return;
     }
     std::memmove(dst->data.data() + writeOffset, src->data.data() + readOffset, (size_t)size);
@@ -139,8 +150,11 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget,
 
 void* glMapBuffer(GLenum target, GLenum access) {
     MITHRIL_ENSURE_INIT();
-    mithril::Buffer* b = bound_buffer_for_target(target);
-    if (!b) { mithril::state_set_error(GL_INVALID_OPERATION); return nullptr; }
+    auto b = bound_buffer_for_target(target);
+    if (!b) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_OPERATION));
+        return nullptr;
+    }
     b->mapAccess  = access;
     b->mapOffset  = 0;
     b->mapLength  = b->size;
@@ -150,10 +164,13 @@ void* glMapBuffer(GLenum target, GLenum access) {
 
 void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     MITHRIL_ENSURE_INIT();
-    mithril::Buffer* b = bound_buffer_for_target(target);
-    if (!b) { mithril::state_set_error(GL_INVALID_OPERATION); return nullptr; }
+    auto b = bound_buffer_for_target(target);
+    if (!b) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_OPERATION));
+        return nullptr;
+    }
     if (offset < 0 || length <= 0 || offset + length > b->size) {
-        mithril::state_set_error(GL_INVALID_VALUE);
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
         return nullptr;
     }
     if (access & GL_MAP_INVALIDATE_BUFFER_BIT) {
@@ -168,7 +185,7 @@ void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitf
 
 GLboolean glUnmapBuffer(GLenum target) {
     MITHRIL_ENSURE_INIT();
-    mithril::Buffer* b = bound_buffer_for_target(target);
+    auto b = bound_buffer_for_target(target);
     if (!b || !b->mapped) return GL_FALSE;
     // Upload the (possibly) modified range to the VkBuffer.
     backend_buffer_upload(b->id, b->mapOffset, b->mapped, (size_t)b->mapLength);
@@ -178,7 +195,7 @@ GLboolean glUnmapBuffer(GLenum target) {
 
 void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length) {
     MITHRIL_ENSURE_INIT();
-    mithril::Buffer* b = bound_buffer_for_target(target);
+    auto b = bound_buffer_for_target(target);
     if (!b || !b->mapped) return;
     GLintptr base = b->mapOffset + offset;
     if (base < 0 || length <= 0 || base + length > b->size) return;
@@ -188,7 +205,7 @@ void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length)
 void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
     MITHRIL_ENSURE_INIT();
     if (!params) return;
-    mithril::Buffer* b = bound_buffer_for_target(target);
+    auto b = bound_buffer_for_target(target);
     if (!b) { *params = 0; return; }
     switch (pname) {
         case GL_BUFFER_SIZE:  *params = (GLint)b->size;  break;
@@ -201,7 +218,7 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {
 void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data) {
     MITHRIL_ENSURE_INIT();
     if (!data || size <= 0) return;
-    mithril::Buffer* b = bound_buffer_for_target(target);
+    auto b = bound_buffer_for_target(target);
     if (!b) return;
     if (offset < 0 || offset + size > b->size) return;
     std::memcpy(data, b->data.data() + offset, (size_t)size);

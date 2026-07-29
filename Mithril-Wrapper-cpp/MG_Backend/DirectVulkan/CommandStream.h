@@ -76,6 +76,20 @@ bool ensure_command_buffer_recording();
 // per-frame fence. Called by backend_commit() and backend_present_and_acquire().
 void commit_frame();
 
+/*
+ * Re-issue the dynamic vkCmdSet* state (viewport, scissor, blend constants,
+ * depth bias, line width, cull mode, front face, depth test) from the modular
+ * RenderState when its version counter has advanced since the last apply on
+ * the current command buffer; otherwise return without recording anything.
+ * Called by the draw entry points right before vkCmdDraw / vkCmdDrawIndexed.
+ * The last-applied version cache is invalidated at the start of every
+ * begin_render_pass() so the first draw of a freshly-begun command buffer
+ * always re-issues. Stencil and color-write-mask dynamic state are not
+ * applied here (the legacy backend kept them deferred/static); pipeline
+ * signature and descriptor-set rebuilds are handled separately.
+ */
+void apply_dynamic_state_if_dirty(VkCommandBuffer cmd);
+
 } // namespace vk
 } // namespace mithril
 

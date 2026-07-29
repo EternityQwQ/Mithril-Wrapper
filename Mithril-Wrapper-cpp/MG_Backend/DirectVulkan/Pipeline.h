@@ -83,8 +83,9 @@ std::unordered_map<GLuint, ProgramResources>& program_table();
 // Build (or fetch from cache) a VkPipeline for the given configuration.
 // All arguments mirror backend_get_or_create_pipeline() in Backend.h.
 //   color_write_mask : 4-bit RGBA mask (bit0=R, bit1=G, bit2=B, bit3=A) from
-//                      g_state->colorMask; part of the pipeline signature so
-//                      glColorMask changes create distinct pipelines.
+//                      g_state->GetRenderState().GetColorMask(); part of the
+//                      pipeline signature so glColorMask changes create
+//                      distinct pipelines.
 //   blend_src_alpha / blend_dst_alpha : GL blend factors for the alpha
 //                      channel (independent from RGB); part of the signature.
 VkPipeline get_or_create_pipeline(GLuint program,

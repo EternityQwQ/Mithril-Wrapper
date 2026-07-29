@@ -1,23 +1,35 @@
 // Mithril-Wrapper - MG_Impl/Texture.cpp
 // Texture object management: storage, upload, parameters, mipmap generation.
 //
-// This is the Vulkan/MoltenVK rewrite of the former gl/texture.cpp. The Metal
-// MTLTexture calls are replaced with the Vulkan backend C API
-// (backend_get_or_create_texture / backend_texture_upload /
-// backend_texture_set_params / backend_delete_texture) declared in
-// MG_Backend/Backend.h. Vulkan VkImage/VkImageView objects are owned by the
-// backend and keyed by GL texture name.
+// Migrated to the modular GLContext API: texture state lives in
+// mithril::glstate::TextureState (owned by g_state), per-name records are
+// mithril::glstate::TextureObject (SharedPtr-owned), the active texture unit
+// and per-unit bindings live on TextureState, the GL_PROXY_TEXTURE_2D query
+// state lives in ProxyTextureState, and the unpack pixel-store parameters live
+// on RenderState. The Vulkan backend C API (backend_get_or_create_texture /
+// backend_texture_upload / backend_texture_set_params / backend_delete_texture
+// / backend_transition_texture_layout / backend_generate_mipmaps) is unchanged.
 #include "includes.h"
+
+#include <vector>
 
 extern "C" {
 
+// Helper: the current GL_UNPACK_ALIGNMENT (used by backend_texture_upload to
+// interpret the host pixel rows). Migrated from the flat g_state->unpackAlignment
+// field to RenderState's typed PixelStoreParam slot.
+static int unpack_alignment() {
+    return g_state->GetRenderState().GetPixelStoreParam(
+        mithril::glstate::GLToPixelStoreParam(GL_UNPACK_ALIGNMENT));
+}
+
 void glGenTextures(GLsizei n, GLuint* textures) {
     MITHRIL_ENSURE_INIT();
-    mithril::state_gen_names("texture", n, textures);
+    if (n <= 0 || !textures) return;
+    std::vector<uint32_t> names;
+    g_state->GetTextureState().GenTextureNames(static_cast<uint32_t>(n), names);
     for (GLsizei i = 0; i < n; ++i) {
-        mithril::Texture t{};
-        t.id = textures[i];
-        g_state->textures[textures[i]] = t;
+        textures[i] = names[static_cast<size_t>(i)];
     }
 }
 
@@ -27,42 +39,37 @@ void glDeleteTextures(GLsizei n, const GLuint* textures) {
     for (GLsizei i = 0; i < n; ++i) {
         GLuint name = textures[i];
         if (name == 0) continue;
-        for (int u = 0; u < mithril::kMaxTextureUnits; ++u) {
-            if (g_state->boundTextures[u] == name) g_state->boundTextures[u] = 0;
-        }
+        // GL name-layer deletion: detaches the name from the object table and
+        // unbinds it from every texture unit (TextureState). The underlying
+        // VkImage + device memory is released by the backend disposal queue
+        // (backend_delete_texture) once in-flight GPU work completes.
+        g_state->GetTextureState().MarkTextureForDeletion(name);
         backend_delete_texture(name);
-        g_state->textures.erase(name);
     }
 }
 
 void glBindTexture(GLenum target, GLuint texture) {
     MITHRIL_ENSURE_INIT();
-    if (texture != 0 && !mithril::state_get_texture(texture)) {
-        g_state->textures[texture] = mithril::Texture{};
-        g_state->textures[texture].id = texture;
-    }
-    GLuint unit = g_state->activeTextureUnit;
-    if (unit < mithril::kMaxTextureUnits) {
-        g_state->boundTextures[unit] = texture;
-        g_state->boundTextureTargets[unit] = target;
-    }
-    if (mithril::Texture* t = mithril::state_get_texture(texture)) {
-        t->target = target;
-    }
+    g_state->GetTextureState().BindTexture(
+        mithril::glstate::GLToTextureTarget(target), texture);
 }
 
-static mithril::Texture* bound_texture_for_unit() {
-    GLuint unit = g_state->activeTextureUnit;
-    if (unit >= mithril::kMaxTextureUnits) return nullptr;
-    GLuint id = g_state->boundTextures[unit];
-    return mithril::state_get_texture(id);
+// Resolve the texture object bound to the active texture unit. Returns a null
+// SharedPtr when no texture is bound.
+static mithril::glstate::SharedPtr<mithril::glstate::TextureObject>
+bound_texture_for_unit() {
+    uint32_t unit = g_state->GetTextureState().GetActiveTextureUnit();
+    return g_state->GetTextureState().GetBoundTexture(unit);
 }
 
 void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
                   GLsizei width, GLsizei height, GLint border,
                   GLenum format, GLenum type, const void* pixels) {
     MITHRIL_ENSURE_INIT();
-    if (border != 0) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    if (border != 0) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
+        return;
+    }
 
     // GL_PROXY_TEXTURE_2D: no real texture is created. Just record the
     // requested dimensions so glGetTexLevelParameteriv can report them.
@@ -72,20 +79,22 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
         // Accept the size if it's within our reported GL_MAX_TEXTURE_SIZE.
         // A size of 0 means "unsupported" per the GL spec.
         GLint maxSize = 16384; // matches GL_MAX_TEXTURE_SIZE in Getter.cpp
+        mithril::glstate::ProxyTextureState& proxy =
+            g_state->GetTextureState().GetProxyTexture2D();
         if (width > 0 && height > 0 && width <= maxSize && height <= maxSize) {
-            g_state->proxyTexture2D.width  = width;
-            g_state->proxyTexture2D.height = height;
-            g_state->proxyTexture2D.internalFormat = internalFormat;
-            g_state->proxyTexture2D.valid = true;
+            proxy.width  = width;
+            proxy.height = height;
+            proxy.internalFormat = internalFormat;
+            proxy.valid = true;
         } else {
-            g_state->proxyTexture2D.valid = false;
-            g_state->proxyTexture2D.width = 0;
-            g_state->proxyTexture2D.height = 0;
+            proxy.valid = false;
+            proxy.width = 0;
+            proxy.height = 0;
         }
         return;
     }
 
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t) return;
     if (level == 0) {
         t->internalFormat = internalFormat;
@@ -99,7 +108,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
                                   internalFormat, target, 1);
     if (pixels) {
         backend_texture_upload(t->id, level, 0, 0, 0, width, height, 1,
-                               format, type, pixels, g_state->unpackAlignment);
+                               format, type, pixels, unpack_alignment());
     }
 }
 
@@ -107,8 +116,11 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
                   GLsizei width, GLsizei height, GLsizei depth, GLint border,
                   GLenum format, GLenum type, const void* pixels) {
     MITHRIL_ENSURE_INIT();
-    if (border != 0) { mithril::state_set_error(GL_INVALID_VALUE); return; }
-    mithril::Texture* t = bound_texture_for_unit();
+    if (border != 0) {
+        g_state->RecordError(mithril::glstate::ErrorState::GLToErrorCode(GL_INVALID_VALUE));
+        return;
+    }
+    auto t = bound_texture_for_unit();
     if (!t) return;
     if (level == 0) {
         t->internalFormat = internalFormat;
@@ -122,7 +134,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
                                   internalFormat, target, 1);
     if (pixels) {
         backend_texture_upload(t->id, level, 0, 0, 0, width, height, depth,
-                               format, type, pixels, g_state->unpackAlignment);
+                               format, type, pixels, unpack_alignment());
     }
 }
 
@@ -146,7 +158,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
 void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat,
                     GLsizei width, GLsizei height) {
     MITHRIL_ENSURE_INIT();
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t || levels <= 0) return;
     t->internalFormat = internalFormat;
     t->width  = width;
@@ -164,7 +176,7 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat,
 void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat,
                     GLsizei width, GLsizei height, GLsizei depth) {
     MITHRIL_ENSURE_INIT();
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t || levels <= 0) return;
     t->internalFormat = internalFormat;
     t->width  = width;
@@ -182,11 +194,11 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                      GLenum format, GLenum type, const void* pixels) {
     MITHRIL_ENSURE_INIT();
     (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t || !pixels) return;
     backend_texture_upload(t->id, level, xoffset, yoffset, 0,
                            width, height, 1, format, type, pixels,
-                           g_state->unpackAlignment);
+                           unpack_alignment());
 }
 
 void glTexSubImage3D(GLenum target, GLint level,
@@ -195,11 +207,11 @@ void glTexSubImage3D(GLenum target, GLint level,
                      GLenum format, GLenum type, const void* pixels) {
     MITHRIL_ENSURE_INIT();
     (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t || !pixels) return;
     backend_texture_upload(t->id, level, xoffset, yoffset, zoffset,
                            width, height, depth, format, type, pixels,
-                           g_state->unpackAlignment);
+                           unpack_alignment());
 }
 
 void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalformat,
@@ -207,7 +219,7 @@ void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalform
                              GLboolean fixedsamplelocations) {
     MITHRIL_ENSURE_INIT();
     (void)fixedsamplelocations;
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t) return;
     t->internalFormat = internalformat;
     t->width  = width;
@@ -220,7 +232,7 @@ void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalform
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
     MITHRIL_ENSURE_INIT();
     (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t) return;
     GLint p = (GLint)param;
     switch (pname) {
@@ -243,7 +255,7 @@ void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params) {
     MITHRIL_ENSURE_INIT();
     if (!params) return;
     if (pname == GL_TEXTURE_BORDER_COLOR) {
-        mithril::Texture* t = bound_texture_for_unit();
+        auto t = bound_texture_for_unit();
         if (!t) return;
         for (int i = 0; i < 4; ++i) t->borderColor[i] = params[i];
         backend_texture_set_params(t->id, t->minFilter, t->magFilter,
@@ -262,7 +274,7 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
 void glGenerateMipmap(GLenum target) {
     MITHRIL_ENSURE_INIT();
     (void)target;
-    mithril::Texture* t = bound_texture_for_unit();
+    auto t = bound_texture_for_unit();
     if (!t) return;
     // Compute mip level count if the app never called glTexStorage*(levels=N).
     // glGenerateMipmap is the legacy way to request a full mip chain: the

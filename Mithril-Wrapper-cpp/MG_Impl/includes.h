@@ -9,6 +9,7 @@
 
 #include "Log.h"
 #include "../MG_State/State.h"
+#include "../MG_State/GLState/RenderState/RenderStateEnumConverter.h"
 #include "Framebuffer.h"
 #include "../MG_Backend/Backend.h"
 

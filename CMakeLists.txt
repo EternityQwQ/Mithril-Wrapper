@@ -156,8 +156,25 @@ set(MITHRIL_SOURCES
     Mithril-Wrapper-cpp/MG_Impl/Debug.cpp
     Mithril-Wrapper-cpp/MG_Impl/lookup.cpp
 
-    # MG_State: GL state machine
+    # MG_State: GL state machine (modular GLContext + domain components)
     Mithril-Wrapper-cpp/MG_State/State.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/ErrorState/Error.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/RenderState/RenderState.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/RenderState/RenderStateEnumConverter.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/BufferState/BufferState.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/BufferState/BufferObject.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/VertexArrayState/VertexArrayState.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/VertexArrayState/VertexArrayObject.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/TextureState/TextureState.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/TextureState/TextureObject.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/TextureState/TextureUnit.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/ProgramState/ProgramState.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/ProgramState/ProgramObject.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/ProgramState/ShaderObject.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/FramebufferState/FramebufferState.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/FramebufferState/FramebufferObject.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/SamplerState/SamplerState.cpp
+    Mithril-Wrapper-cpp/MG_State/GLState/SamplerState/SamplerObject.cpp
 
     # MG_Backend: Vulkan 1.2 + MoltenVK direct backend (platform-agnostic core)
     Mithril-Wrapper-cpp/MG_Backend/DirectVulkan/Device.cpp

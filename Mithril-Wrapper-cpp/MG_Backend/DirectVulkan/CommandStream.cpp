@@ -56,6 +56,21 @@ EncoderState& encoder() {
     return s;
 }
 
+// Last-applied render-state version consumed by apply_dynamic_state_if_dirty()
+// to skip redundant vkCmdSet* re-issue when no GL state changed between draws.
+// Initialized to the sentinel 0xFFFF so the very first draw (whose version is
+// typically small) re-issues unconditionally. Invalidated to 0xFFFF at the
+// start of each begin_render_pass() so the first draw of a freshly-begun
+// command buffer (new frame slot, post-reset) re-issues even when the version
+// is unchanged — dynamic state does not carry across vkResetCommandBuffer.
+struct AppliedStateVersions {
+    uint16_t renderState = 0xFFFF;  // RenderState::GetVersion()
+};
+AppliedStateVersions& applied_versions() {
+    static AppliedStateVersions s;
+    return s;
+}
+
 /*
  * Record an image-memory barrier transitioning `image` from `oldLayout` to
  * `newLayout` on the active command buffer. Used by begin_render_pass() /
@@ -165,6 +180,116 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
 }
 
 } // namespace
+
+/*
+ * Re-issue the dynamic vkCmdSet* state (viewport, scissor, blend constants,
+ * depth bias, line width, cull mode, front face, depth test) from the modular
+ * RenderState, but only when RenderState::GetVersion() has advanced since the
+ * last apply. This is the draw-path side of the OpenGL state-machine cutover:
+ * the GL entry-point layer (MG_Impl) only mutates g_state->GetRenderState()
+ * (bumping its version on real change) and no longer calls backend_set_*; the
+ * backend therefore re-reads the typed render state here, right before a draw,
+ * and skips the vkCmdSet* blast when nothing changed.
+ *
+ * Scope: dynamic vkCmdSet* state only. Pipeline-signature / descriptor-set
+ * rebuilds are handled separately (Task 22). Stencil and color-write-mask
+ * dynamic state are intentionally NOT applied here — the legacy backend kept
+ * stencil deferred (backend_set_stencil_state was a no-op) and color-write
+ * mask static (a VkPipelineColorBlendAttachmentState field); this migration
+ * preserves that behaviour.
+ *
+ * The version cache is invalidated (reset to the 0xFFFF sentinel) at the start
+ * of every begin_render_pass(), so the first draw after a command-buffer
+ * reset (new frame slot / device-lost / submit-failure recovery) always
+ * re-issues.
+ */
+void apply_dynamic_state_if_dirty(VkCommandBuffer cmd) {
+    if (!cmd || !mithril::g_state) return;
+    auto& rs = mithril::g_state->GetRenderState();
+    uint16_t currentVersion = rs.GetVersion();
+    auto& applied = applied_versions();
+    if (currentVersion == applied.renderState) {
+        return;  // no render-state change since the last apply on this buffer
+    }
+
+    // ---- Viewport (combines the GL viewport rect + depth range) ----
+    auto vp = rs.GetViewport();
+    float znear = 0.0f, zfar = 1.0f;
+    rs.GetDepthRange(znear, zfar);
+    VkViewport vkvp{};
+    vkvp.x        = (float)vp.x;
+    vkvp.y        = (float)vp.y;
+    vkvp.width    = (float)vp.w;
+    vkvp.height   = (float)vp.h;
+    vkvp.minDepth = znear;
+    vkvp.maxDepth = zfar;
+    vkCmdSetViewport(cmd, 0, 1, &vkvp);
+
+    // ---- Scissor (the GL scissor box). backend_set_scissor always applied
+    //      the last glScissor rect regardless of the GL_SCISSOR_TEST enable,
+    //      so the scissor-test enable/disable at the Vulkan scissor-rect level
+    //      is unchanged from the legacy behaviour. ----
+    auto box = rs.GetScissorBox();
+    VkRect2D sc{};
+    sc.offset.x      = box.x;
+    sc.offset.y      = box.y;
+    sc.extent.width   = (uint32_t)box.w;
+    sc.extent.height  = (uint32_t)box.h;
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+
+    // ---- Blend constants ----
+    vkCmdSetBlendConstants(cmd, rs.GetBlendColor());
+
+    // ---- Depth bias (polygon offset). The legacy backend_set_depth_bias
+    //      applied only the constant factor (units) with a zero slope factor;
+    //      this migration preserves that behaviour rather than silently
+    //      enabling slope-scaled bias, which would change rendering. ----
+    vkCmdSetDepthBias(cmd, rs.GetPolygonOffsetUnits(), 0.0f, 0.0f);
+
+    // ---- Line width ----
+    vkCmdSetLineWidth(cmd, rs.GetLineWidth());
+
+    // ---- Cull mode (gated on the GL_CULL_FACE capability, matching the
+    //      legacy Drawing.cpp which passed VK_CULL_MODE_NONE when culling
+    //      was disabled) ----
+    VkCullModeFlags cull = VK_CULL_MODE_NONE;
+    if (rs.IsCapabilityEnabled(mithril::glstate::CapabilityInput::CullFace)) {
+        switch (rs.GetCullFaceMode()) {
+            case mithril::glstate::CullFaceMode::Front:        cull = VK_CULL_MODE_FRONT_BIT; break;
+            case mithril::glstate::CullFaceMode::Back:         cull = VK_CULL_MODE_BACK_BIT; break;
+            case mithril::glstate::CullFaceMode::FrontAndBack: cull = VK_CULL_MODE_FRONT_AND_BACK; break;
+            default: cull = VK_CULL_MODE_NONE; break;
+        }
+    }
+    vkCmdSetCullMode(cmd, cull);
+
+    // ---- Front face ----
+    VkFrontFace ff = (rs.GetFrontFaceMode() == mithril::glstate::FrontFaceMode::Clockwise)
+                         ? VK_FRONT_FACE_CLOCKWISE
+                         : VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    vkCmdSetFrontFace(cmd, ff);
+
+    // ---- Depth test (enable from the GL_DEPTH_TEST capability, write mask
+    //      from DepthMask, compare op from DepthFunc) ----
+    vkCmdSetDepthTestEnable(cmd, rs.IsCapabilityEnabled(
+        mithril::glstate::CapabilityInput::DepthTest) ? VK_TRUE : VK_FALSE);
+    vkCmdSetDepthWriteEnable(cmd, rs.GetDepthMask() ? VK_TRUE : VK_FALSE);
+    VkCompareOp cmp = VK_COMPARE_OP_LESS;
+    switch (rs.GetDepthFunc()) {
+        case mithril::glstate::DepthTestFunc::Never:        cmp = VK_COMPARE_OP_NEVER; break;
+        case mithril::glstate::DepthTestFunc::Less:         cmp = VK_COMPARE_OP_LESS; break;
+        case mithril::glstate::DepthTestFunc::Equal:        cmp = VK_COMPARE_OP_EQUAL; break;
+        case mithril::glstate::DepthTestFunc::LessEqual:    cmp = VK_COMPARE_OP_LESS_OR_EQUAL; break;
+        case mithril::glstate::DepthTestFunc::Greater:      cmp = VK_COMPARE_OP_GREATER; break;
+        case mithril::glstate::DepthTestFunc::NotEqual:     cmp = VK_COMPARE_OP_NOT_EQUAL; break;
+        case mithril::glstate::DepthTestFunc::GreaterEqual: cmp = VK_COMPARE_OP_GREATER_OR_EQUAL; break;
+        case mithril::glstate::DepthTestFunc::Always:       cmp = VK_COMPARE_OP_ALWAYS; break;
+        default: cmp = VK_COMPARE_OP_LESS; break;
+    }
+    vkCmdSetDepthCompareOp(cmd, cmp);
+
+    applied.renderState = currentVersion;
+}
 
 bool render_pass_active() { return encoder().passActive; }
 
@@ -279,6 +404,15 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     if (!b->initialized || !b->commandBuffer) return;
     EncoderState& e = encoder();
     if (e.passActive) return;  // coalesce draws into one pass
+
+    // Invalidate the cached last-applied render-state version so the first
+    // draw of this pass re-issues all vkCmdSet* dynamic state. The command
+    // buffer may have been reset+begun since the last pass (new frame slot,
+    // device-lost / vkEndCommandBuffer / vkQueueSubmit failure recovery),
+    // in which case the previously-recorded dynamic state is gone. The
+    // version-gated apply_dynamic_state_if_dirty() in the draw path must
+    // therefore re-issue unconditionally on the first draw of each pass.
+    applied_versions().renderState = 0xFFFF;
 
     // Ensure the current slot's command buffer is in the recording state.
     // After commit_frame() submits slot N and advances to slot N+1, the
@@ -576,11 +710,15 @@ void clear_attachments(uint32_t mask, int x, int y, int w, int h) {
     // attachment causes a spec violation (VUID-vkCmdClearAttachments-pRects-00016)
     // and can crash MoltenVK's IOSurfaceBindAccel on iOS.
     VkClearRect rect{};
-    if (mithril::g_state && mithril::g_state->scissorTest) {
-        rect.rect.offset.x = mithril::g_state->scissorX;
-        rect.rect.offset.y = mithril::g_state->scissorY;
-        rect.rect.extent.width = (uint32_t)mithril::g_state->scissorW;
-        rect.rect.extent.height = (uint32_t)mithril::g_state->scissorH;
+    const bool scissorEnabled = mithril::g_state &&
+        mithril::g_state->GetRenderState().IsCapabilityEnabled(
+            mithril::glstate::CapabilityInput::ScissorTest);
+    if (scissorEnabled) {
+        auto box = mithril::g_state->GetRenderState().GetScissorBox();  // IntRect { x, y, w, h }
+        rect.rect.offset.x = box.x;
+        rect.rect.offset.y = box.y;
+        rect.rect.extent.width = (uint32_t)box.w;
+        rect.rect.extent.height = (uint32_t)box.h;
         // Clamp scissor rect to the render pass's effective dimensions
         // (e.width/e.height, already clamped to drawable/swapchain size).
         // A scissor rect extending past the IOSurface causes the same
@@ -1268,6 +1406,7 @@ void backend_draw_arrays(int primitive, int first, int count) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
+    mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     vkCmdDraw(b->commandBuffer, (uint32_t)count, 1, (uint32_t)first, 0);
 }
 
@@ -1276,6 +1415,7 @@ void backend_draw_indexed(int primitive, int count, int index_type,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !index_buffer) return;
+    mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     VkIndexType t = (index_type == 1) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     vkCmdBindIndexBuffer(b->commandBuffer, index_buffer, index_offset, t);
     vkCmdDrawIndexed(b->commandBuffer, (uint32_t)count, 1, 0, 0, 0);
@@ -1285,6 +1425,7 @@ void backend_draw_arrays_instanced(int primitive, int first, int count, int prim
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
+    mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     vkCmdDraw(b->commandBuffer, (uint32_t)count, (uint32_t)primcount, (uint32_t)first, 0);
 }
 
@@ -1294,6 +1435,7 @@ void backend_draw_indexed_instanced(int primitive, int count, int index_type,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !index_buffer) return;
+    mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     VkIndexType t = (index_type == 1) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     vkCmdBindIndexBuffer(b->commandBuffer, index_buffer, index_offset, t);
     vkCmdDrawIndexed(b->commandBuffer, (uint32_t)count, (uint32_t)primcount, 0, 0, 0);

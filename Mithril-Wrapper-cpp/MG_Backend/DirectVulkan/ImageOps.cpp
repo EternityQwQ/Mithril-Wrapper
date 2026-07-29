@@ -244,17 +244,18 @@ int read_pixels(int x, int y, int w, int h, GLenum format, GLenum type, void* ou
     VkImage src_image = VK_NULL_HANDLE;
     VkFormat src_fmt = VK_FORMAT_UNDEFINED;
 
-    if (g_state->currentDrawFBO == 0) {
+    auto& fbs = g_state->GetFramebufferState();
+    if (fbs.GetCurrentDrawFBO() == 0) {
         // EGL default framebuffer: read directly from the swapchain image.
         // The EGL layer installs both the VkImageView and the underlying
-        // VkImage + format on g_state when a surface is made current.
-        src_image = g_state->eglDefaultColorImage;
-        src_fmt   = g_state->eglDefaultColorFormat;
+        // VkImage + format on FramebufferState when a surface is made current.
+        src_image = fbs.eglDefaultColorImage;
+        src_fmt   = fbs.eglDefaultColorFormat;
     } else {
-        mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentDrawFBO);
+        auto fbo = fbs.GetCurrentDrawFramebuffer();
         if (!fbo || !fbo->colors[0].texture) return 0;
         src_image = backend_get_texture_image(fbo->colors[0].texture);
-        mithril::Texture* t = mithril::state_get_texture(fbo->colors[0].texture);
+        auto t = g_state->GetTextureState().GetTextureObject(fbo->colors[0].texture);
         if (t) src_fmt = gl_internal_to_vk((GLenum)t->internalFormat);
     }
     if (src_image == VK_NULL_HANDLE) return 0;

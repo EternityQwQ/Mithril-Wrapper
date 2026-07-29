@@ -14,8 +14,9 @@ namespace mithril {
 // Resolve the current draw framebuffer's attachments into Vulkan image views.
 // For user FBOs, each color attachment's VkImageView comes from
 // backend_get_texture_view(); for the EGL default framebuffer (FBO 0), the
-// swapchain color/depth views installed on g_state->eglDefaultColor/Depth are
-// returned. Returns the number of valid color attachments (<=8).
+// swapchain color/depth views installed on
+// g_state->GetFramebufferState().eglDefaultColor/Depth are returned. Returns
+// the number of valid color attachments (<=8).
 //   out_color[8] : filled with color VkImageViews (VK_NULL_HANDLE allowed)
 //   *out_depth   : depth VkImageView (VK_NULL_HANDLE if none)
 //   *out_w/*out_h: render area (from FBO 0's EGL surface or the first color tex)

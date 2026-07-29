@@ -24,7 +24,7 @@ extern "C" {
 
 static void prepare_draw(GLenum mode) {
     // Resolve current program + its SPIR-V.
-    mithril::Program* prog = mithril::state_get_program(g_state->currentProgram);
+    auto prog = g_state->GetProgramState().GetCurrentProgram();
     if (!prog || !prog->linked) return;
     // Defensive: skip draws whose shader translation produced no SPIR-V
     // (e.g. glslang failed on an unrecognised construct). Issuing the draw
@@ -62,21 +62,21 @@ static void prepare_draw(GLenum mode) {
 
     // Compute color attachment VkFormats.
     VkFormat color_formats[8] = {VK_FORMAT_UNDEFINED};
-    mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentDrawFBO);
-    if (fbo) {
+    auto fbo = g_state->GetFramebufferState().GetCurrentDrawFramebuffer();
+    if (fbo && fbo->id != 0) {
         for (int i = 0; i < color_count; ++i) {
             GLuint t = fbo->colors[i].texture;
-            mithril::Texture* tex = mithril::state_get_texture(t);
+            auto tex = g_state->GetTextureState().GetTextureObject(t);
             if (tex) color_formats[i] = backend_vk_format_for_gl((GLenum)tex->internalFormat);
         }
     } else {
         // EGL default framebuffer: read the swapchain's actual color format
-        // from g_state->eglDefaultColorFormat (set by install_surface_on_state
-        // after each acquire). Hardcoding VK_FORMAT_B8G8R8A8_UNORM would
-        // mismatch if MoltenVK picked a different surface format (e.g. RGBA8
-        // or an sRGB variant), causing a pipeline-creation failure on the
-        // first draw and a black screen.
-        VkFormat swapchainFmt = g_state->eglDefaultColorFormat;
+        // from FramebufferState::eglDefaultColorFormat (set by
+        // install_surface_on_state after each acquire). Hardcoding
+        // VK_FORMAT_B8G8R8A8_UNORM would mismatch if MoltenVK picked a
+        // different surface format (e.g. RGBA8 or an sRGB variant), causing a
+        // pipeline-creation failure on the first draw and a black screen.
+        VkFormat swapchainFmt = g_state->GetFramebufferState().eglDefaultColorFormat;
         if (swapchainFmt == VK_FORMAT_UNDEFINED) {
             // Fallback for headless / surfaceless mode where no swapchain is
             // attached. BGRA8Unorm matches MoltenVK's most common default.
@@ -94,8 +94,8 @@ static void prepare_draw(GLenum mode) {
     // the GL texture table. For user FBOs, derive the VkFormat from the GL
     // internalFormat.
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
-    if (fbo && fbo->depth.texture) {
-        mithril::Texture* dt = mithril::state_get_texture(fbo->depth.texture);
+    if (fbo && fbo->id != 0 && fbo->depth.texture) {
+        auto dt = g_state->GetTextureState().GetTextureObject(fbo->depth.texture);
         if (dt) depth_format = backend_vk_format_for_gl((GLenum)dt->internalFormat);
     } else if (depth_view != VK_NULL_HANDLE) {
         // EGL default framebuffer: depth is always D32_SFLOAT_S8_UINT.
@@ -103,12 +103,11 @@ static void prepare_draw(GLenum mode) {
     }
 
     // Build the vertex attribute descriptor array for the pipeline signature.
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
-    if (!vao) vao = mithril::state_get_vao(0);
-    MGVertexAttrib attribs[mithril::kMaxVertexAttribs];
+    auto vao = g_state->GetVertexArrayState().GetCurrentVertexArray();
+    MGVertexAttrib attribs[mithril::glstate::kMaxVertexAttribs];
     int attrib_count = 0;
-    for (int i = 0; i < mithril::kMaxVertexAttribs; ++i) {
-        const mithril::VertexAttrib& a = vao->attribs[i];
+    for (int i = 0; i < mithril::glstate::kMaxVertexAttribs; ++i) {
+        const mithril::glstate::VertexAttrib& a = vao->attribs[i];
         if (!a.enabled) continue;
         MGVertexAttrib& m = attribs[attrib_count++];
         m.location     = i;
@@ -128,11 +127,14 @@ static void prepare_draw(GLenum mode) {
     // pipeline (root cause I+J: previously only blend_enabled/src/dst were in
     // the signature and colorWriteMask was hardcoded RGBA-all-on, so different
     // blend/mask configs collided in the cache and glColorMask was a no-op).
+    mithril::glstate::BoolVec4 cwm = g_state->GetRenderState().GetColorMask();
     int cwm_bits = 0;
-    if (g_state->colorMask[0]) cwm_bits |= 1;
-    if (g_state->colorMask[1]) cwm_bits |= 2;
-    if (g_state->colorMask[2]) cwm_bits |= 4;
-    if (g_state->colorMask[3]) cwm_bits |= 8;
+    if (cwm.v[0]) cwm_bits |= 1;
+    if (cwm.v[1]) cwm_bits |= 2;
+    if (cwm.v[2]) cwm_bits |= 4;
+    if (cwm.v[3]) cwm_bits |= 8;
+    mithril::glstate::BlendFactor bsRGB, bdRGB, bsA, bdA;
+    g_state->GetRenderState().GetBlendFunc(bsRGB, bdRGB, bsA, bdA);
     VkPipeline pipeline = backend_get_or_create_pipeline(
         prog->id,
         prog->vertexSpirv.data(),   (int)prog->vertexSpirv.size(),
@@ -140,11 +142,11 @@ static void prepare_draw(GLenum mode) {
         attribs, attrib_count,
         color_formats, color_count,
         depth_format,
-        g_state->blend ? 1 : 0,
-        g_state->blendSrcRGB,
-        g_state->blendDstRGB,
-        g_state->blendSrcA,
-        g_state->blendDstA,
+        g_state->GetRenderState().IsCapabilityEnabled(mithril::glstate::CapabilityInput::Blend) ? 1 : 0,
+        mithril::glstate::BlendFactorToGL(bsRGB),
+        mithril::glstate::BlendFactorToGL(bdRGB),
+        mithril::glstate::BlendFactorToGL(bsA),
+        mithril::glstate::BlendFactorToGL(bdA),
         cwm_bits,
         mode);
     if (pipeline == VK_NULL_HANDLE) return;
@@ -160,48 +162,49 @@ static void prepare_draw(GLenum mode) {
     // the upcoming draw. The set is built per-draw from Program.uniforms +
     // g_state->boundTextures by DescriptorSet.cpp.
     backend_bind_program_descriptors(prog->id);
-    backend_set_viewport(g_state->viewportX, g_state->viewportY,
-                         g_state->viewportW, g_state->viewportH,
-                         g_state->depthNear, g_state->depthFar);
+    mithril::glstate::IntRect vp = g_state->GetRenderState().GetViewport();
+    float dn, df;
+    g_state->GetRenderState().GetDepthRange(dn, df);
+    backend_set_viewport(vp.x, vp.y, vp.w, vp.h, dn, df);
     // FIX (root cause G): ALWAYS set the scissor. VK_DYNAMIC_STATE_SCISSOR is
     // a dynamic state (Pipeline.cpp), so it MUST be set via vkCmdSetScissor
     // before drawing. When scissorTest is disabled, the old code skipped the
     // call entirely, leaving the dynamic scissor at its undefined default
     // (0,0,0,0) — which clips ALL pixels → black screen. MobileGL always
     // sets a scissor (full viewport when GL_SCISSOR_TEST is off).
-    if (g_state->scissorTest) {
-        backend_set_scissor(g_state->scissorX, g_state->scissorY,
-                            g_state->scissorW, g_state->scissorH);
+    if (g_state->GetRenderState().IsCapabilityEnabled(mithril::glstate::CapabilityInput::ScissorTest)) {
+        mithril::glstate::IntRect sb = g_state->GetRenderState().GetScissorBox();
+        backend_set_scissor(sb.x, sb.y, sb.w, sb.h);
     } else {
-        backend_set_scissor(0, 0, g_state->viewportW, g_state->viewportH);
+        backend_set_scissor(0, 0, vp.w, vp.h);
     }
     // FIX (root cause H): ALWAYS set cull mode. VK_DYNAMIC_STATE_CULL_MODE is
     // dynamic; skipping the call when cullFace is disabled leaves the previous
     // draw's cull mode active → stale culling culls geometry incorrectly.
     // When cullFace is off, explicitly set VK_CULL_MODE_NONE.
-    if (g_state->cullFace) {
+    if (g_state->GetRenderState().IsCapabilityEnabled(mithril::glstate::CapabilityInput::CullFace)) {
+        mithril::glstate::CullFaceMode cm = g_state->GetRenderState().GetCullFaceMode();
         int mode_cull = 0;
-        if (g_state->cullMode == GL_FRONT) mode_cull = 1;
-        else if (g_state->cullMode == GL_BACK) mode_cull = 2;
+        if (cm == mithril::glstate::CullFaceMode::Front) mode_cull = 1;
+        else if (cm == mithril::glstate::CullFaceMode::Back) mode_cull = 2;
         backend_set_cull_mode(mode_cull);
-        backend_set_front_face(g_state->frontFace == GL_CCW ? 1 : 0);
+        backend_set_front_face(g_state->GetRenderState().GetFrontFaceMode() == mithril::glstate::FrontFaceMode::CounterClockwise ? 1 : 0);
     } else {
         backend_set_cull_mode(0);  // VK_CULL_MODE_NONE
     }
     backend_set_color_write_mask(
-        g_state->colorMask[0], g_state->colorMask[1],
-        g_state->colorMask[2], g_state->colorMask[3]);
+        cwm.v[0] ? 1 : 0, cwm.v[1] ? 1 : 0,
+        cwm.v[2] ? 1 : 0, cwm.v[3] ? 1 : 0);
     backend_set_depth_test(
-        g_state->depthTest ? 1 : 0,
-        g_state->depthMask ? 1 : 0,
-        (int)g_state->depthFunc);
-    if (g_state->polygonOffsetFill) {
-        backend_set_depth_bias(g_state->polygonOffsetUnits, 0.0f);
+        g_state->GetRenderState().IsCapabilityEnabled(mithril::glstate::CapabilityInput::DepthTest) ? 1 : 0,
+        g_state->GetRenderState().GetDepthMask() ? 1 : 0,
+        (int)mithril::glstate::DepthTestFuncToGL(g_state->GetRenderState().GetDepthFunc()));
+    if (g_state->GetRenderState().IsCapabilityEnabled(mithril::glstate::CapabilityInput::PolygonOffsetFill)) {
+        backend_set_depth_bias(g_state->GetRenderState().GetPolygonOffsetUnits(), 0.0f);
     }
-    if (g_state->blend) {
-        backend_set_blend_color(
-            g_state->blendColor[0], g_state->blendColor[1],
-            g_state->blendColor[2], g_state->blendColor[3]);
+    if (g_state->GetRenderState().IsCapabilityEnabled(mithril::glstate::CapabilityInput::Blend)) {
+        const float* bc = g_state->GetRenderState().GetBlendColor();
+        backend_set_blend_color(bc[0], bc[1], bc[2], bc[3]);
     }
 
     // Bind vertex buffers — one VkBuffer per enabled attribute, at index
@@ -278,7 +281,7 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices
     MITHRIL_ENSURE_INIT();
     prepare_draw(mode);
     // If a VBO is bound for GL_ELEMENT_ARRAY_BUFFER, indices is an offset into it.
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    auto vao = g_state->GetVertexArrayState().GetCurrentVertexArray();
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
     VkBuffer ib = backend_get_buffer(ib_name);
     if (ib != VK_NULL_HANDLE) {
@@ -309,7 +312,7 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
                              const void* indices, GLsizei primcount) {
     MITHRIL_ENSURE_INIT();
     prepare_draw(mode);
-    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    auto vao = g_state->GetVertexArrayState().GetCurrentVertexArray();
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
     VkBuffer ib = backend_get_buffer(ib_name);
     if (ib != VK_NULL_HANDLE) {

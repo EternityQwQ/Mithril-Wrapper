@@ -7,6 +7,9 @@
 // / metal_commit / ...) are replaced with the Vulkan backend C API
 // (backend_set_clear_color / backend_begin_render_pass / backend_commit / ...)
 // declared in MG_Backend/Backend.h.
+//
+// State access goes through the modular GLContext domain accessors
+// (GetRenderState / GetTextureState) instead of the former flat GLState fields.
 #include "includes.h"
 #include "Framebuffer.h"
 
@@ -15,16 +18,14 @@ extern "C" {
 /* ---- Clear ---- */
 void glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
     MITHRIL_ENSURE_INIT();
-    g_state->clearColor[0] = r;
-    g_state->clearColor[1] = g;
-    g_state->clearColor[2] = b;
-    g_state->clearColor[3] = a;
+    float c[4] = {r, g, b, a};
+    g_state->GetRenderState().SetClearColor(c);
     backend_set_clear_color(r, g, b, a);
 }
 
 void glClearDepth(GLclampd d) {
     MITHRIL_ENSURE_INIT();
-    g_state->clearDepth = d;
+    g_state->GetRenderState().SetClearDepth(static_cast<float>(d));
     backend_set_clear_depth(d);
 }
 
@@ -34,7 +35,7 @@ void glClearDepthf(GLclampf d) {
 
 void glClearStencil(GLint s) {
     MITHRIL_ENSURE_INIT();
-    g_state->clearStencil = s;
+    g_state->GetRenderState().SetClearStencil(static_cast<uint32_t>(s));
     backend_set_clear_stencil(s);
 }
 
@@ -62,51 +63,26 @@ void glClear(GLbitfield mask) {
 /* ---- Enable / Disable ---- */
 void glEnable(GLenum cap) {
     MITHRIL_ENSURE_INIT();
-    g_state->enabledCaps.insert(cap);
-    switch (cap) {
-        case GL_DEPTH_TEST:    g_state->depthTest = true; break;
-        case GL_BLEND:         g_state->blend = true; break;
-        case GL_STENCIL_TEST:  g_state->stencilTest = true; break;
-        case GL_CULL_FACE:     g_state->cullFace = true; break;
-        case GL_SCISSOR_TEST:  g_state->scissorTest = true; break;
-        case GL_DITHER:        g_state->dither = true; break;
-        case GL_MULTISAMPLE:   g_state->multisample = true; break;
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: g_state->sampleAlphaToCoverage = true; break;
-        case GL_SAMPLE_COVERAGE:          g_state->sampleCoverage = true; break;
-        case GL_POLYGON_OFFSET_FILL:      g_state->polygonOffsetFill = true; break;
-        case GL_PROGRAM_POINT_SIZE:       g_state->programPointSize = true; break;
-        case GL_PRIMITIVE_RESTART:        g_state->primitiveRestart = true; break;
-        case GL_FRAMEBUFFER_SRGB:         g_state->framebufferSRGB = true; break;
-        default: break;
-    }
+    g_state->GetRenderState().SetCapability(
+        mithril::glstate::GLToCapabilityInput(cap), true);
 }
 
 void glDisable(GLenum cap) {
     MITHRIL_ENSURE_INIT();
-    g_state->enabledCaps.erase(cap);
-    switch (cap) {
-        case GL_DEPTH_TEST:    g_state->depthTest = false; break;
-        case GL_BLEND:         g_state->blend = false; break;
-        case GL_STENCIL_TEST:  g_state->stencilTest = false; break;
-        case GL_CULL_FACE:     g_state->cullFace = false; break;
-        case GL_SCISSOR_TEST:  g_state->scissorTest = false; break;
-        case GL_DITHER:        g_state->dither = false; break;
-        case GL_MULTISAMPLE:   g_state->multisample = false; break;
-        case GL_SAMPLE_ALPHA_TO_COVERAGE: g_state->sampleAlphaToCoverage = false; break;
-        case GL_SAMPLE_COVERAGE:          g_state->sampleCoverage = false; break;
-        case GL_POLYGON_OFFSET_FILL:      g_state->polygonOffsetFill = false; break;
-        case GL_PROGRAM_POINT_SIZE:       g_state->programPointSize = false; break;
-        case GL_PRIMITIVE_RESTART:        g_state->primitiveRestart = false; break;
-        case GL_FRAMEBUFFER_SRGB:         g_state->framebufferSRGB = false; break;
-        default: break;
-    }
+    g_state->GetRenderState().SetCapability(
+        mithril::glstate::GLToCapabilityInput(cap), false);
 }
 
 GLboolean glIsEnabled(GLenum cap) {
     MITHRIL_ENSURE_INIT();
-    return g_state->enabledCaps.count(cap) ? GL_TRUE : GL_FALSE;
+    return g_state->GetRenderState().IsCapabilityEnabled(
+        mithril::glstate::GLToCapabilityInput(cap)) ? GL_TRUE : GL_FALSE;
 }
 
+// Indexed capability toggles are kept as the historical simplified broadcast
+// (glEnable(cap) ignores the index). Specialising GL_BLEND to a per-buffer
+// enable would require splitting the main blend switch and is left for a
+// later pass; the broadcast matches the previous behaviour exactly.
 void glEnablei(GLenum cap, GLuint index) { (void)index; glEnable(cap); }
 void glDisablei(GLenum cap, GLuint index) { (void)index; glDisable(cap); }
 GLboolean glIsEnabledi(GLenum cap, GLuint index) { (void)index; return glIsEnabled(cap); }
@@ -114,186 +90,193 @@ GLboolean glIsEnabledi(GLenum cap, GLuint index) { (void)index; return glIsEnabl
 /* ---- Viewport / scissor / depth range ---- */
 void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) {
     MITHRIL_ENSURE_INIT();
-    g_state->viewportX = x;
-    g_state->viewportY = y;
-    g_state->viewportW = w;
-    g_state->viewportH = h;
+    g_state->GetRenderState().SetViewport(x, y, w, h);
 }
 
 void glDepthRange(GLclampd n, GLclampd f) {
     MITHRIL_ENSURE_INIT();
-    g_state->depthNear = n;
-    g_state->depthFar  = f;
+    g_state->GetRenderState().SetDepthRange(static_cast<float>(n),
+                                            static_cast<float>(f));
 }
 
 void glDepthRangef(GLclampf n, GLclampf f) { glDepthRange((GLclampd)n, (GLclampd)f); }
 
 void glScissor(GLint x, GLint y, GLsizei w, GLsizei h) {
     MITHRIL_ENSURE_INIT();
-    g_state->scissorX = x;
-    g_state->scissorY = y;
-    g_state->scissorW = w;
-    g_state->scissorH = h;
+    g_state->GetRenderState().SetScissorBox(x, y, w, h);
 }
 
 /* ---- Blend ---- */
 void glBlendFunc(GLenum sf, GLenum df) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendSrcRGB = g_state->blendSrcA = sf;
-    g_state->blendDstRGB = g_state->blendDstA = df;
+    mithril::glstate::BlendFactor s = mithril::glstate::GLToBlendFactor(sf);
+    mithril::glstate::BlendFactor d = mithril::glstate::GLToBlendFactor(df);
+    g_state->GetRenderState().SetBlendFunc(s, d, s, d);
 }
 
 void glBlendFuncSeparate(GLenum sRGB, GLenum dRGB, GLenum sA, GLenum dA) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendSrcRGB = sRGB; g_state->blendDstRGB = dRGB;
-    g_state->blendSrcA   = sA;   g_state->blendDstA   = dA;
+    g_state->GetRenderState().SetBlendFunc(
+        mithril::glstate::GLToBlendFactor(sRGB),
+        mithril::glstate::GLToBlendFactor(dRGB),
+        mithril::glstate::GLToBlendFactor(sA),
+        mithril::glstate::GLToBlendFactor(dA));
 }
 
 void glBlendEquation(GLenum mode) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendEqRGB = g_state->blendEqA = mode;
+    mithril::glstate::BlendEquation m = mithril::glstate::GLToBlendEquation(mode);
+    g_state->GetRenderState().SetBlendEquation(m, m);
 }
 
 void glBlendEquationSeparate(GLenum mRGB, GLenum mA) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendEqRGB = mRGB;
-    g_state->blendEqA   = mA;
+    g_state->GetRenderState().SetBlendEquation(
+        mithril::glstate::GLToBlendEquation(mRGB),
+        mithril::glstate::GLToBlendEquation(mA));
 }
 
 void glBlendColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
     MITHRIL_ENSURE_INIT();
-    g_state->blendColor[0] = r;
-    g_state->blendColor[1] = g;
-    g_state->blendColor[2] = b;
-    g_state->blendColor[3] = a;
+    float c[4] = {r, g, b, a};
+    g_state->GetRenderState().SetBlendColor(c);
 }
 
-void glBlendFunci(GLuint buf, GLenum src, GLenum dst) { (void)buf; glBlendFunc(src, dst); }
-void glBlendFuncSeparatei(GLuint buf, GLenum sR, GLenum dR, GLenum sA, GLenum dA) {
-    (void)buf; glBlendFuncSeparate(sR, dR, sA, dA);
+void glBlendFunci(GLuint buf, GLenum src, GLenum dst) {
+    MITHRIL_ENSURE_INIT();
+    mithril::glstate::BlendFactor s = mithril::glstate::GLToBlendFactor(src);
+    mithril::glstate::BlendFactor d = mithril::glstate::GLToBlendFactor(dst);
+    g_state->GetRenderState().SetBlendFuncIndexed(buf, s, d, s, d);
 }
-void glBlendEquationi(GLuint buf, GLenum mode) { (void)buf; glBlendEquation(mode); }
+void glBlendFuncSeparatei(GLuint buf, GLenum sR, GLenum dR, GLenum sA, GLenum dA) {
+    MITHRIL_ENSURE_INIT();
+    g_state->GetRenderState().SetBlendFuncIndexed(
+        buf,
+        mithril::glstate::GLToBlendFactor(sR),
+        mithril::glstate::GLToBlendFactor(dR),
+        mithril::glstate::GLToBlendFactor(sA),
+        mithril::glstate::GLToBlendFactor(dA));
+}
+void glBlendEquationi(GLuint buf, GLenum mode) {
+    MITHRIL_ENSURE_INIT();
+    mithril::glstate::BlendEquation m = mithril::glstate::GLToBlendEquation(mode);
+    g_state->GetRenderState().SetBlendEquationIndexed(buf, m, m);
+}
 
 /* ---- Depth / stencil / color mask ---- */
 void glDepthFunc(GLenum func) {
     MITHRIL_ENSURE_INIT();
-    g_state->depthFunc = func;
+    g_state->GetRenderState().SetDepthFunc(mithril::glstate::GLToDepthTestFunc(func));
 }
 
 void glDepthMask(GLboolean flag) {
     MITHRIL_ENSURE_INIT();
-    g_state->depthMask = (flag != 0);
+    g_state->GetRenderState().SetDepthMask(flag != 0);
 }
 
 void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
     MITHRIL_ENSURE_INIT();
-    g_state->colorMask[0] = (r != 0);
-    g_state->colorMask[1] = (g != 0);
-    g_state->colorMask[2] = (b != 0);
-    g_state->colorMask[3] = (a != 0);
+    g_state->GetRenderState().SetColorMask(
+        mithril::glstate::BoolVec4{r != 0, g != 0, b != 0, a != 0});
 }
 
 void glStencilMask(GLuint mask) {
     MITHRIL_ENSURE_INIT();
-    g_state->stencilMask = mask;
-    g_state->stencilBackMask = mask;
+    g_state->GetRenderState().SetStencilMask(mithril::glstate::StencilFace::Front, mask);
+    g_state->GetRenderState().SetStencilMask(mithril::glstate::StencilFace::Back, mask);
 }
 
 void glStencilFunc(GLenum func, GLint ref, GLuint mask) {
     MITHRIL_ENSURE_INIT();
-    g_state->stencilFunc = func;
-    g_state->stencilRef  = ref;
-    g_state->stencilValueMask = mask;
-    g_state->stencilBackFunc = func;
-    g_state->stencilBackRef  = ref;
-    g_state->stencilBackValueMask = mask;
+    mithril::glstate::DepthTestFunc f = mithril::glstate::GLToDepthTestFunc(func);
+    g_state->GetRenderState().SetStencilFunc(mithril::glstate::StencilFace::Front, f, ref, mask);
+    g_state->GetRenderState().SetStencilFunc(mithril::glstate::StencilFace::Back,  f, ref, mask);
 }
 
 void glStencilOp(GLenum sfail, GLenum dpfail, GLenum dppass) {
     MITHRIL_ENSURE_INIT();
-    g_state->stencilSfail  = sfail;
-    g_state->stencilDpfail = dpfail;
-    g_state->stencilDppass = dppass;
-    g_state->stencilBackSfail  = sfail;
-    g_state->stencilBackDpfail = dpfail;
-    g_state->stencilBackDppass = dppass;
+    mithril::glstate::StencilOperation sf  = mithril::glstate::GLToStencilOperation(sfail);
+    mithril::glstate::StencilOperation dpf = mithril::glstate::GLToStencilOperation(dpfail);
+    mithril::glstate::StencilOperation dpp = mithril::glstate::GLToStencilOperation(dppass);
+    g_state->GetRenderState().SetStencilOp(mithril::glstate::StencilFace::Front, sf, dpf, dpp);
+    g_state->GetRenderState().SetStencilOp(mithril::glstate::StencilFace::Back,  sf, dpf, dpp);
 }
 
 void glStencilMaskSeparate(GLenum face, GLuint mask) {
     MITHRIL_ENSURE_INIT();
-    if (face == GL_FRONT) g_state->stencilMask = mask;
-    else if (face == GL_BACK) g_state->stencilBackMask = mask;
-    else { g_state->stencilMask = mask; g_state->stencilBackMask = mask; }
+    if (face == GL_FRONT) {
+        g_state->GetRenderState().SetStencilMask(mithril::glstate::StencilFace::Front, mask);
+    } else if (face == GL_BACK) {
+        g_state->GetRenderState().SetStencilMask(mithril::glstate::StencilFace::Back, mask);
+    } else {
+        // GL_FRONT_AND_BACK (or anything else): broadcast to both faces,
+        // matching the previous flat-state behaviour.
+        g_state->GetRenderState().SetStencilMask(mithril::glstate::StencilFace::Front, mask);
+        g_state->GetRenderState().SetStencilMask(mithril::glstate::StencilFace::Back, mask);
+    }
 }
 
 void glStencilFuncSeparate(GLenum face, GLenum func, GLint ref, GLuint mask) {
     MITHRIL_ENSURE_INIT();
+    mithril::glstate::DepthTestFunc f = mithril::glstate::GLToDepthTestFunc(func);
     if (face == GL_FRONT || face == GL_FRONT_AND_BACK) {
-        g_state->stencilFunc = func;
-        g_state->stencilRef  = ref;
-        g_state->stencilValueMask = mask;
+        g_state->GetRenderState().SetStencilFunc(mithril::glstate::StencilFace::Front, f, ref, mask);
     }
     if (face == GL_BACK || face == GL_FRONT_AND_BACK) {
-        g_state->stencilBackFunc = func;
-        g_state->stencilBackRef  = ref;
-        g_state->stencilBackValueMask = mask;
+        g_state->GetRenderState().SetStencilFunc(mithril::glstate::StencilFace::Back, f, ref, mask);
     }
 }
 
 void glStencilOpSeparate(GLenum face, GLenum sfail, GLenum dpfail, GLenum dppass) {
     MITHRIL_ENSURE_INIT();
+    mithril::glstate::StencilOperation sf  = mithril::glstate::GLToStencilOperation(sfail);
+    mithril::glstate::StencilOperation dpf = mithril::glstate::GLToStencilOperation(dpfail);
+    mithril::glstate::StencilOperation dpp = mithril::glstate::GLToStencilOperation(dppass);
     if (face == GL_FRONT || face == GL_FRONT_AND_BACK) {
-        g_state->stencilSfail = sfail;
-        g_state->stencilDpfail = dpfail;
-        g_state->stencilDppass = dppass;
+        g_state->GetRenderState().SetStencilOp(mithril::glstate::StencilFace::Front, sf, dpf, dpp);
     }
     if (face == GL_BACK || face == GL_FRONT_AND_BACK) {
-        g_state->stencilBackSfail = sfail;
-        g_state->stencilBackDpfail = dpfail;
-        g_state->stencilBackDppass = dppass;
+        g_state->GetRenderState().SetStencilOp(mithril::glstate::StencilFace::Back, sf, dpf, dpp);
     }
 }
 
 /* ---- Rasterizer ---- */
 void glCullFace(GLenum mode) {
     MITHRIL_ENSURE_INIT();
-    g_state->cullMode = mode;
+    g_state->GetRenderState().SetCullFaceMode(mithril::glstate::GLToCullFaceMode(mode));
 }
 
 void glFrontFace(GLenum mode) {
     MITHRIL_ENSURE_INIT();
-    g_state->frontFace = mode;
+    g_state->GetRenderState().SetFrontFaceMode(mithril::glstate::GLToFrontFaceMode(mode));
 }
 
 void glPolygonMode(GLenum face, GLenum mode) {
     MITHRIL_ENSURE_INIT();
-    if (face == GL_FRONT || face == GL_FRONT_AND_BACK) g_state->polygonModeFront = mode;
-    if (face == GL_BACK  || face == GL_FRONT_AND_BACK) g_state->polygonModeBack  = mode;
+    // SetPolygonMode takes (front, back) together; preserve the untouched
+    // face by reading its current value and passing it through. This keeps
+    // the per-face selectivity of the previous flat-state implementation.
+    GLenum front = g_state->GetRenderState().GetPolygonModeFront();
+    GLenum back  = g_state->GetRenderState().GetPolygonModeBack();
+    if (face == GL_FRONT || face == GL_FRONT_AND_BACK) front = mode;
+    if (face == GL_BACK  || face == GL_FRONT_AND_BACK) back  = mode;
+    g_state->GetRenderState().SetPolygonMode(front, back);
 }
 
 void glPolygonOffset(GLfloat factor, GLfloat units) {
     MITHRIL_ENSURE_INIT();
-    g_state->polygonOffsetFactor = factor;
-    g_state->polygonOffsetUnits  = units;
+    g_state->GetRenderState().SetPolygonOffset(factor, units);
 }
 
-void glLineWidth(GLfloat w) { MITHRIL_ENSURE_INIT(); g_state->lineWidth = w; }
-void glPointSize(GLfloat s) { MITHRIL_ENSURE_INIT(); g_state->pointSize = s; }
+void glLineWidth(GLfloat w) { MITHRIL_ENSURE_INIT(); g_state->GetRenderState().SetLineWidth(w); }
+void glPointSize(GLfloat s) { MITHRIL_ENSURE_INIT(); g_state->GetRenderState().SetPointSize(s); }
 void glHint(GLenum, GLenum) { MITHRIL_ENSURE_INIT(); /* hints are advisory */ }
 
 /* ---- Pixel store ---- */
 void glPixelStorei(GLenum pname, GLint param) {
     MITHRIL_ENSURE_INIT();
-    switch (pname) {
-        case GL_UNPACK_ALIGNMENT:      g_state->unpackAlignment = param; break;
-        case GL_PACK_ALIGNMENT:        g_state->packAlignment   = param; break;
-        case GL_UNPACK_ROW_LENGTH:     g_state->unpackRowLength = param; break;
-        case GL_UNPACK_IMAGE_HEIGHT:   g_state->unpackImageHeight = param; break;
-        case GL_UNPACK_SKIP_ROWS:      g_state->unpackSkipRows = param; break;
-        case GL_UNPACK_SKIP_PIXELS:    g_state->unpackSkipPixels = param; break;
-        case GL_UNPACK_SKIP_IMAGES:    g_state->unpackSkipImages = param; break;
-        default: break;
-    }
+    g_state->GetRenderState().SetPixelStoreParam(
+        mithril::glstate::GLToPixelStoreParam(pname), param);
 }
 
 void glPixelStoref(GLenum pname, GLfloat param) { glPixelStorei(pname, (GLint)param); }
@@ -301,8 +284,9 @@ void glPixelStoref(GLenum pname, GLfloat param) { glPixelStorei(pname, (GLint)pa
 /* ---- Active texture ---- */
 void glActiveTexture(GLenum texture) {
     MITHRIL_ENSURE_INIT();
-    if (texture >= GL_TEXTURE0 && texture < GL_TEXTURE0 + mithril::kMaxTextureUnits) {
-        g_state->activeTextureUnit = texture - GL_TEXTURE0;
+    if (texture >= GL_TEXTURE0 &&
+        texture < GL_TEXTURE0 + mithril::glstate::kMaxTextureUnits) {
+        g_state->GetTextureState().SetActiveTextureUnit(texture - GL_TEXTURE0);
     }
 }
 
@@ -321,7 +305,7 @@ void glFinish(void) {
 
 void glPrimitiveRestartIndex(GLuint index) {
     MITHRIL_ENSURE_INIT();
-    g_state->primitiveRestartIndex = index;
+    g_state->GetRenderState().SetPrimitiveRestartIndex(index);
 }
 
 } // extern "C"
