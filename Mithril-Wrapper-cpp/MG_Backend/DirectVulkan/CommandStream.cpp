@@ -258,6 +258,17 @@ bool ensure_command_buffer_recording() {
     }
     b->commandBufferRecording = true;
     encoder().hasCommands = false;  // fresh buffer, no commands yet
+
+    // FIX (Invalid Resource 根因 - per-frame transient staging arena rewind):
+    // 到达这里意味着 command buffer 被重置+重新 begin（新帧开始）。
+    // 之前的 fence wait（或 safe_device_wait_idle 的 vkDeviceWaitIdle）保证了
+    // 该 slot 的所有 GPU 工作已完成，staging buffer 的数据不再被引用。
+    // rewind offset 到 0，让本帧的纹理上传从 arena 头部重新 sub-allocate。
+    // 参考 MobileGL TryDrainFrameTransients 的 transient arena rewind。
+    if (b->frameStagingReady) {
+        b->frameStagingOffset[b->currentFrame] = 0;
+    }
+
     return true;
 }
 

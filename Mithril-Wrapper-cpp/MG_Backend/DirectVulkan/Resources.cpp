@@ -250,52 +250,99 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     size_t src_stride = (tight_row + mask) & ~mask;
     size_t staging = tight_row * (size_t)h * (size_t)d;
 
-    if (tex.stagingSize < staging) {
-        // Deferred-destroy the old staging buffer — it may still be referenced
-        // by an in-flight command buffer's vkCmdCopyBufferToImage. Immediate
-        // destruction here was another source of the Metal UAF crash.
-        if (tex.stagingBuffer != VK_NULL_HANDLE || tex.stagingMemory != VK_NULL_HANDLE) {
-            DeferredDestroy ds;
-            ds.buffer = tex.stagingBuffer;
-            ds.memory = tex.stagingMemory;
-            b->disposalQueue[b->currentFrame].push_back(ds);
-            tex.stagingBuffer = VK_NULL_HANDLE;
-            tex.stagingMemory = VK_NULL_HANDLE;
+    // ---- FIX (Invalid Resource 根因 - per-frame transient staging arena) ----
+    // 深度参考 MobileGL 的 transient staging arena 模式：
+    // 从当前 frame slot 的大 staging buffer 中 sub-allocate（bump offset），
+    // 而不是为每张纹理创建/销毁独立的 staging buffer。
+    //
+    // 这消除了：
+    //   1. per-texture vkCreateBuffer + vkAllocateMemory（降低 allocation count）
+    //   2. staging buffer 的 disposalQueue 条目（消除 UAF 风险）
+    //   3. vkMapMemory/vkUnmapMemory 的 per-upload 开销（arena persistently mapped）
+    //
+    // arena 在 ensure_command_buffer_recording 的 fence wait 后 rewind 到 0，
+    // 保证 GPU 已完成对该 slot staging buffer 的引用。
+    //
+    // overflow（staging > 剩余空间）回退到临时 staging buffer + deferred destroy。
+
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceSize stagingOffset = 0;
+    void* stagingMapped = nullptr;
+    bool usedArena = false;
+
+    if (b->frameStagingReady) {
+        // 对齐到 256 字节（满足 VkBufferImageCopy.bufferOffset 的对齐要求，
+        // 也满足 MoltenVK/Metal 的 MTLBuffer offset 对齐）
+        VkDeviceSize alignedOffset = (b->frameStagingOffset[b->currentFrame] + 255) & ~255;
+        if (alignedOffset + staging <= Backend::kFrameStagingSize) {
+            // Fast path: sub-allocate from per-frame arena
+            stagingBuffer = b->frameStagingBuffer[b->currentFrame];
+            stagingOffset = alignedOffset;
+            stagingMapped = b->frameStagingMapped[b->currentFrame];
+            b->frameStagingOffset[b->currentFrame] = alignedOffset + staging;
+            usedArena = true;
         }
-        BufferEntry tmp;
-        if (create_buffer(tmp, staging,
-                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, nullptr)) {
-            tex.stagingBuffer = tmp.buffer;
-            tex.stagingMemory = tmp.memory;
-            tex.stagingSize = staging;
-        } else {
-            return;
-        }
+        // else: overflow — fall through to temporary staging buffer path
     }
-    void* dst = nullptr;
-    vkMapMemory(b->device, tex.stagingMemory, 0, staging, 0, &dst);
-    if (dst && pixels) {
+
+    if (!usedArena) {
+        // Overflow path: arena 不存在或剩余空间不足。
+        // 创建临时 staging buffer，上传后延迟销毁（disposalQueue）。
+        // 这是罕见情况（单帧上传超过 16MB），不影响整体性能。
+        // 对超大单张纹理（>16MB），也需要走此路径。
+        if (tex.stagingSize < staging) {
+            if (tex.stagingBuffer != VK_NULL_HANDLE || tex.stagingMemory != VK_NULL_HANDLE) {
+                DeferredDestroy ds;
+                ds.buffer = tex.stagingBuffer;
+                ds.memory = tex.stagingMemory;
+                b->disposalQueue[b->currentFrame].push_back(ds);
+                tex.stagingBuffer = VK_NULL_HANDLE;
+                tex.stagingMemory = VK_NULL_HANDLE;
+            }
+            BufferEntry tmp;
+            if (create_buffer(tmp, staging,
+                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT, nullptr)) {
+                tex.stagingBuffer = tmp.buffer;
+                tex.stagingMemory = tmp.memory;
+                tex.stagingSize = staging;
+            } else {
+                return;
+            }
+        }
+        stagingBuffer = tex.stagingBuffer;
+        stagingOffset = 0;
+        // Per-upload map for overflow path (arena 的 persistently mapped 不可用)
+        vkMapMemory(b->device, tex.stagingMemory, 0, staging, 0, &stagingMapped);
+    }
+
+    // Copy pixel data into staging buffer at stagingOffset
+    if (stagingMapped && pixels) {
+        char* dst = (char*)stagingMapped + stagingOffset;
         if (src_stride == tight_row) {
             // Source rows are already tightly packed — single memcpy.
             std::memcpy(dst, pixels, staging);
         } else {
             // Source rows carry GL_UNPACK_ALIGNMENT padding; repack to tight
             // so VkBufferImageCopy.bufferRowLength == 0 (== w) is valid.
-            char* d8 = (char*)dst;
             const char* s8 = (const char*)pixels;
             for (int layer = 0; layer < d; ++layer) {
                 for (int row = 0; row < h; ++row) {
-                    std::memcpy(d8, s8, tight_row);
-                    d8 += tight_row;
+                    std::memcpy(dst, s8, tight_row);
+                    dst += tight_row;
                     s8 += src_stride;
                 }
             }
         }
     }
-    if (dst) vkUnmapMemory(b->device, tex.stagingMemory);
+
+    if (!usedArena && stagingMapped) {
+        // Unmap the per-upload mapping (overflow path only)
+        vkUnmapMemory(b->device, tex.stagingMemory);
+    }
+    // Arena path: no unmap needed (persistently mapped)
 
     VkBufferImageCopy region{};
-    region.bufferOffset = 0;
+    region.bufferOffset = stagingOffset;  // 非 0 for arena sub-allocation
     region.bufferRowLength = 0;     // tightly packed
     region.bufferImageHeight = 0;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -331,7 +378,7 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &barrier);
 
-    vkCmdCopyBufferToImage(b->commandBuffer, tex.stagingBuffer, tex.image,
+    vkCmdCopyBufferToImage(b->commandBuffer, stagingBuffer, tex.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     // Transition to SHADER_READ_ONLY so the texture can be sampled afterwards.
@@ -346,24 +393,20 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                          0, nullptr, 0, nullptr, 1, &barrier);
     tex.currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    // FIX (P0 - 显存耗尽根因): 上传完成后立即延迟释放 staging buffer。
-    // 原实现永久持有 staging buffer（Resources.h:42-44），每张纹理额外占
-    // 一份 host-visible 显存 + 一个 vkAllocateMemory 配额。几百张纹理
-    // 同时导致显存持续增长和 maxMemoryAllocationCount 耗尽。
-    // 参考 MobileGL：staging buffer 上传后立即进 deferred release 队列，
-    // 按 frame-serial 释放，不跨帧泄漏。
+    // Arena path: no cleanup needed — staging buffer 是永久的，offset 在
+    // 下次 ensure_command_buffer_recording 时 rewind。
     //
-    // layout 转换 barrier 已确保 GPU 完成 vkCmdCopyBufferToImage，staging
-    // buffer 的数据已被 copy 到 image，可以安全延迟释放（kMaxFramesInFlight
-    // 帧后释放，确保 GPU 不再引用）。
-    if (tex.stagingBuffer != VK_NULL_HANDLE || tex.stagingMemory != VK_NULL_HANDLE) {
-        DeferredDestroy ds;
-        ds.buffer = tex.stagingBuffer;
-        ds.memory = tex.stagingMemory;
-        b->disposalQueue[b->currentFrame].push_back(ds);
-        tex.stagingBuffer = VK_NULL_HANDLE;
-        tex.stagingMemory = VK_NULL_HANDLE;
-        tex.stagingSize = 0;
+    // Overflow path: 延迟释放临时 staging buffer（与原实现相同）。
+    if (!usedArena) {
+        if (tex.stagingBuffer != VK_NULL_HANDLE || tex.stagingMemory != VK_NULL_HANDLE) {
+            DeferredDestroy ds;
+            ds.buffer = tex.stagingBuffer;
+            ds.memory = tex.stagingMemory;
+            b->disposalQueue[b->currentFrame].push_back(ds);
+            tex.stagingBuffer = VK_NULL_HANDLE;
+            tex.stagingMemory = VK_NULL_HANDLE;
+            tex.stagingSize = 0;
+        }
     }
 }
 

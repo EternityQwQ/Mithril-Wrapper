@@ -415,12 +415,113 @@ safe_device_wait_idle():
 - `backend_reset_device_lost`（Device.cpp:85）— deviceLost 恢复路径
 - `shutdown_device`（Device.cpp:721）— 关闭路径
 
+### 7.8 修复缺口 7：Invalid Resource (code 9) 根因 — per-frame transient staging arena
+
+**文件**: `Device.h:155-166`, `Device.cpp:766-838/864-871`, `CommandStream.cpp:262-270`, `Resources.cpp:253-410`
+
+**日志特征**（用户提供的崩溃日志）：
+```
+[egl_bridge] First frame rendered, game is ready
+[mvk-error] VK_ERROR_OUT_OF_DEVICE_MEMORY: MTLCommandBuffer "vkQueueSubmit" execution failed (code 9): Invalid Resource (00000009:kIOGPUCommandBufferCallbackErrorInvalidResource)
+... (重复数十次)
+[mvk-error] VK_TIMEOUT: ... Caused GPU Timeout Error (00000002:kIOGPUCommandBufferCallbackErrorTimeout)
+[mvk-error] VK_ERROR_DEVICE_LOST: ... Ignored (for causing prior/excessive GPU errors)
+[mvk-error] VK_ERROR_INITIALIZATION_FAILED: Shader library compile failed ... "invalid type 'main0_in'"
+exit(0) called
+```
+
+崩溃在首帧渲染后立即发生，先级联 Invalid Resource → GPU Timeout → Device Lost → 着色器编译失败（红屏）→ 退出。
+
+**根因分析**（深度参考 MobileGL transient staging arena 模式）：
+
+原 `stage_and_copy_image` 为每次纹理上传创建独立的 staging buffer：
+```
+每次 glTexSubImage2D / glTexImage2D:
+  1. vkCreateBuffer (staging)
+  2. vkAllocateMemory (staging)
+  3. vkMapMemory → memcpy → vkUnmapMemory
+  4. vkCmdCopyBufferToImage
+  5. 推入 disposalQueue[currentFrame] 延迟销毁
+```
+
+这导致三重问题：
+
+1. **allocation count 爆炸**：MC 1.21.1 启动时加载 14+ 个纹理图集（blocks/signs/banner_patterns/shield_patterns/armor_trims/chest/decorated_pot/beds/shulker_boxes/particles/paintings/mob_effects/map_decorations/gui），每张 2 次 vkAllocateMemory（image + staging），单帧分配 ~30 次。配合 proactive GC（日志可见 `allocationCount 2867/4096`），接近 4096 上限。
+
+2. **staging buffer UAF 风险**：staging buffer 进 `disposalQueue[currentFrame]`，在下次该 slot 被 `ensure_command_buffer_recording` 复用时 drain。但 drain 时机依赖 fence wait，若 GC 在 fence wait 前触发 `drain_all_disposal_queues`（如 `backend_reset_device_lost_pending_resources`），会释放仍在 GPU 队列中的 staging buffer 对应的 MTLBuffer。MoltenVK 的 `vkCmdCopyBufferToImage` 编码器保留 MTLBuffer wrapper，提交时访问已释放的 MTLBuffer → Metal 报 `kIOGPUCommandBufferCallbackErrorInvalidResource` (code 9)。
+
+3. **per-upload map/unmap 开销**：每次纹理上传都 `vkMapMemory` + `vkUnmapMemory`，在 iOS 上触发 MoltenVK 的 coherency 同步，增加 CPU 开销。
+
+**MobileGL 的做法**：MobileGL 用 `FrameTransientBuffer` — 每个 frame slot 持有一个大的 host-visible VkBuffer，纹理上传时从中 sub-allocate（bump offset），在帧边界（`Present` 末尾 / `BeginFrame`）rewind offset。staging buffer 永不销毁，无 allocation count 增长，无 UAF 风险。
+
+**修复**：per-frame transient staging arena
+
+```
+init_device():
+  为每个 frame slot 创建一个 16MB 的 host-visible VkBuffer
+  persistently mapped（vkMapMemory 一次，保持映射）
+  frameStagingReady = true（所有 slot 创建成功）
+
+ensure_command_buffer_recording()（fence wait 后，drain 后）:
+  if frameStagingReady:
+    frameStagingOffset[currentFrame] = 0   ← rewind
+
+stage_and_copy_image():
+  if frameStagingReady && 剩余空间足够:
+    alignedOffset = (offset + 255) & ~255   ← 256 字节对齐
+    stagingBuffer = frameStagingBuffer[currentFrame]
+    stagingOffset = alignedOffset
+    stagingMapped = frameStagingMapped[currentFrame]   ← 已映射
+    frameStagingOffset[currentFrame] = alignedOffset + staging
+    usedArena = true
+  else:
+    ← overflow 回退：临时 staging buffer + disposalQueue（原路径）
+
+  memcpy(stagingMapped + stagingOffset, pixels, ...)
+  vkCmdCopyBufferToImage(stagingBuffer, ..., bufferOffset=stagingOffset)
+
+  if usedArena: 无清理（arena 永久，offset 下帧 rewind）
+  else: 延迟销毁临时 staging buffer
+
+shutdown_device():
+  vkUnmapMemory + vkDestroyBuffer + vkFreeMemory 每个 slot
+```
+
+**关键设计点**：
+
+| 点 | 说明 |
+|----|------|
+| **16MB per slot** | 足够覆盖 MC 单帧纹理上传（最大图集 1024x1024x4 = 4MB，14 张 < 16MB）。overflow 回退到临时 buffer。 |
+| **256 字节对齐** | 满足 `VkBufferImageCopy.bufferOffset` 对齐要求，也满足 MoltenVK/Metal 的 MTLBuffer offset 对齐。 |
+| **persistently mapped** | `vkMapMemory` 一次，host-coherent 内存写入自动对 GPU 可见，消除 per-upload map/unmap。 |
+| **rewind 时机** | `ensure_command_buffer_recording` 的 fence wait 之后 — 保证该 slot 的 GPU 工作已完成，staging buffer 数据不再被引用。参考 MobileGL `TryDrainFrameTransients` 的 transient arena rewind。 |
+| **overflow 回退** | 单张纹理 > 16MB 或单帧累积 > 16MB 时，回退到临时 staging buffer + disposalQueue（原路径）。罕见情况，不影响整体性能。 |
+
+**消除的问题**：
+
+| 问题 | 原路径 | arena 路径 |
+|------|--------|-----------|
+| per-texture vkCreateBuffer + vkAllocateMemory | 每张纹理 2 次分配 | 0 次（arena 在 init 时一次性分配） |
+| staging buffer disposalQueue 条目 | 每张纹理 1 条 | 0 条（arena 永不销毁） |
+| staging buffer UAF 风险 | drain 时机不当会 UAF | 无（arena 永久，offset rewind 保证 GPU 完成） |
+| per-upload vkMapMemory/vkUnmapMemory | 每张纹理 1 对 | 0 对（persistently mapped） |
+| allocation count 增长 | 启动时 +30，运行时持续 | 启动时 +2（2 个 slot），运行时 0 |
+
+**与 7.7 (safe_device_wait_idle) 的协同**：
+
+7.7 修复了 GC 期间录制中的 command buffer 被提交的 SIGBUS。本修复（7.8）从根源消除了 staging buffer 的 disposalQueue 条目，使 GC 期间 drain 释放的资源大幅减少（仅剩 orphaned buffer / 旧纹理），进一步降低 UAF 风险。两者互补：
+- 7.7：GC 安全地处理正在录制的 command buffer
+- 7.8：减少需要 GC 的 staging buffer 数量
+
 ## 八、验证标准
 
 - [ ] iPhone SE 3 能正常进入游戏主界面
 - [ ] 长时间运行（>30分钟）显存占用稳定不增长
 - [ ] 无 VK_ERROR_OUT_OF_DEVICE_MEMORY
 - [ ] 无 VK_ERROR_DEVICE_LOST
+- [ ] **无 `kIOGPUCommandBufferCallbackErrorInvalidResource` (code 9) 错误**（7.8 per-frame staging arena 修复）
+- [ ] **日志中可见 `Per-frame transient staging arena initialised` 初始化消息**（7.8）
+- [ ] **首帧渲染后无 Invalid Resource 错误级联**（不再 → Timeout → Device Lost → 红屏 → exit）(7.8)
 - [ ] 无红屏/黑屏（有声音无画面）
 - [ ] 无 SIGBUS (BUS_ADRALN) 对齐崩溃（MVKCmdBufferImageCopy::encode）
 - [ ] 无 SIGSEGV (IOSurfaceBindAccel) 崩溃（首帧 present 后）

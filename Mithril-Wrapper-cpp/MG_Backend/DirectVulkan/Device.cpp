@@ -763,6 +763,80 @@ bool init_device() {
         }
     }
 
+    // ---- Per-frame transient staging arena (MobileGL pattern) ----
+    // 每个 frame slot 一个大的 host-visible VkBuffer，用于纹理上传的 staging。
+    // 在 ensure_command_buffer_recording 的 fence wait 后 rewind offset 到 0。
+    // 这消除了 per-texture staging buffer 的分配/销毁循环，根治 Metal
+    // Invalid Resource (code 9) UAF 崩溃。
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        VkBufferCreateInfo sbci{};
+        sbci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        sbci.size = Backend::kFrameStagingSize;
+        sbci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        sbci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(b->device, &sbci, nullptr, &b->frameStagingBuffer[i]) != VK_SUCCESS) {
+            MITHRIL_LOG_ERROR("vk", "failed to create frame staging buffer "
+                              "(slot %d, size=%zu)", i, (size_t)Backend::kFrameStagingSize);
+            break;
+        }
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(b->device, b->frameStagingBuffer[i], &req);
+        uint32_t mt = find_memory_type(req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mt == 0xFFFFFFFFu) {
+            vkDestroyBuffer(b->device, b->frameStagingBuffer[i], nullptr);
+            b->frameStagingBuffer[i] = VK_NULL_HANDLE;
+            MITHRIL_LOG_ERROR("vk", "no host-visible memory type for frame staging "
+                              "buffer (slot %d)", i);
+            break;
+        }
+        VkMemoryAllocateInfo smai{};
+        smai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        smai.allocationSize = req.size;
+        smai.memoryTypeIndex = mt;
+        // 使用 try_allocate_memory_with_gc（虽然首次分配不应 OOM，但保持一致性）
+        if (try_allocate_memory_with_gc(b->device, &smai, nullptr,
+                                         &b->frameStagingMemory[i]) != VK_SUCCESS) {
+            vkDestroyBuffer(b->device, b->frameStagingBuffer[i], nullptr);
+            b->frameStagingBuffer[i] = VK_NULL_HANDLE;
+            MITHRIL_LOG_ERROR("vk", "failed to allocate memory for frame staging "
+                              "buffer (slot %d)", i);
+            break;
+        }
+        vkBindBufferMemory(b->device, b->frameStagingBuffer[i],
+                           b->frameStagingMemory[i], 0);
+        // Persistently map — keep mapped for the lifetime of the buffer.
+        // Host-coherent memory: writes are automatically visible to GPU.
+        if (vkMapMemory(b->device, b->frameStagingMemory[i], 0,
+                        Backend::kFrameStagingSize, 0,
+                        &b->frameStagingMapped[i]) != VK_SUCCESS) {
+            MITHRIL_LOG_WARN("vk", "failed to persistently map frame staging "
+                             "buffer (slot %d) — falling back to per-upload map",
+                             i);
+            b->frameStagingMapped[i] = nullptr;
+        }
+        b->frameStagingOffset[i] = 0;
+    }
+    // Check if all slots were created successfully
+    b->frameStagingReady = true;
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (b->frameStagingBuffer[i] == VK_NULL_HANDLE) {
+            b->frameStagingReady = false;
+            break;
+        }
+    }
+    if (b->frameStagingReady) {
+        MITHRIL_LOG_INFO("vk", "Per-frame transient staging arena initialised "
+                          "(%d slots x %zu MB, persistently mapped)",
+                          kMaxFramesInFlight,
+                          (size_t)Backend::kFrameStagingSize / (1024 * 1024));
+    } else {
+        MITHRIL_LOG_WARN("vk", "Per-frame staging arena NOT ready — falling "
+                          "back to per-texture staging buffers (higher "
+                          "allocation count, potential Invalid Resource risk)");
+    }
+
     b->initialized = true;
     MITHRIL_LOG_INFO("vk", "Vulkan 1.2 backend initialised (MoltenVK static link)");
     return true;
@@ -787,6 +861,14 @@ void shutdown_device() {
     if (b->commandPool) { vkDestroyCommandPool(b->device, b->commandPool, nullptr); b->commandPool = VK_NULL_HANDLE; }
     if (b->dummyVertexBuffer) { vkDestroyBuffer(b->device, b->dummyVertexBuffer, nullptr); b->dummyVertexBuffer = VK_NULL_HANDLE; }
     if (b->dummyVertexMemory) { vkFreeMemory(b->device, b->dummyVertexMemory, nullptr); b->dummyVertexMemory = VK_NULL_HANDLE; }
+    // Destroy per-frame transient staging arena
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (b->frameStagingMapped[i]) { vkUnmapMemory(b->device, b->frameStagingMemory[i]); b->frameStagingMapped[i] = nullptr; }
+        if (b->frameStagingBuffer[i]) { vkDestroyBuffer(b->device, b->frameStagingBuffer[i], nullptr); b->frameStagingBuffer[i] = VK_NULL_HANDLE; }
+        if (b->frameStagingMemory[i]) { vkFreeMemory(b->device, b->frameStagingMemory[i], nullptr); b->frameStagingMemory[i] = VK_NULL_HANDLE; }
+        b->frameStagingOffset[i] = 0;
+    }
+    b->frameStagingReady = false;
     if (b->device) { vkDestroyDevice(b->device, nullptr); b->device = VK_NULL_HANDLE; }
     if (b->instance) { vkDestroyInstance(b->instance, nullptr); b->instance = VK_NULL_HANDLE; }
     b->initialized = false;

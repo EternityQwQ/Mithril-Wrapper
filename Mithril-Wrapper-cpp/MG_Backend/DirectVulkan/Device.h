@@ -143,6 +143,26 @@ struct Backend {
     // all work submitted to that slot, so the deferred resources are safe to
     // destroy. See DeferredDestroy above for the full rationale.
     std::vector<DeferredDestroy> disposalQueue[kMaxFramesInFlight];
+
+    // FIX (Invalid Resource 根因 - per-frame transient staging arena):
+    // 深度参考 MobileGL 的 transient staging arena 模式：每个 frame slot 持有
+    // 一个大的 host-visible VkBuffer，纹理上传时从中 sub-allocate（bump offset）。
+    // 在 ensure_command_buffer_recording 的 fence wait 之后 rewind offset 到 0。
+    //
+    // 这消除了 per-texture staging buffer 的创建/销毁循环：
+    //   - 不再为每次 stage_and_copy_image 调用 vkCreateBuffer + vkAllocateMemory
+    //   - 不再将 staging buffer 推入 disposalQueue
+    //   - 不再因 disposal queue 生命周期管理不当导致 Metal Invalid Resource (code 9)
+    //
+    // arena 在 init_device 中创建（一次），在 shutdown_device 中销毁。
+    // persistently mapped（vkMapMemory 一次，保持映射）。
+    // overflow（单次上传超过剩余空间）回退到临时 staging buffer + deferred destroy。
+    static constexpr VkDeviceSize kFrameStagingSize = 16 * 1024 * 1024;  // 16 MB per slot
+    VkBuffer       frameStagingBuffer[kMaxFramesInFlight] = {};
+    VkDeviceMemory frameStagingMemory[kMaxFramesInFlight] = {};
+    VkDeviceSize   frameStagingOffset[kMaxFramesInFlight] = {};
+    void*          frameStagingMapped[kMaxFramesInFlight] = {};
+    bool           frameStagingReady = false;
 };
 
 // Access the singleton backend state. Allocated on first call.
