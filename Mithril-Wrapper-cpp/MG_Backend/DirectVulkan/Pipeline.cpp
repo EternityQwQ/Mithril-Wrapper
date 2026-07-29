@@ -596,10 +596,13 @@ void delete_program_resources(GLuint program) {
     auto it = tbl.find(program);
     if (it == tbl.end()) return;
     ProgramResources& pr = it->second;
-    if (b->device) vkDeviceWaitIdle(b->device);
-    // vkDeviceWaitIdle guarantees all GPU work is complete — drain any
-    // deferred buffer/texture/sampler destruction queued by previous frames
-    // so no stale Vulkan handles outlive the program's shader modules.
+    // FIX (SIGBUS): glDeleteProgram 可能在帧中间调用（command buffer 正在录制）。
+    // 使用 safe_device_wait_idle 安全结束+提交当前 command buffer 后再 wait，
+    // 避免 MoltenVK deferred encoding 触发 SIGBUS。
+    safe_device_wait_idle();
+    // safe_device_wait_idle 保证所有 GPU 工作已完成 — drain 任何之前帧延迟的
+    // buffer/texture/sampler 销毁，确保没有过期的 Vulkan handle 比 program 的
+    // shader module 存活更久。
     drain_all_disposal_queues();
     for (auto& kv : pr.pipelines) {
         if (kv.second) vkDestroyPipeline(b->device, kv.second, nullptr);

@@ -68,15 +68,18 @@ VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo
     // 限流日志：首次 + 每 50 次
     if (gcTriggerCount <= 3 || gcTriggerCount % 50 == 0) {
         MITHRIL_LOG_WARN("vk", "OOM detected (vkAllocateMemory failed), "
-                          "triggering forced GC (attempt #%d): vkDeviceWaitIdle "
+                          "triggering forced GC (attempt #%d): safe_device_wait_idle "
                           "+ drain_all_disposal_queues",
                           gcTriggerCount);
     }
     Backend* b = backend();
-    if (b->device) {
-        // 等待所有 GPU 工作完成，确保 disposalQueue 中的资源不再被引用
-        vkDeviceWaitIdle(b->device);
-    }
+    // FIX (SIGBUS): 使用 safe_device_wait_idle 而非直接 vkDeviceWaitIdle。
+    // try_allocate_memory_with_gc 被 create_buffer 调用，后者被 stage_and_copy_image
+    // 调用。此时 command buffer 可能正在录制（包含之前帧内已记录的
+    // vkCmdCopyBufferToImage），直接 vkDeviceWaitIdle 会触发 MoltenVK 的
+    // deferred encoding → MVKCmdBufferImageCopy::encode → SIGBUS。
+    // safe_device_wait_idle 先安全结束+提交当前 command buffer，wait 后重新 begin。
+    safe_device_wait_idle();
     drain_all_disposal_queues();
 
     // GC 后重试一次

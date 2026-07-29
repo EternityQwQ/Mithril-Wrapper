@@ -18,6 +18,7 @@
 
 #include "Device.h"
 #include "Resources.h"
+#include "CommandStream.h"  // end_render_pass, ensure_command_buffer_recording, render_pass_active
 #include "Pipeline.h"  // clear_all_pipeline_caches() for deviceLost recovery
 #include "../../MG_Impl/Log.h"
 
@@ -31,6 +32,90 @@ namespace vk {
 Backend* backend() {
     static Backend b;
     return &b;
+}
+
+// FIX (SIGBUS 根因 - vkDeviceWaitIdle 触发 deferred encoding):
+// 见 Device.h 中的详细注释。此函数在 vkDeviceWaitIdle 前安全结束当前录制
+// 的 command buffer，避免 MoltenVK 对未完成 command buffer 做 deferred
+// encoding 时访问未对齐的命令池内存。
+//
+// 透明语义：如果调用时 command buffer 正在录制，函数会：
+//   1. 结束 render pass（如有）— vkEndCommandBuffer 在 render pass 内会失败
+//   2. vkEndCommandBuffer + vkQueueSubmit 提交当前录制的命令
+//   3. vkDeviceWaitIdle 等待 GPU 完成
+//   4. 清除所有 fencePending（wait 后所有 fence 已 signaled）
+//   5. 重新 begin command buffer，让调用方可以继续录制（透明）
+// 如果调用时 command buffer 未在录制，仅执行 vkDeviceWaitIdle（无状态变化）。
+void safe_device_wait_idle() {
+    Backend* b = backend();
+    if (!b->initialized || !b->device) return;
+
+    const bool wasRecording = b->commandBufferRecording && b->commandBuffer != VK_NULL_HANDLE;
+
+    // 1. 如果 render pass 处于活动状态，先结束它。
+    //    vkEndCommandBuffer 在 render pass 实例内调用会返回 VK_ERROR_UNKNOWN。
+    //    纹理上传（stage_and_copy_image）通常在 render pass 外调用，
+    //    但 draw 路径触发的分配可能在 render pass 内，需要安全处理。
+    if (wasRecording && render_pass_active()) {
+        end_render_pass();
+        static int rpWarnCount = 0;
+        rpWarnCount++;
+        if (rpWarnCount <= 3) {
+            MITHRIL_LOG_WARN("vk", "safe_device_wait_idle: ended active render "
+                              "pass before vkDeviceWaitIdle (occurrence #%d) — "
+                              "render pass will be re-established by next "
+                              "begin_render_pass call", rpWarnCount);
+        }
+    }
+
+    // 2. 结束并提交当前录制的 command buffer。
+    //    vkEndCommandBuffer 让 MoltenVK 在安全上下文中完成 command buffer 的
+    //    编码，然后 vkQueueSubmit 提交到 GPU。这样 vkDeviceWaitIdle 就不会
+    //    触发对未完成 command buffer 的 deferred encoding。
+    if (wasRecording) {
+        VkResult endRc = vkEndCommandBuffer(b->commandBuffer);
+        b->commandBufferRecording = false;
+        if (endRc == VK_SUCCESS) {
+            // 提交到当前 slot 的 fence，让 GPU 执行这个 command buffer。
+            // 不等待 renderFinished semaphore（这是 GC 路径，不是正常帧提交）。
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &b->commandBuffer;
+            VkFence fence = b->frameFences[b->currentFrame];
+            // FIX: fence 可能在 signaled 状态（ensure_command_buffer_recording
+            // 的 vkWaitForFences 不 reset fence，或上一次 safe_device_wait_idle
+            // 的 vkDeviceWaitIdle 已 signal 它）。Vulkan spec 要求 vkQueueSubmit
+            // 的 fence 必须是 unsignaled，否则 UB。commit_frame 也这样做。
+            vkResetFences(b->device, 1, &fence);
+            VkResult submitRc = vkQueueSubmit(b->graphicsQueue, 1, &si, fence);
+            if (submitRc == VK_SUCCESS) {
+                b->fencePending[b->currentFrame] = true;
+            }
+            // 提交失败（OOM/deviceLost）时不设置 fencePending，后续的
+            // vkDeviceWaitIdle 仍会等待其他 pending 工作。
+        }
+        // vkEndCommandBuffer 失败时（设备已挂起），command buffer 状态未定义，
+        // 但 vkDeviceWaitIdle 仍可安全调用（它会等待其他 pending 工作）。
+    }
+
+    // 3. 等待 GPU 完成。
+    VkResult waitRc = vkDeviceWaitIdle(b->device);
+    (void)waitRc;
+
+    // 4. vkDeviceWaitIdle 后所有 fence 已 signaled。清除 fencePending，
+    //    让后续 ensure_command_buffer_recording 跳过无意义的 vkWaitForFences。
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        b->fencePending[i] = false;
+    }
+
+    // 5. 如果之前在录制，重新 begin command buffer，让调用方可以透明地
+    //    继续录制。ensure_command_buffer_recording 看到
+    //    commandBufferRecording==false，跳过 fence wait（fencePending 已清除），
+    //    reset + begin 当前 slot 的 buffer。
+    if (wasRecording && !b->deviceLost) {
+        ensure_command_buffer_recording();
+    }
 }
 
 bool backend_is_device_lost() {
@@ -207,16 +292,21 @@ bool backend_proactive_gc_if_needed() {
         if (!b->disposalQueue[i].empty()) { stillHasDeferred = true; break; }
     }
     if (stillHasDeferred && b->currentAllocationCount >= threshold) {
-        if (b->device) {
-            vkDeviceWaitIdle(b->device);
-        }
+        // FIX (SIGBUS): 使用 safe_device_wait_idle 而非直接 vkDeviceWaitIdle。
+        // proactive GC 可能在 stage_and_copy_image 录制期间触发（create_buffer →
+        // try_allocate_memory_with_gc → 此函数）。此时 command buffer 正在录制，
+        // 直接 vkDeviceWaitIdle 会触发 MoltenVK 的 deferred encoding →
+        // MVKCmdBufferImageCopy::encode 访问未对齐内存 → SIGBUS。
+        // safe_device_wait_idle 先结束+提交当前 command buffer，wait 后重新 begin，
+        // 让 stage_and_copy_image 可以透明地继续录制。
+        safe_device_wait_idle();
         drain_all_disposal_queues();
-        // 清除所有 fencePending（vkDeviceWaitIdle 后所有 fence 已 signaled）
+        // safe_device_wait_idle 已清除 fencePending，但重复清除无害（防御性）
         for (int i = 0; i < kMaxFramesInFlight; ++i) {
             b->fencePending[i] = false;
         }
         if (proactiveGcCount <= 3 || proactiveGcCount % 20 == 0) {
-            MITHRIL_LOG_WARN("vk", "proactive GC: vkDeviceWaitIdle + "
+            MITHRIL_LOG_WARN("vk", "proactive GC: safe_device_wait_idle + "
                               "drain_all completed, allocationCount now %u/%u",
                               (unsigned)b->currentAllocationCount,
                               (unsigned)b->maxMemoryAllocationCount);

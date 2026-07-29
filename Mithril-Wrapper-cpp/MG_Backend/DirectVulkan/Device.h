@@ -185,6 +185,20 @@ void drain_disposal_queue(int slot);
 // guarantees all GPU work is complete) and during shutdown_device().
 void drain_all_disposal_queues();
 
+// FIX (SIGBUS 根因 - vkDeviceWaitIdle 触发 deferred encoding):
+// MoltenVK 的 vkDeviceWaitIdle 会等待所有 pending command buffer 被编码完成。
+// 如果当前有正在录制的 command buffer（commandBufferRecording=true），其中
+// 包含 vkCmdCopyBufferToImage 等命令，vkDeviceWaitIdle 会触发 MoltenVK 对
+// 未完成 command buffer 的 deferred encoding → MVKCmdBufferImageCopy::encode
+// 访问命令池中未对齐的内存 → SIGBUS (BUS_ADRALN)。
+//
+// safe_device_wait_idle() 在调用 vkDeviceWaitIdle 前，先检查并安全结束当前
+// 录制的 command buffer（vkEndCommandBuffer + 提交到对应 slot 的 fence），
+// 确保没有未完成的 command buffer 时才调用 vkDeviceWaitIdle。
+//
+// 所有需要在 GC/drain 路径中调用 vkDeviceWaitIdle 的地方都应使用此函数。
+void safe_device_wait_idle();
+
 // FIX (显存耗尽根因 - 主动式 GC，深度参考 MobileGL):
 //
 // MobileGL 在每帧 Present 末尾、FlushPendingCommands、WaitForFrameSerial 等

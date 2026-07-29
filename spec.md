@@ -357,6 +357,64 @@ swapchain_acquire_color: swapchain images=2      ← MoltenVK 只创建 2 个
 
 **为什么不用 3**：之前注释认为"triple buffering 加深 IOSurface 池"能避免 `IOSurfaceBindAccel` 崩溃，但这是**错误的**——IOSurface 池大小由 `maximumDrawableCount` 决定，不是 swapchain image count。设置 `imgCount > maximumDrawableCount` 无害（多余 image 不会被 acquire），但 `imgCount < maximumDrawableCount` 会导致池/image 不匹配崩溃。现在两者都固定为 2，完全一致。
 
+### 7.7 修复缺口 6：SIGBUS 在 proactive GC 期间（vkDeviceWaitIdle + drain 释放正在录制的 command buffer 引用的资源）
+
+**文件**: `Device.cpp:37-119`, `Device.cpp:289-309`, `Resources.cpp:65-83`, `Pipeline.cpp:599-606`
+
+**崩溃分析**（iPhone SE 3, iOS 15.4.1, MC 1.21.1）：
+```
+[mithril W] proactive GC triggered: allocationCount 2867/4096 — draining before OOM
+[mithril W] proactive GC: vkDeviceWaitIdle + drain_all completed, allocationCount now 49/4096
+SIGBUS (0xa) at pc=0x...in libMoltenVK.dylib
+MVKCmdBufferImageCopy<1ul>::encode(MVKCommandEncoder*)+0x4c
+```
+
+崩溃发生在 proactive GC 完成后，MoltenVK 尝试编码 `vkCmdCopyBufferToImage` 命令时。
+
+**根因**（双重问题）：
+
+1. **vkDeviceWaitIdle 在 command buffer 录制期间调用**：
+   - proactive GC 由 `try_allocate_memory_with_gc` → `backend_proactive_gc_if_needed` 触发
+   - 调用链：`stage_and_copy_image` → `ensure_command_buffer_recording()` → `create_buffer` → `try_allocate_memory_with_gc` → `backend_proactive_gc_if_needed` → `vkDeviceWaitIdle`
+   - 此时 command buffer 正在录制，其中包含之前帧内已记录的 `vkCmdCopyBufferToImage` 命令
+   - `vkDeviceWaitIdle` 等待所有**已提交**的 command buffer 完成，但不等待正在录制的（未提交的）command buffer
+
+2. **drain_all_disposal_queues 释放正在录制的 command buffer 引用的 staging buffer**：
+   - `vkDeviceWaitIdle` 不会等待未提交的 command buffer
+   - `drain_all_disposal_queues` 释放所有 slot 的 disposalQueue，包括当前 slot 中由 `stage_and_copy_image` 在 staging buffer resize 时延迟的旧 staging buffer
+   - 这些旧 staging buffer 仍被正在录制的 command buffer 中的 `vkCmdCopyBufferToImage` 命令引用
+   - 后续 `commit_frame` → `vkQueueSubmit` → MoltenVK 编码 `vkCmdCopyBufferToImage` → 访问已释放的 staging buffer 的 Metal 资源 → SIGBUS
+
+**修复**：`safe_device_wait_idle()` 透明函数
+
+```
+safe_device_wait_idle():
+  1. 如果 render pass 活动状态 → end_render_pass()（vkEndCommandBuffer 在 render pass 内会失败）
+  2. 如果 command buffer 正在录制：
+     a. vkEndCommandBuffer() — 让 MoltenVK 在安全上下文中完成编码
+     b. vkResetFences() — fence 可能在 signaled 状态（spec 要求 unsignaled）
+     c. vkQueueSubmit() — 提交到当前 slot 的 fence，让 GPU 执行
+  3. vkDeviceWaitIdle() — 等待所有 GPU 工作（包括刚提交的）完成
+  4. 清除所有 fencePending（wait 后所有 fence 已 signaled）
+  5. ensure_command_buffer_recording() — 重新 begin command buffer，让调用方透明继续录制
+```
+
+**替换的调用点**（3 处 GC/drain 路径）：
+
+| 调用点 | 文件 | 原代码 | 新代码 | 理由 |
+|--------|------|--------|--------|------|
+| proactive GC | Device.cpp:289-309 | `vkDeviceWaitIdle(b->device)` | `safe_device_wait_idle()` | **崩溃现场**：stage_and_copy_image 录制期间触发 |
+| OOM 恢复 | Resources.cpp:65-83 | `vkDeviceWaitIdle(b->device)` | `safe_device_wait_idle()` | 同上：create_buffer 调用链中触发 |
+| delete_program | Pipeline.cpp:599-606 | `vkDeviceWaitIdle(b->device)` | `safe_device_wait_idle()` | glDeleteProgram 可能在帧中间调用 |
+
+**未替换的调用点**（command buffer 未在录制，安全）：
+- `commit_frame` OOM GC（CommandStream.cpp:915）— vkEndCommandBuffer 已调用
+- `drain_and_detach_swapchain`（CommandStream.cpp:1083）— commit_frame 已调用
+- `swapchain_acquire_color` VK_TIMEOUT（SwapchainCommon.cpp:378）— commit_frame 已调用
+- `vkQueuePresentKHR` 失败（SwapchainCommon.cpp:525）— commit_frame 已调用
+- `backend_reset_device_lost`（Device.cpp:85）— deviceLost 恢复路径
+- `shutdown_device`（Device.cpp:721）— 关闭路径
+
 ## 八、验证标准
 
 - [ ] iPhone SE 3 能正常进入游戏主界面
