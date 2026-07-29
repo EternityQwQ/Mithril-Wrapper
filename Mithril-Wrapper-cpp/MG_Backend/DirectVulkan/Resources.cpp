@@ -165,9 +165,9 @@ void destroy_texture_entry(TextureEntry& e) {
 // out the entry. The actual vkDestroy* / vkFreeMemory calls happen in
 // drain_disposal_queue() after the slot's fence is waited — by then the GPU
 // has finished all command buffers that might reference these resources.
-// This prevents the Metal resource UAF crash where MoltenVK's deferred
-// encoding (MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1) retains MTLBuffer/
-// MTLTexture wrappers that were already freed by an immediate vkDestroy*.
+// This prevents the Metal resource UAF crash where MoltenVK's command
+// encoding retains MTLBuffer/MTLTexture wrappers that were already freed
+// by an immediate vkDestroy*.
 void defer_destroy_buffer_entry(BufferEntry& e) {
     Backend* b = backend();
     if (!b->device) return;

@@ -299,11 +299,24 @@ bool init_device() {
     //   encoding is complete. Prevents submit races on iOS. (MoltenVK default
     //   is 1, but we set it explicitly for determinism.)
     //
-    // MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1: Pre-fill Metal command
-    //   buffers at vkQueueSubmit time instead of deferring to present time.
-    //   This ensures the Metal command buffer (and its IOSurface bindings)
-    //   are fully encoded before present, avoiding races where the present
-    //   engine reads an unbound IOSurface. Amethyst sets this for stability.
+    // MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=0 (SIGBUS 对齐崩溃根因修复):
+    //   MoltenVK prefill 模式：
+    //     0 = 提交时编码（vkQueueSubmit 时创建 Metal command buffer）— 默认
+    //     1 = vkEndCommandBuffer() 时编码（deferred encoding）
+    //     2 = 每条命令立即编码
+    //
+    //   原设为 1 是为了"避免 present 时 IOSurface 未绑定竞态"，但这是个
+    //   误解：prefill=1 实际在 vkEndCommandBuffer() 时触发 deferred encoding，
+    //   而 MoltenVK 命令池中的 MVKCmdBufferImageCopy 对象分配可能未满足
+    //   8 字节对齐（ARMv8 ldr x9,[x9,#0xE0] 要求 8 字节对齐），导致 SIGBUS
+    //   (BUS_ADRALN) 崩溃。崩溃栈：
+    //     MVKCmdBufferImageCopy::encode → checkDeferredEncoding →
+    //     MVKCommandBuffer::end() → vkEndCommandBuffer → commit_frame
+    //
+    //   改为 0（提交时编码）规避了 vkEndCommandBuffer 时的 deferred
+    //   encoding 路径，从而避免命令池对齐崩溃。IOSurface 绑定竞态已通过
+    //   commit_frame 中的 dummy render pass（CommandStream.cpp:706-768）
+    //   和 imageAvailable semaphore 等待解决，不再依赖 prefill。
     //
     // MVK_CONFIG_RESUME_LOST_DEVICE=1: Automatically attempt to recover from
     //   VK_ERROR_DEVICE_LOST by re-creating the VkDevice. Without this, a
@@ -327,7 +340,7 @@ bool init_device() {
     //   MoltenVK 阻塞等待前一个 command buffer 完成，可能导致死锁
     //   （若前一个的 fence 还没被 ensure_command_buffer_recording 等待）。
     setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 1);
-    setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "1", 1);
+    setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "0", 1);
     setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 1);
     setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "1", 1);
     setenv("MVK_CONFIG_SUBMIT_COMMAND_BUFFERS_PER_QUEUE", "2", 1);

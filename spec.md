@@ -304,6 +304,35 @@ try_allocate_memory_with_gc()           ← 每次纹理/buffer 分配
 
 **修复**：所有 acquire 失败路径都标记 `imageAvailableConsumed = true`，防止 `commit_frame` 等待不一致的 semaphore。下次成功 acquire 时 `swapchain_acquire_color` 会重置为 false。
 
+### 7.5 修复缺口 4：SIGBUS 对齐崩溃（MVKCmdBufferImageCopy::encode）
+
+**文件**: `Device.cpp:302-319, 343`
+
+**崩溃分析**：
+```
+SIGBUS (BUS_ADRALN) at pc=0x...in libMoltenVK.dylib
+MVKCmdBufferImageCopy<1ul>::encode(MVKCommandEncoder*)  ← ldr x9,[x9,#0xE0]
+MVKCommandEncoder::encode(...)
+MVKCommandBuffer::checkDeferredEncoding()                ← deferred encoding!
+MVKCommandBuffer::end()
+vkEndCommandBuffer                                        ← prefill=1 在此时编码
+mithril::vk::commit_frame()
+glClear
+```
+
+- `x9 = 0x0000003000000294`（非 8 字节对齐），`x9+0xE0 = 0x374`（非 8 字节对齐）
+- ARMv8 的 `ldr x9,[x9,#0xE0]`（64 位加载）要求地址 8 字节对齐 → SIGBUS
+
+**根因**：`MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1` 让 MoltenVK 在 `vkEndCommandBuffer()` 时执行 deferred encoding。此时 MoltenVK 遍历命令池中的所有命令对象（包括 `MVKCmdBufferImageCopy`）并调用其 `encode()` 方法。命令池内存分配器返回的地址可能未满足 8 字节对齐，导致访问结构体成员时触发 ARM 对齐异常。
+
+**关键发现**：原注释错误地认为 prefill=1 是"在 vkQueueSubmit 时编码"。实际上 MoltenVK 文档明确：prefill=1 = "在 vkEndCommandBuffer() 时编码"（deferred encoding）。prefill=0 = "提交时编码"（默认值）。
+
+**修复**：将 `MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS` 从 `1` 改为 `0`（MoltenVK 默认值，提交时编码）。这规避了 `vkEndCommandBuffer` 时的 deferred encoding 路径，从而避免命令池对齐崩溃。
+
+**IOSurface 绑定竞态的替代保障**：原设 prefill=1 是为了"避免 present 时 IOSurface 未绑定竞态"，但该问题已通过以下机制独立解决，不再依赖 prefill：
+- `commit_frame` 中的 dummy render pass（`CommandStream.cpp:706-768`）— 首次渲染时强制绑定 IOSurface
+- `imageAvailable` semaphore 等待（`CommandStream.cpp:821-840`）— 确保 GPU 不在 acquire 完成前渲染
+
 ## 八、验证标准
 
 - [ ] iPhone SE 3 能正常进入游戏主界面
@@ -311,6 +340,7 @@ try_allocate_memory_with_gc()           ← 每次纹理/buffer 分配
 - [ ] 无 VK_ERROR_OUT_OF_DEVICE_MEMORY
 - [ ] 无 VK_ERROR_DEVICE_LOST
 - [ ] 无红屏/黑屏（有声音无画面）
+- [ ] 无 SIGBUS (BUS_ADRALN) 对齐崩溃（MVKCmdBufferImageCopy::encode）
 - [ ] 日志无循环刷屏（每帧日志数 < 10 条）
 - [ ] allocation 数量 < maxMemoryAllocationCount 的 80%
 - [ ] deviceLost 恢复后着色器能正常编译（无 "invalid type 'main0_in'"）

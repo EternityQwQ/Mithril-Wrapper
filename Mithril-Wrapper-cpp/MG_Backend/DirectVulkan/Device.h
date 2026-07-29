@@ -34,10 +34,9 @@ constexpr int kMaxFramesInFlight = 2;
 // IOGPUMetalResource in MVKGraphicsResourcesCommandEncoderState::encodeBindings
 // during vkEndCommandBuffer → MVKCmdDrawIndexed::encode). The crash occurred
 // because glDeleteBuffers / glBufferData orphan destroyed VkBuffers immediately
-// while MoltenVK's deferred encoding (MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS=1)
-// still held references to the corresponding MTLBuffer wrappers. With deferred
-// destruction, the VkBuffer (and its MTLBuffer) survives until the GPU finishes
-// all in-flight command buffers that reference it.
+// while MoltenVK's command encoding still held references to the corresponding
+// MTLBuffer wrappers. With deferred destruction, the VkBuffer (and its MTLBuffer)
+// survives until the GPU finishes all in-flight command buffers that reference it.
 struct DeferredDestroy {
     VkBuffer       buffer = VK_NULL_HANDLE;
     VkImage        image = VK_NULL_HANDLE;
