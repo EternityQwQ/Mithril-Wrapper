@@ -313,10 +313,24 @@ bool init_device() {
     //   during SPIR-V→MSL translation to account for GL(Vulkan) vs Metal NDC
     //   differences. Our viewport code passes GL coordinates unchanged and
     //   relies on this flip. (MoltenVK default is 1, set explicitly.)
+    //
+    // MVK_CONFIG_SUBMIT_COMMAND_BUFFERS_PER_QUEUE=2 (深度参考 MobileGL 缺口):
+    //   限制每个 queue 同时未完成的 command buffer 数量。MoltenVK 默认
+    //   是 64（即允许 64 个 command buffer 并发编码），每个 command buffer
+    //   都会预分配 Metal 资源（编码器、IOSurface 引用等）。在 iPhone SE 3
+    //   这种显存受限的设备上，64 个并发 command buffer 的 Metal 资源占用
+    //   会加剧显存压力，导致 OOM。
+    //   设为 kMaxFramesInFlight(2) 后，MoltenVK 最多维护 2 个活跃 command
+    //   buffer（与我们的 per-slot 设计匹配），从默认 64 降到 2，显著降低
+    //   峰值显存占用。
+    //   注意：这个值必须 >= kMaxFramesInFlight（2），否则 submit 会被
+    //   MoltenVK 阻塞等待前一个 command buffer 完成，可能导致死锁
+    //   （若前一个的 fence 还没被 ensure_command_buffer_recording 等待）。
     setenv("MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS", "1", 1);
     setenv("MVK_CONFIG_PREFILL_METAL_COMMAND_BUFFERS", "1", 1);
     setenv("MVK_CONFIG_RESUME_LOST_DEVICE", "1", 1);
     setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "1", 1);
+    setenv("MVK_CONFIG_SUBMIT_COMMAND_BUFFERS_PER_QUEUE", "2", 1);
 
     // ---- Instance ----
     std::vector<VkExtensionProperties> instExtProps;

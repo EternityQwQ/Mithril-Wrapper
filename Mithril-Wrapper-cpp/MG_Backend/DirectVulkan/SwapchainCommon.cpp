@@ -335,6 +335,55 @@ VkImageView swapchain_acquire_color(Swapchain* sc) {
         VkResult r = vkAcquireNextImageKHR(b->device, sc->swapchain, UINT64_MAX,
                                            sc->imageAvailable, VK_NULL_HANDLE, &idx);
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+            // FIX (VK_TIMEOUT 根因 - 深度参考 MobileGL):
+            // VK_TIMEOUT 在 UINT64_MAX 超时下意味着 GPU watchdog 触发
+            // （MoltenVK 的 GPU 超时保护）。这不是 swapchain 死亡——
+            // swapchain 本身可能还活着，只是 GPU 太忙/卡住了。
+            //
+            // 原实现把 VK_TIMEOUT 和 VK_ERROR_OUT_OF_DEVICE_MEMORY 一样
+            // 标记 needsRebuild=true，导致 swapchain 被销毁重建。但重建
+            // swapchain 不能解决 GPU 卡住的问题——新 swapchain 下次 acquire
+            // 还会 VK_TIMEOUT，形成"acquire timeout → rebuild → acquire
+            // timeout"死循环，日志中反复出现 VK_TIMEOUT。
+            //
+            // 正确处理：VK_TIMEOUT 时 NOT 标记 needsRebuild，而是触发 OOM GC
+            // （vkDeviceWaitIdle + drain_all_disposal_queues）释放显存后
+            // 跳过本帧。swapchain 保留，下帧重试 acquire。
+            //
+            // 参考 MobileGL：它不处理 VK_TIMEOUT（用 UINT64_MAX 超时期望
+            // 永不超时），但在 SubmitPendingCommandBuffer 失败时（设备降级
+            // 场景）也是返回 false 让调用方跳过，而非销毁 swapchain。
+            if (r == VK_TIMEOUT) {
+                static int timeoutCount = 0;
+                timeoutCount++;
+                if (timeoutCount <= 3 || timeoutCount % 50 == 0) {
+                    MITHRIL_LOG_WARN("vk", "swapchain_acquire_color: "
+                                      "vkAcquireNextImageKHR returned VK_TIMEOUT "
+                                      "(GPU busy/watchdog, occurrence #%d) — "
+                                      "triggering OOM GC, keeping swapchain, "
+                                      "skipping frame",
+                                      timeoutCount);
+                }
+                // GPU 卡住：等待所有工作完成 + 释放延迟资源
+                if (b->device) {
+                    vkDeviceWaitIdle(b->device);
+                }
+                drain_all_disposal_queues();
+                // 清除所有 fencePending（vkDeviceWaitIdle 后所有 fence 已 signaled）
+                for (int i = 0; i < kMaxFramesInFlight; ++i) {
+                    b->fencePending[i] = false;
+                }
+                // FIX (缺口 3): acquire 返回 VK_TIMEOUT 时，imageAvailable
+                // semaphore 的状态未定义（可能 signaled 也可能未 signaled）。
+                // 标记为已消费，避免后续 commit_frame 等待一个可能永远不会
+                // signal 的 semaphore（死锁）或等待一个已 signal 的 semaphore
+                // （在本帧没有 acquire 成功的情况下等待 acquire 信号是 UB）。
+                // 下次成功 acquire 时 swapchain_acquire_color 会重置为 false。
+                sc->imageAvailableConsumed = true;
+                // 不标记 needsRebuild：swapchain 还活着，下帧重试
+                return VK_NULL_HANDLE;
+            }
+
             // FIX (日志刷屏): 限流 — 首次 + 每 100 次打印一条。
             // acquire 失败后 needsRebuild=true 会阻止重复调用，但 EGL 重建
             // swapchain 后可能再次失败，形成循环。
@@ -351,6 +400,10 @@ VkImageView swapchain_acquire_color(Swapchain* sc) {
             // Mark the swapchain dead so EGL rebuilds it; otherwise the next
             // eglSwapBuffers would call acquire again on the same dead
             // swapchain and spin forever.
+            //
+            // FIX (缺口 3): 这些致命错误下 imageAvailable semaphore 状态
+            // 也未定义。标记为已消费，避免后续 commit_frame 等待它。
+            sc->imageAvailableConsumed = true;
             sc->needsRebuild = true;
             return VK_NULL_HANDLE;
         }

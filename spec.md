@@ -257,7 +257,54 @@ try_allocate_memory_with_gc()           ← 每次纹理/buffer 分配
 - 需要完整重构 Resources.cpp 的分配路径
 - 当前三层主动式 GC + 钳制到 4096 + staging buffer 延迟释放已足够稳定
 
-## 七、验证标准
+## 七、二次深度调查修复（MobileGL 全量对比）
+
+基于对 MobileGL 完整源码（`.mobilegl_analysis/`）的 7 维度深度调查——Swapchain 重建、ImageLayout/Barrier、TextureManager deferred release、DescriptorSet/Uniform、MoltenVK 配置、deviceLost 处理、Pipeline 缓存——发现 Mithril 已对标或超越 MobileGL 的大部分机制，但仍存在 3 个关键缺口。
+
+### 7.1 MobileGL 调查核心发现
+
+**MobileGL 的设计哲学**：`VK_VERIFY` 失败即 abort（`VkIncludes.h:55-64`），无 deviceLost 恢复、无 OOM GC、无 swapchain 降级。它依赖"永远不失败"的前提——通过 VMA sub-allocation + 每帧 `BeginFrame` 主动 drain + 每 64 帧 `PruneDeadTextures` GC 来保证。
+
+**Mithril 已超越 MobileGL 的点**（无需再改）：
+- ✅ MoltenVK 配置（`MVK_CONFIG_RESUME_LOST_DEVICE=1` 等，`Device.cpp:329-333`）— MobileGL 完全无配置
+- ✅ `maxMemoryAllocationCount` 钳制到 4096（`Device.cpp:425-429`）— MobileGL 不查询
+- ✅ 主动式 GC（`backend_proactive_gc_if_needed` + `backend_poll_completed_frames`）— MobileGL 无压力触发 GC
+- ✅ deviceLost 恢复 + pipeline 负缓存清除（`Device.cpp:40-62`, `Pipeline.cpp:558-591`）— MobileGL 无恢复
+- ✅ swapchain 三级降级（`SwapchainCommon.cpp:144-177`）— MobileGL 无降级
+- ✅ TransitionToPresent 时序正确（barrier 在 vkEndCommandBuffer 前，`CommandStream.cpp:777-787`）— 对标 MobileGL `VulkanRenderer.cpp:7609`
+- ✅ imageAvailable semaphore 等待（`CommandStream.cpp:821-840`）— 对标 MobileGL `FrameContext.cpp:234`
+- ✅ 零尺寸窗口守卫（`egl.cpp:929-932`）— 对标 MobileGL commit 7ab8386
+- ✅ DescriptorSet cursor rewind + 耗尽 reset+retry（`DescriptorSet.cpp:334-374`）— 对标 MobileGL UniformManager
+
+### 7.2 修复缺口 1：VK_TIMEOUT acquire 处理（根因修复）
+
+**文件**: `SwapchainCommon.cpp:338-385`
+
+**问题**：原实现把 `VK_TIMEOUT`（GPU watchdog 触发）和 `VK_ERROR_OUT_OF_DEVICE_MEMORY` 一样标记 `needsRebuild=true`，导致 swapchain 被销毁重建。但重建 swapchain 不能解决 GPU 卡住的问题——新 swapchain 下次 acquire 还会 `VK_TIMEOUT`，形成"acquire timeout → rebuild → acquire timeout"死循环，日志中反复出现 `VK_TIMEOUT`。
+
+**修复**：`VK_TIMEOUT` 时**不**标记 `needsRebuild`，而是：
+1. `vkDeviceWaitIdle` + `drain_all_disposal_queues` 释放显存
+2. 清除所有 `fencePending`（vkDeviceWaitIdle 后所有 fence 已 signaled）
+3. 标记 `imageAvailableConsumed = true`（避免后续等待未定义状态的 semaphore）
+4. 跳过本帧，swapchain 保留，下帧重试
+
+### 7.3 修复缺口 2：MVK_CONFIG_SUBMIT_COMMAND_BUFFERS_PER_QUEUE
+
+**文件**: `Device.cpp:317-333`
+
+**问题**：MoltenVK 默认允许 64 个 command buffer 并发，每个都预分配 Metal 资源（编码器、IOSurface 引用）。在 iPhone SE 3 上这会加剧显存压力。
+
+**修复**：设置 `MVK_CONFIG_SUBMIT_COMMAND_BUFFERS_PER_QUEUE=2`（匹配 `kMaxFramesInFlight`），从默认 64 降到 2，显著降低峰值显存占用。
+
+### 7.4 修复缺口 3：acquire 失败后 imageAvailable semaphore 状态清理
+
+**文件**: `SwapchainCommon.cpp:382, 406`
+
+**问题**：`vkAcquireNextImageKHR` 失败时（VK_TIMEOUT / OOM / DEVICE_LOST），`imageAvailable` semaphore 的状态未定义（可能 signaled 也可能未 signaled）。后续 `commit_frame` 若等待它，可能死锁（等待永不 signal）或 UB（等待已 signal 但本帧未 acquire）。
+
+**修复**：所有 acquire 失败路径都标记 `imageAvailableConsumed = true`，防止 `commit_frame` 等待不一致的 semaphore。下次成功 acquire 时 `swapchain_acquire_color` 会重置为 false。
+
+## 八、验证标准
 
 - [ ] iPhone SE 3 能正常进入游戏主界面
 - [ ] 长时间运行（>30分钟）显存占用稳定不增长
