@@ -502,11 +502,11 @@ VkPipeline get_or_create_pipeline(GLuint program,
     if (r != VK_SUCCESS) {
         // FIX (红屏根因 - 瞬态失败不可永久缓存):
         // vkCreateGraphicsPipelines 可能在设备处于异常状态时因瞬态原因失败：
-        //   VK_ERROR_OUT_OF_DEVICE_MEMORY     (-4) 显存不足，设备恢复后可成功
-        //   VK_ERROR_OUT_OF_HOST_MEMORY       (-3) 主机内存不足
-        //   VK_ERROR_DEVICE_LOST              (-4) 设备丢失，恢复后可成功
+        //   VK_ERROR_OUT_OF_HOST_MEMORY       (-1) 主机内存不足
+        //   VK_ERROR_OUT_OF_DEVICE_MEMORY     (-2) 显存不足，设备恢复后可成功
         //   VK_ERROR_INITIALIZATION_FAILED    (-3) MoltenVK 着色器库编译失败
         //         （deviceLost 后 MoltenVK 内部 MSL 编译器状态异常）
+        //   VK_ERROR_DEVICE_LOST              (-4) 设备丢失，恢复后可成功
         //
         // 这些失败不是着色器本身的永久性缺陷。如果将其加入 failedSignatures
         // 负缓存，即使设备恢复后着色器可以正常编译，draw 也会被永久跳过，
@@ -517,10 +517,17 @@ VkPipeline get_or_create_pipeline(GLuint program,
         //
         // MobileGL 不做负缓存（VulkanRenderer.cpp:4183 直接返回 null），
         // 但那样会导致每帧重试。我们保留负缓存但仅用于永久性失败。
+        // 注意：这里不再检查 b->deviceLost。若 b->deviceLost 为真，上方
+        // line 233 的早期返回已先行短路返回 VK_NULL_HANDLE，不会执行到此
+        // （即原 b->deviceLost 分支为死代码）。但 vkCreateGraphicsPipelines
+        // 可能在 b->deviceLost 被 submit/fence 路径置位之前就直接返回
+        // VK_ERROR_DEVICE_LOST（设备处于坏状态但 flag 尚未设置），此时必须
+        // 显式识别为瞬态；否则 signature 会被永久缓存到 failedSignatures，
+        // 导致设备恢复后 draw 仍被永久跳过 → 红屏。
         bool isTransient = (r == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
                            r == VK_ERROR_OUT_OF_HOST_MEMORY ||
                            r == VK_ERROR_INITIALIZATION_FAILED ||
-                           b->deviceLost);
+                           r == VK_ERROR_DEVICE_LOST);
         if (!isTransient) {
             // 永久性失败：加入负缓存避免每帧重试刷屏
             pr.failedSignatures.insert(sig);

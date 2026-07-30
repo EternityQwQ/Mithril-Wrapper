@@ -156,6 +156,20 @@ struct Backend {
     VkDeviceSize   frameStagingOffset[kMaxFramesInFlight] = {};
     void*          frameStagingMapped[kMaxFramesInFlight] = {};
     bool           frameStagingReady = false;
+
+    // ---- Per-frame UBO arena (eliminates cross-frame host-write/GPU-read race) ----
+    // Each frame slot has its own 1MB host-visible VkBuffer with UNIFORM_BUFFER
+    // usage, persistently mapped. UBO data is sub-allocated (bump offset) from the
+    // arena. The offset is rewound to 0 after the fence wait in
+    // ensure_command_buffer_recording() — guaranteeing the slot's GPU work is
+    // complete, so overwriting is safe. This mirrors the per-frame staging arena
+    // design and follows MobileGL's UniformManager per-frame ring buffer pattern.
+    static constexpr VkDeviceSize kFrameUboSize = 1 * 1024 * 1024;  // 1 MB per slot
+    VkBuffer       frameUboBuffer[kMaxFramesInFlight] = {};
+    VkDeviceMemory frameUboMemory[kMaxFramesInFlight] = {};
+    VkDeviceSize   frameUboOffset[kMaxFramesInFlight] = {};
+    void*          frameUboMapped[kMaxFramesInFlight] = {};
+    bool           frameUboReady = false;
 };
 
 // Access the singleton backend state. Allocated on first call.

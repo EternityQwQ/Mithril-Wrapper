@@ -860,7 +860,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
             // FIX (degenerate window size): 窗口尺寸退化(1x1 等)时跳过重建尝试,
             // 不递增 recoveryFailCount,避免在窗口尺寸未恢复时烧尽 18 次恢复配额。
             // 退化尺寸由 ensure_swapchain 的 w<2||h<2 守卫拦截,此处提前检查
-            // 避免 backend_reset_device_lost_pending_resources() 的无效调用。
+            // 避免 backend_reset_device_lost() 的无效调用。
             {
                 int chk_w = 0, chk_h = 0;
                 if (surface_get_size(s->native_window, &chk_w, &chk_h) &&
@@ -869,19 +869,35 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                     return EGL_TRUE;  // 等待窗口尺寸恢复,不烧配额
                 }
             }
-            // FIX (黑屏根因 - deviceLost 期间显存不释放):
-            // deviceLost 期间 ensure_command_buffer_recording 早退，disposalQueue
-            // 不会被排空，延迟释放的 VkBuffer/VkImage/VkDeviceMemory 持续累积，
-            // 导致显存占用不降反升，swapchain 重建也因显存不足而失败。
+            // FIX (恢复路径循环依赖死锁):
+            // 旧实现存在鸡生蛋-蛋生鸡死锁：
+            //   (1) deviceLost 标志只在 backend_reset_device_lost() 中清除
+            //       (Device.cpp:145)
+            //   (2) 旧代码在 ensure_swapchain 重建成功之后才调用
+            //       backend_reset_device_lost() (原 line 895)
+            //   (3) 但 SwapchainCommon.cpp:34-38 在 deviceLost==true 时直接
+            //       return nullptr，短路掉重建
+            //   → 重建因 deviceLost 为 true 而失败 → deviceLost 无法清除
+            //     → 18 次失败 → EGL_FALSE → 游戏退出。
             //
-            // 参考 MobileGL TryDrainFrameTransients（VulkanRenderer.cpp:7239-7313）：
-            // present-suspend 期间主动 drain 延迟释放队列 + rewind transient arena，
-            // 防止资源累积。我们在 swapchain 重建前先 drain，释放显存给重建腾空间。
+            // 修复：在 swapchain 重建之前就调用 backend_reset_device_lost()，
+            // 先清除 deviceLost 标志打破循环依赖。该函数同时完成：
+            //   - vkDeviceWaitIdle + drain_all_disposal_queues()：排空 deviceLost
+            //     期间未被排空的 disposalQueue（deviceLost 期间
+            //     ensure_command_buffer_recording 早退，延迟释放的
+            //     VkBuffer/VkImage/VkDeviceMemory 持续累积，显存占用不降反升，
+            //     重建也因显存不足而失败），释放显存给重建腾空间。
+            //     参考 MobileGL TryDrainFrameTransients（VulkanRenderer.cpp:7239-7313）。
+            //   - clear_all_pipeline_caches()：清除 deviceLost 期间失败的着色器
+            //     负缓存与可能损坏的 VkPipeline，避免恢复后红屏/物体消失。
+            //   - b->deviceLost = false：解除 SwapchainCommon 的短路。
             //
-            // vkDeviceWaitIdle 在 deviceLost 时可能返回错误，但仍会尝试等待
-            // 已提交的 command buffer 完成，之后 drain 是安全的（资源不再被引用）。
-            mithril::vk::backend_reset_device_lost_pending_resources();
-            // 强制重建 swapchain，如果成功则重置 deviceLost
+            // 安全性：MVK_CONFIG_RESUME_LOST_DEVICE=1 (Device.cpp:434)，MoltenVK
+            // 已在内部恢复设备，因此清除 Mithril 侧的 deviceLost 标志是安全的。
+            // vkDeviceWaitIdle 在 deviceLost 时可能返回错误，但仍会尝试等待已提交
+            // 的 command buffer 完成，之后 drain 是安全的（资源不再被引用）。
+            mithril::vk::backend_reset_device_lost();
+            // 强制重建 swapchain（deviceLost 已在上面清除，解除 SwapchainCommon 短路）
             if (s->swapchain_state) {
                 backend_destroy_swapchain(s->swapchain_state);
                 s->swapchain_state = nullptr;
@@ -890,9 +906,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
             // 30 帧退避,否则双层退避叠加 = 300 帧 = 5 秒间隔,与 "0.17 秒一次"
             // 设计意图不符。deviceLost 是严重故障,需要快速重试。
             if (ensure_swapchain(s, /*skipBackoff=*/true) && s->swapchain_state) {
-                // 重建成功：重置 deviceLost，恢复渲染
-                // backend_reset_device_lost 会再次 drain + 清除 pipeline 缓存
-                mithril::vk::backend_reset_device_lost();
+                // 重建成功：deviceLost 已在重建前清除，恢复渲染
                 if (t_currentDraw == s) {
                     install_surface_on_state(s);
                 }

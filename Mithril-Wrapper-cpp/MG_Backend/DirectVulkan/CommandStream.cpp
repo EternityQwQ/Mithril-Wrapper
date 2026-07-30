@@ -396,6 +396,14 @@ bool ensure_command_buffer_recording() {
         b->frameStagingOffset[b->currentFrame] = 0;
     }
 
+    // Rewind per-frame UBO arena offset. The fence wait above guarantees this
+    // slot's GPU work is complete, so any UBO data previously sub-allocated from
+    // this slot's arena is no longer being read by the GPU — overwriting from
+    // offset 0 is safe. Mirrors the staging arena rewind above.
+    if (b->frameUboReady) {
+        b->frameUboOffset[b->currentFrame] = 0;
+    }
+
     return true;
 }
 

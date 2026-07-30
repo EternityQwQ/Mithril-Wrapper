@@ -412,15 +412,56 @@ void bind_program_descriptors(GLuint program) {
                 }
             }
 
-            // Stable per-(program,binding) GL name so the buffer is reused and
-            // its contents updated each frame rather than reallocated.
-            GLuint uname = program * 1000000u + db.binding + 1u;
-            VkBuffer ubuf = backend_get_or_create_buffer(uname, payload.data(), payload.size());
-            if (ubuf != VK_NULL_HANDLE) {
+            // Sub-allocate UBO data from the per-frame UBO arena (mirrors the
+            // staging arena). Each frame slot has its own persistently-mapped
+            // host-visible VkBuffer; the offset is rewound to 0 after the fence
+            // wait in ensure_command_buffer_recording() — guaranteeing the
+            // slot's GPU work is complete, so overwriting is safe. This
+            // eliminates the cross-frame host-write/GPU-read race that the old
+            // shared per-name buffer (in-place vkMapMemory+memcpy+vkUnmapMemory)
+            // suffered under kMaxFramesInFlight=2.
+            VkBuffer uboBuf = VK_NULL_HANDLE;
+            VkDeviceSize uboOffset = 0;
+            VkDeviceSize uboRange = payload.size();
+
+            if (b->frameUboReady && payload.size() <= Backend::kFrameUboSize) {
+                // Sub-allocate from per-frame UBO arena (256-byte aligned).
+                // The fence wait in ensure_command_buffer_recording() guarantees
+                // this slot's GPU work is complete, so overwriting is safe — no
+                // cross-frame host-write/GPU-read race.
+                VkDeviceSize aligned = (b->frameUboOffset[b->currentFrame] + 255) & ~255;
+                if (aligned + payload.size() <= Backend::kFrameUboSize) {
+                    std::memcpy(static_cast<char*>(b->frameUboMapped[b->currentFrame]) + aligned,
+                                payload.data(), payload.size());
+                    uboBuf = b->frameUboBuffer[b->currentFrame];
+                    uboOffset = aligned;
+                    b->frameUboOffset[b->currentFrame] = aligned + payload.size();
+                }
+            }
+
+            if (uboBuf == VK_NULL_HANDLE) {
+                // Overflow fallback: use the old per-name shared buffer path.
+                // This still has the theoretical cross-frame race, but only
+                // triggers when a single frame's UBO data exceeds 1MB
+                // (extremely rare) or when the arena is unavailable.
+                static int uboOverflowCount = 0;
+                uboOverflowCount++;
+                if (uboOverflowCount <= 3 || uboOverflowCount % 100 == 0) {
+                    MITHRIL_LOG_WARN("vk", "UBO arena overflow (slot=%d, size=%zu, "
+                                      "fail #%d) — falling back to shared buffer",
+                                      b->currentFrame, payload.size(), uboOverflowCount);
+                }
+                GLuint uname = program * 1000000u + db.binding + 1u;
+                uboBuf = backend_get_or_create_buffer(uname, payload.data(), payload.size());
+                uboOffset = 0;
+                uboRange = VK_WHOLE_SIZE;
+            }
+
+            if (uboBuf != VK_NULL_HANDLE) {
                 VkDescriptorBufferInfo bi{};
-                bi.buffer = ubuf;
-                bi.offset = 0;
-                bi.range = VK_WHOLE_SIZE;
+                bi.buffer = uboBuf;
+                bi.offset = uboOffset;
+                bi.range = uboRange;
                 bufInfos.push_back(bi);
                 VkWriteDescriptorSet w{};
                 w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

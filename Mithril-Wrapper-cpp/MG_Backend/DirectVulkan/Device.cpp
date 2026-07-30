@@ -820,6 +820,81 @@ bool init_device() {
                           "allocation count, potential Invalid Resource risk)");
     }
 
+    // ---- Per-frame UBO arena (eliminates cross-frame host-write/GPU-read race) ----
+    // 每个 frame slot 一个 1MB host-visible VkBuffer（UNIFORM_BUFFER usage），
+    // persistently mapped。UBO 数据从中 sub-allocate（bump offset），offset 在
+    // ensure_command_buffer_recording 的 fence wait 后 rewind 到 0。这消除了
+    // backend_get_or_create_buffer 在共享 VkBuffer 上 in-place 更新导致的跨帧
+    // host-write/GPU-read 竞争。镜像 staging arena 设计，参考 MobileGL
+    // UniformManager per-frame ring buffer。
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        VkBufferCreateInfo ubci{};
+        ubci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        ubci.size = Backend::kFrameUboSize;
+        ubci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        ubci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(b->device, &ubci, nullptr, &b->frameUboBuffer[i]) != VK_SUCCESS) {
+            MITHRIL_LOG_ERROR("vk", "failed to create frame UBO buffer "
+                              "(slot %d, size=%zu)", i, (size_t)Backend::kFrameUboSize);
+            break;
+        }
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(b->device, b->frameUboBuffer[i], &req);
+        uint32_t mt = find_memory_type(req.memoryTypeBits,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mt == 0xFFFFFFFFu) {
+            vkDestroyBuffer(b->device, b->frameUboBuffer[i], nullptr);
+            b->frameUboBuffer[i] = VK_NULL_HANDLE;
+            MITHRIL_LOG_ERROR("vk", "no host-visible memory type for frame UBO "
+                              "buffer (slot %d)", i);
+            break;
+        }
+        VkMemoryAllocateInfo umai{};
+        umai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        umai.allocationSize = req.size;
+        umai.memoryTypeIndex = mt;
+        if (try_allocate_memory_with_gc(b->device, &umai, nullptr,
+                                         &b->frameUboMemory[i]) != VK_SUCCESS) {
+            vkDestroyBuffer(b->device, b->frameUboBuffer[i], nullptr);
+            b->frameUboBuffer[i] = VK_NULL_HANDLE;
+            MITHRIL_LOG_ERROR("vk", "failed to allocate memory for frame UBO "
+                              "buffer (slot %d)", i);
+            break;
+        }
+        vkBindBufferMemory(b->device, b->frameUboBuffer[i],
+                           b->frameUboMemory[i], 0);
+        // Persistently map — keep mapped for the lifetime of the buffer.
+        // Host-coherent memory: writes are automatically visible to GPU.
+        if (vkMapMemory(b->device, b->frameUboMemory[i], 0,
+                        Backend::kFrameUboSize, 0,
+                        &b->frameUboMapped[i]) != VK_SUCCESS) {
+            MITHRIL_LOG_WARN("vk", "failed to persistently map frame UBO "
+                             "buffer (slot %d) — arena disabled, falling back "
+                             "to shared buffer path", i);
+            b->frameUboMapped[i] = nullptr;
+        }
+        b->frameUboOffset[i] = 0;
+    }
+    // Check if all slots were created successfully
+    b->frameUboReady = true;
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (b->frameUboBuffer[i] == VK_NULL_HANDLE) {
+            b->frameUboReady = false;
+            break;
+        }
+    }
+    if (b->frameUboReady) {
+        MITHRIL_LOG_INFO("vk", "Per-frame UBO arena initialised "
+                          "(%d slots x %zu MB, persistently mapped)",
+                          kMaxFramesInFlight,
+                          (size_t)Backend::kFrameUboSize / (1024 * 1024));
+    } else {
+        MITHRIL_LOG_WARN("vk", "Per-frame UBO arena NOT ready — falling "
+                          "back to shared per-name UBO buffer (cross-frame "
+                          "race risk)");
+    }
+
     b->initialized = true;
     MITHRIL_LOG_INFO("vk", "Vulkan 1.2 backend initialised (MoltenVK static link)");
     return true;
@@ -850,6 +925,14 @@ void shutdown_device() {
         b->frameStagingOffset[i] = 0;
     }
     b->frameStagingReady = false;
+    // Destroy per-frame UBO arena
+    for (int i = 0; i < kMaxFramesInFlight; ++i) {
+        if (b->frameUboMapped[i]) { vkUnmapMemory(b->device, b->frameUboMemory[i]); b->frameUboMapped[i] = nullptr; }
+        if (b->frameUboBuffer[i]) { vkDestroyBuffer(b->device, b->frameUboBuffer[i], nullptr); b->frameUboBuffer[i] = VK_NULL_HANDLE; }
+        if (b->frameUboMemory[i]) { vkFreeMemory(b->device, b->frameUboMemory[i], nullptr); b->frameUboMemory[i] = VK_NULL_HANDLE; }
+        b->frameUboOffset[i] = 0;
+    }
+    b->frameUboReady = false;
     if (b->device) { vkDestroyDevice(b->device, nullptr); b->device = VK_NULL_HANDLE; }
     if (b->instance) { vkDestroyInstance(b->instance, nullptr); b->instance = VK_NULL_HANDLE; }
     b->initialized = false;
