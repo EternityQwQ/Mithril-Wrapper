@@ -230,6 +230,11 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                           int unpack_alignment, GLenum format, GLenum type) {
     Backend* b = backend();
     if (!b->commandBuffer) return;
+    // FIX (proactive GC on fast path): arena 快速路径(下面 frameStagingBuffer
+    // sub-alloc)不调用 create_buffer → try_allocate_memory_with_gc,绕过
+    // proactive GC。重纹理加载场景下 VRAM 压力持续累积直到 reactive OOM。
+    // 在每次纹理上传前主动 GC,释放延迟资源,降低 OOM 概率。
+    backend_proactive_gc_if_needed();
     // With per-slot command buffers, the alias b->commandBuffer may point at
     // a just-submitted (pending) buffer after commit_frame advanced the slot.
     // ensure_command_buffer_recording() lazily switches to the current slot's

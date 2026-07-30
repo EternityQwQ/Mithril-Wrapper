@@ -191,8 +191,13 @@ bool ensure_swapchain(EglSurface* s, bool skipBackoff = false) {
     if (!s || !s->native_window) return false;
     int w = 0, h = 0;
     if (!surface_get_size(s->native_window, &w, &h)) return false;
-    if (w <= 0 || h <= 0) {
-        // Window not yet sized; defer swapchain creation to a later call.
+    if (w < 2 || h < 2) {
+        // Window not yet sized (or degenerate): defer swapchain creation.
+        // FIX (degenerate 1x1 window): 资源重载/内存压力下 CAMetalLayer
+        // drawableSize 可能塌缩为 1x1。原守卫 w<=0||h<=0 让 1x1 通过,导致
+        // deviceLost 恢复路径的 18 次重试全部尝试创建 1x1 swapchain(必然失败),
+        // 耗尽配额后返回 EGL_FALSE,宿主调用 exit(0) 退出游戏。将退化尺寸
+        // (<2)视为"尚未就绪",defer 而非 fail。
         return false;
     }
     // FIX (swapchain 重建死循环): ensure_swapchain 失败后，如果每帧都重试，
@@ -852,6 +857,18 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         s->recoveryAttemptCounter++;
         if (s->recoveryAttemptCounter >= 10 && s->native_window) {
             s->recoveryAttemptCounter = 0;
+            // FIX (degenerate window size): 窗口尺寸退化(1x1 等)时跳过重建尝试,
+            // 不递增 recoveryFailCount,避免在窗口尺寸未恢复时烧尽 18 次恢复配额。
+            // 退化尺寸由 ensure_swapchain 的 w<2||h<2 守卫拦截,此处提前检查
+            // 避免 backend_reset_device_lost_pending_resources() 的无效调用。
+            {
+                int chk_w = 0, chk_h = 0;
+                if (surface_get_size(s->native_window, &chk_w, &chk_h) &&
+                    (chk_w < 2 || chk_h < 2)) {
+                    s->recoveryAttemptCounter = 0;
+                    return EGL_TRUE;  // 等待窗口尺寸恢复,不烧配额
+                }
+            }
             // FIX (黑屏根因 - deviceLost 期间显存不释放):
             // deviceLost 期间 ensure_command_buffer_recording 早退，disposalQueue
             // 不会被排空，延迟释放的 VkBuffer/VkImage/VkDeviceMemory 持续累积，

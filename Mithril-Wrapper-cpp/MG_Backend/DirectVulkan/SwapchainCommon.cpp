@@ -85,6 +85,13 @@ Swapchain* create_swapchain_post_surface(VkSurfaceKHR surface, int width, int he
         extent.width = (uint32_t)width;
         extent.height = (uint32_t)height;
     }
+    // 深度对标 MobileGL SwapchainObject.cpp:191-196: 将 extent 钳制到 surface
+    // caps 的 [minImageExtent, maxImageExtent] 范围。currentExtent 可能报告
+    // 退化值(1x1)或越界值,钳制确保 vkCreateSwapchainKHR 收到合法 extent。
+    if (extent.width < caps.minImageExtent.width) extent.width = caps.minImageExtent.width;
+    if (extent.height < caps.minImageExtent.height) extent.height = caps.minImageExtent.height;
+    if (extent.width > caps.maxImageExtent.width) extent.width = caps.maxImageExtent.width;
+    if (extent.height > caps.maxImageExtent.height) extent.height = caps.maxImageExtent.height;
 
     // Pick a supported composite alpha mode. The INHERIT bit may not be
     // available on all platforms; prefer OPAQUE (always supported on Metal)
