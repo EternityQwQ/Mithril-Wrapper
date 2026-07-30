@@ -205,6 +205,8 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
  */
 void apply_dynamic_state_if_dirty(VkCommandBuffer cmd) {
     if (!cmd || !mithril::g_state) return;
+    Backend* b = backend();
+    if (b->deviceLost) return;
     auto& rs = mithril::g_state->GetRenderState();
     uint16_t currentVersion = rs.GetVersion();
     auto& applied = applied_versions();
@@ -1089,12 +1091,20 @@ void commit_frame() {
             sc->needsRebuild = true;
         }
         // Reset+begin so the next frame has a recording buffer.
-        vkResetCommandBuffer(b->commandBuffer, 0);
-        VkCommandBufferBeginInfo rbi{};
-        rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vkBeginCommandBuffer(b->commandBuffer, &rbi) == VK_SUCCESS) {
-            b->commandBufferRecording = true;
+        // FIX (deviceLost UB): vkResetCommandBuffer + vkBeginCommandBuffer on a
+        // lost device is UB. When deviceLost was set by this submit (VK_ERROR_DEVICE_LOST),
+        // skip reset+begin — the command buffer stays in INVALID state until the
+        // EGL recovery path clears deviceLost and re-initializes recording via
+        // ensure_command_buffer_recording(). The non-deviceLost failure paths
+        // (OOM etc.) still reset+begin as before.
+        if (!b->deviceLost) {
+            vkResetCommandBuffer(b->commandBuffer, 0);
+            VkCommandBufferBeginInfo rbi{};
+            rbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            rbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            if (vkBeginCommandBuffer(b->commandBuffer, &rbi) == VK_SUCCESS) {
+                b->commandBufferRecording = true;
+            }
         }
         e.hasCommands = false;
         return;
@@ -1276,14 +1286,14 @@ void backend_drain_and_detach_swapchain(void) {
 
 void backend_bind_pipeline(VkPipeline pipeline) {
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (b->commandBuffer && pipeline) {
+    if (b->commandBuffer && pipeline && !b->deviceLost) {
         vkCmdBindPipeline(b->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     }
 }
 
 void backend_set_viewport(int x, int y, int w, int h, double znear, double zfar) {
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer) return;
+    if (!b->commandBuffer || b->deviceLost) return;
     // Use the GL viewport directly. GL's viewport is bottom-left origin while
     // Vulkan's is top-left, but MoltenVK flips the Y axis when translating to
     // Metal, so passing the GL values through unchanged matches the on-screen
@@ -1300,7 +1310,7 @@ void backend_set_viewport(int x, int y, int w, int h, double znear, double zfar)
 
 void backend_set_scissor(int x, int y, int w, int h) {
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer) return;
+    if (!b->commandBuffer || b->deviceLost) return;
     VkRect2D sc{};
     sc.offset.x = x; sc.offset.y = y;
     sc.extent.width = (uint32_t)w; sc.extent.height = (uint32_t)h;
@@ -1309,7 +1319,7 @@ void backend_set_scissor(int x, int y, int w, int h) {
 
 void backend_set_vertex_buffer(int slot, VkBuffer buffer, VkDeviceSize offset) {
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer || !buffer) return;
+    if (!b->commandBuffer || !buffer || b->deviceLost) return;
     VkDeviceSize offsets[1] = { offset };
     vkCmdBindVertexBuffers(b->commandBuffer, (uint32_t)slot, 1, &buffer, offsets);
 }
@@ -1338,14 +1348,14 @@ void backend_set_blend_color(float r, float g, float b, float a) {
     // NOTE: parameter `b` is the blue blend constant (float); the backend ptr
     // is renamed to avoid shadowing it.
     mithril::vk::Backend* bk = mithril::vk::backend();
-    if (!bk->commandBuffer) return;
+    if (!bk->commandBuffer || bk->deviceLost) return;
     float bc[4] = { r, g, b, a };
     vkCmdSetBlendConstants(bk->commandBuffer, bc);
 }
 
 void backend_set_depth_bias(float slope, float clamp) {
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer) return;
+    if (!b->commandBuffer || b->deviceLost) return;
     vkCmdSetDepthBias(b->commandBuffer, slope, clamp, 0.0f);
 }
 
@@ -1405,7 +1415,7 @@ void backend_set_stencil_state(int enabled, int func, int ref, int mask,
 void backend_draw_arrays(int primitive, int first, int count) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer) return;
+    if (!b->commandBuffer || b->deviceLost) return;
     mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     vkCmdDraw(b->commandBuffer, (uint32_t)count, 1, (uint32_t)first, 0);
 }
@@ -1414,7 +1424,7 @@ void backend_draw_indexed(int primitive, int count, int index_type,
                           VkBuffer index_buffer, VkDeviceSize index_offset) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer || !index_buffer) return;
+    if (!b->commandBuffer || !index_buffer || b->deviceLost) return;
     mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     VkIndexType t = (index_type == 1) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     vkCmdBindIndexBuffer(b->commandBuffer, index_buffer, index_offset, t);
@@ -1424,7 +1434,7 @@ void backend_draw_indexed(int primitive, int count, int index_type,
 void backend_draw_arrays_instanced(int primitive, int first, int count, int primcount) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer) return;
+    if (!b->commandBuffer || b->deviceLost) return;
     mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     vkCmdDraw(b->commandBuffer, (uint32_t)count, (uint32_t)primcount, (uint32_t)first, 0);
 }
@@ -1434,7 +1444,7 @@ void backend_draw_indexed_instanced(int primitive, int count, int index_type,
                                     int primcount) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->commandBuffer || !index_buffer) return;
+    if (!b->commandBuffer || !index_buffer || b->deviceLost) return;
     mithril::vk::apply_dynamic_state_if_dirty(b->commandBuffer);
     VkIndexType t = (index_type == 1) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
     vkCmdBindIndexBuffer(b->commandBuffer, index_buffer, index_offset, t);

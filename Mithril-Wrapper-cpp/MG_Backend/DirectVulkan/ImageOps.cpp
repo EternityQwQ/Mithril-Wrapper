@@ -45,6 +45,9 @@ struct OneShotCtx {
 
 bool begin_one_shot(OneShotCtx& c) {
     Backend* b = backend();
+    // FIX (deviceLost guard): 在 lost device 上 vkAllocateCommandBuffers /
+    // vkBeginCommandBuffer 行为未定义。短路返回 false,调用方跳过 one-shot 操作。
+    if (b->deviceLost) return false;
     VkCommandBufferAllocateInfo ai{};
     ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     ai.commandPool = b->commandPool;
@@ -81,7 +84,16 @@ void end_one_shot(OneShotCtx& c) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &c.cmd;
     vkQueueSubmit(b->graphicsQueue, 1, &si, c.fence);
-    vkWaitForFences(b->device, 1, &c.fence, VK_TRUE, UINT64_MAX);
+    // FIX (hang prevention): UINT64_MAX 超时在 submit 失败(deviceLost/OOM)时
+    // 永久挂起,因为 fence 永远不会被 signal。改为 6 秒有限超时,超时后
+    // 销毁资源并返回,不阻塞渲染线程。
+    VkResult waitResult = vkWaitForFences(b->device, 1, &c.fence, VK_TRUE, 6000000000ULL);
+    if (waitResult != VK_SUCCESS) {
+        MITHRIL_LOG_ERROR("vk", "end_one_shot: vkWaitForFences %s (timeout=%d) "
+                          "— submit may have failed on lost/unstable device",
+                          waitResult == VK_TIMEOUT ? "timed out" : "failed",
+                          waitResult == VK_TIMEOUT);
+    }
     vkDestroyFence(b->device, c.fence, nullptr);
     vkFreeCommandBuffers(b->device, b->commandPool, 1, &c.cmd);
     c.cmd = VK_NULL_HANDLE;
