@@ -3,6 +3,7 @@
 // + encoder dynamic-state setters + draw recording + per-frame submit.
 #include "CommandStream.h"
 #include "Device.h"
+#include "Pipeline.h"   // reset_descriptor_caches_for_slot (per-frame UAF fix)
 #include "Swapchain.h"
 #include "../Backend.h"
 #include "../../MG_Impl/Log.h"
@@ -349,6 +350,16 @@ bool ensure_command_buffer_recording() {
             return false;
         }
         b->fencePending[b->currentFrame] = false;
+
+        // FIX (UAF root cause): Reset descriptor pools for this slot BEFORE
+        // draining the disposal queue. Cached descriptor sets in allocatedSets[]
+        // reference VkImageViews that drain_disposal_queue is about to destroy.
+        // Without this reset, vkUpdateDescriptorSets on a reused set would access
+        // the freed view → SIGSEGV in MVKCombinedImageSamplerDescriptor::write.
+        // vkResetDescriptorPool frees all sets, eliminating the dangling references.
+        // Safe after fence wait (VUID-vkResetDescriptorPool-descriptorPool-00313).
+        mithril::vk::reset_descriptor_caches_for_slot(b->currentFrame);
+
         // The fence wait guarantees all GPU work submitted to this slot has
         // completed. Any resources deferred to this slot's disposal queue
         // (glDeleteBuffers / glBufferData orphan / glDeleteTextures from the

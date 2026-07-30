@@ -628,6 +628,30 @@ void clear_all_pipeline_caches() {
                       "reset descriptor pools/caches (device recovery)");
 }
 
+void reset_descriptor_caches_for_slot(int slot) {
+    Backend* b = backend();
+    if (!b->device || slot < 0 || slot >= kMaxFramesInFlight) return;
+    auto& tbl = program_table();
+    for (auto& kv : tbl) {
+        ProgramResources& pr = kv.second;
+        if (pr.descriptorPools[slot] != VK_NULL_HANDLE) {
+            VkResult rc = vkResetDescriptorPool(b->device, pr.descriptorPools[slot], 0);
+            if (rc != VK_SUCCESS) {
+                static int resetFailLog = 0;
+                resetFailLog++;
+                if (resetFailLog <= 3 || resetFailLog % 100 == 0) {
+                    MITHRIL_LOG_WARN("vk", "vkResetDescriptorPool failed (slot=%d, "
+                                      "rc=%d, log %d) — descriptor sets may be stale",
+                                      slot, (int)rc, resetFailLog);
+                }
+            }
+        }
+        pr.allocatedSets[slot].clear();
+        pr.setCursor[slot] = 0;
+        pr.lastFrameGen[slot] = 0;
+    }
+}
+
 void delete_program_resources(GLuint program) {
     Backend* b = backend();
     auto& tbl = program_table();

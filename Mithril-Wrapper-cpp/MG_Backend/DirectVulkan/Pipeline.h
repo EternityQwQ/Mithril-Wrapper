@@ -49,29 +49,34 @@ struct ProgramResources {
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout      pipelineLayout = VK_NULL_HANDLE;
     // One pool per frame-in-flight slot, created with
-    // VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT. bind_program_descriptors()
-    // reuses cached sets via cursor rewind (see allocatedSets/setCursor below)
-    // instead of vkResetDescriptorPool — the latter requires all in-flight sets
-    // to be complete (VUID-vkResetDescriptorPool-descriptorPool-00313), and even
-    // though ensure_command_buffer_recording() waits on the slot's fence before
-    // we touch the pool, avoiding reset entirely is more robust against any
-    // future code path that might allocate mid-frame. This mirrors MobileGL's
-    // UniformManager (UniformManager.cpp:183,1026), which also avoids
-    // vkResetDescriptorPool in favor of cursor rewind + set reuse.
+    // VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT. The pool is RESET
+    // every frame via reset_descriptor_caches_for_slot() (called from
+    // ensure_command_buffer_recording() AFTER the fence wait but BEFORE
+    // drain_disposal_queue()), which frees every VkDescriptorSet allocated
+    // from it so the next frame allocates fresh sets.
+    //
+    // WHY per-frame reset instead of cursor-rewind + set reuse: the previous
+    // approach kept descriptor sets alive across frames. Those cached sets
+    // referenced VkImageViews that drain_disposal_queue() destroys — a
+    // Vulkan spec violation (vkDestroyImageView while a descriptor set
+    // references the view). When vkUpdateDescriptorSets rewrote a reused set,
+    // MoltenVK accessed the freed view → SIGSEGV in
+    // MVKCombinedImageSamplerDescriptor::write (si_addr=0x108).
+    // vkResetDescriptorPool is called after the fence wait, so no in-flight
+    // command buffer references these sets
+    // (VUID-vkResetDescriptorPool-descriptorPool-00313 satisfied).
     VkDescriptorPool      descriptorPools[kMaxFramesInFlight] = {};
     std::vector<DescriptorBinding> bindings;  // reflected VS+FS binding set
     bool layoutsBuilt = false;
-    // Per-slot cached descriptor sets + rewind cursor. At the start of each
-    // frame (detected via lastFrameGen != b->frameGeneration), the cursor is
-    // rewound to 0. Subsequent draws in that frame reuse
-    // allocatedSets[slot][cursor++] if available, or vkAllocateDescriptorSets
-    // a new set and appends it. The pool's FREE_DESCRIPTOR_SET_BIT flag keeps
-    // the option open to vkFreeDescriptorSets a destroyed layout's cached
-    // sets, though in practice we never free individual sets — the pool is
-    // destroyed wholesale on program deletion (which implicitly frees all
-    // sets allocated from it). Rewind is safe because it runs after the
-    // slot's fence wait in ensure_command_buffer_recording(), so no in-flight
-    // command buffer references the reused sets.
+    // Per-slot descriptor set cache + cursor, used WITHIN a single frame
+    // only. reset_descriptor_caches_for_slot() clears allocatedSets[slot],
+    // resets setCursor[slot] to 0, and zeroes lastFrameGen[slot] at the
+    // start of each frame (after the fence wait). Within the frame,
+    // bind_program_descriptors() reuses allocatedSets[slot][cursor++] if
+    // available, or vkAllocateDescriptorSets a new set and appends it.
+    // The pool's FREE_DESCRIPTOR_SET_BIT flag is retained for compatibility
+    // but individual sets are never freed — the pool is reset wholesale
+    // (per-frame) and destroyed wholesale on program deletion.
     std::vector<VkDescriptorSet> allocatedSets[kMaxFramesInFlight];
     size_t    setCursor[kMaxFramesInFlight] = {};
     uint64_t  lastFrameGen[kMaxFramesInFlight] = {};
@@ -107,6 +112,26 @@ void delete_program_resources(GLuint program);
 // 设备恢复后有机会重新编译。deviceLost 期间 MoltenVK 着色器缓存可能损坏，
 // 不清除会导致 draw 永久跳过 → 红屏/黑屏。
 void clear_all_pipeline_caches();
+
+// Per-frame per-slot descriptor pool reset. Called from
+// ensure_command_buffer_recording() AFTER the fence wait but BEFORE
+// drain_disposal_queue(). Resets the descriptor pool for the given slot
+// across ALL programs, freeing every VkDescriptorSet allocated from it.
+// This eliminates dangling VkImageView references in cached descriptor sets,
+// so the subsequent drain_disposal_queue() can safely destroy views without
+// triggering a use-after-free in MoltenVK's MVKDescriptorSet::write.
+//
+// WHY: The previous cursor-rewind + set-reuse approach (see comment above
+// descriptorPools[]) kept descriptor sets alive across frames. Those sets
+// referenced VkImageViews that drain_disposal_queue destroys — a Vulkan spec
+// violation (vkDestroyImageView while a descriptor set references the view).
+// vkUpdateDescriptorSets on a reused set then accessed the freed view →
+// SIGSEGV in MVKCombinedImageSamplerDescriptor::write (si_addr=0x108).
+//
+// vkResetDescriptorPool is safe here because the fence wait guarantees no
+// in-flight command buffer references these sets
+// (VUID-vkResetDescriptorPool-descriptorPool-00313 satisfied).
+void reset_descriptor_caches_for_slot(int slot);
 
 } // namespace vk
 } // namespace mithril
