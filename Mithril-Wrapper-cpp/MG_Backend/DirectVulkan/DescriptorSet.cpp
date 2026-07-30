@@ -293,6 +293,34 @@ DefaultTexture& default_texture() {
     return dt;
 }
 
+// FIX (device lost 恢复 - default_texture 重建):
+// default_texture() 是进程级 static 局部变量，创建一次后永不销毁。device lost
+// 后 MoltenVK 可能内部重建 MTLDevice，使 default_texture 的 VkImageView 底层
+// MTLTexture 变为 NULL，但句柄仍非 NULL → NULL 检查通过 → MoltenVK 解引用
+// 旧 Metal 纹理 → 崩溃。本函数销毁旧 default_texture 资源并把字段重置为 NULL
+// 句柄，使下次访问 default_texture() 时落入重建分支。由 backend_reset_device_lost()
+// 调用。
+void reset_default_texture() {
+    Backend* b = backend();
+    // default_texture() 使用 static 局部变量。调用它拿到引用，
+    // 然后销毁其资源并把字段重置为 NULL 句柄。下次调用 default_texture()
+    // 会看到 NULL 句柄并重新创建。
+    DefaultTexture& dt = default_texture();
+    if (b->device) {
+        if (dt.view != VK_NULL_HANDLE)    vkDestroyImageView(b->device, dt.view, nullptr);
+        if (dt.sampler != VK_NULL_HANDLE) vkDestroySampler(b->device, dt.sampler, nullptr);
+        if (dt.image != VK_NULL_HANDLE)   vkDestroyImage(b->device, dt.image, nullptr);
+        if (dt.memory != VK_NULL_HANDLE)  {
+            vkFreeMemory(b->device, dt.memory, nullptr);
+            if (b->currentAllocationCount > 0) b->currentAllocationCount--;
+        }
+    }
+    dt.view = VK_NULL_HANDLE;
+    dt.sampler = VK_NULL_HANDLE;
+    dt.image = VK_NULL_HANDLE;
+    dt.memory = VK_NULL_HANDLE;
+}
+
 void bind_program_descriptors(GLuint program) {
     Backend* b = backend();
     if (!b->initialized || !b->commandBuffer || program == 0) return;

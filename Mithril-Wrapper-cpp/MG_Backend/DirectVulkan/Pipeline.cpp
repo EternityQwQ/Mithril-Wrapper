@@ -593,10 +593,39 @@ void clear_all_pipeline_caches() {
             }
         }
         pr.pipelines.clear();
+
+        // FIX (UAF in MVKCombinedImageSamplerDescriptor::write):
+        // device lost 恢复路径 (backend_reset_device_lost) 在 vkDeviceWaitIdle
+        // 之后调用 drain_all_disposal_queues，会销毁 VkImageView。但
+        // allocatedSets 里缓存的 descriptor set 仍引用这些 view —— 当下一帧
+        // bind_program_descriptors 复用某个 cached set 并通过
+        // vkUpdateDescriptorSets 重写它时，MoltenMVk 会解引用旧（已释放）的
+        // view → SIGSEGV。
+        // 这里 reset 每个 slot 的 descriptor pool（释放其中所有 set，但不
+        // 销毁 pool 本身，pool 被复用）并清空缓存，使后续
+        // bind_program_descriptors 走 vkAllocateDescriptorSets 分配全新 set，
+        // 不再引用已释放的 view。注意：descriptorSetLayout / pipelineLayout
+        // 跨恢复保持稳定，不销毁；descriptorPools 本身也不销毁，只 reset。
+        // vkResetDescriptorPool 在 vkDeviceWaitIdle 之后调用是安全的（此时
+        // 无 in-flight 命令引用这些 set）。
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            if (pr.descriptorPools[i] != VK_NULL_HANDLE) {
+                VkResult rc = vkResetDescriptorPool(b->device,
+                                                    pr.descriptorPools[i], 0);
+                if (rc != VK_SUCCESS) {
+                    MITHRIL_LOG_WARN("vk", "clear_all_pipeline_caches: "
+                                     "vkResetDescriptorPool slot=%d failed "
+                                     "(rc=%d), continuing", i, rc);
+                }
+            }
+            pr.allocatedSets[i].clear();
+            pr.setCursor[i] = 0;
+            pr.lastFrameGen[i] = 0;
+        }
     }
     MITHRIL_LOG_INFO("vk", "clear_all_pipeline_caches: cleared all "
-                      "failedSignatures + destroyed all cached pipelines "
-                      "(device recovery)");
+                      "failedSignatures + destroyed all cached pipelines + "
+                      "reset descriptor pools/caches (device recovery)");
 }
 
 void delete_program_resources(GLuint program) {

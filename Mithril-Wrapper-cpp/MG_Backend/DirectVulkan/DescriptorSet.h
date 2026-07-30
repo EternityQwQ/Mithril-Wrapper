@@ -46,6 +46,19 @@ void ensure_program_layouts(GLuint program,
  */
 void bind_program_descriptors(GLuint program);
 
+/*
+ * Destroy the process-wide default_texture's VkImage / VkDeviceMemory /
+ * VkImageView / VkSampler and reset the static to NULL handles, so the next
+ * default_texture() call recreates them on the (possibly rebuilt) MTLDevice.
+ *
+ * Called from backend_reset_device_lost(): after device lost, MoltenVK may
+ * internally rebuild the MTLDevice, leaving the cached default_texture's
+ * underlying MTLTexture NULL while the Vulkan handle stays non-NULL — the
+ * NULL check in default_texture() would pass and MoltenVK would dereference
+ * the stale Metal texture → crash. Resetting forces a clean recreate.
+ */
+void reset_default_texture();
+
 } // namespace vk
 } // namespace mithril
 

@@ -20,6 +20,7 @@
 #include "Resources.h"
 #include "CommandStream.h"  // end_render_pass, ensure_command_buffer_recording, render_pass_active
 #include "Pipeline.h"  // clear_all_pipeline_caches() for deviceLost recovery
+#include "DescriptorSet.h"  // reset_default_texture() for deviceLost recovery
 #include "../../MG_Impl/Log.h"
 
 #include <cstring>
@@ -133,6 +134,7 @@ void backend_reset_device_lost() {
         vkDeviceWaitIdle(b->device);
     }
     drain_all_disposal_queues();
+    reset_default_texture();  // 销毁 stale default_texture（Metal 后端可能已失效）
     // FIX (红屏根因 - deviceLost 恢复后清除着色器负缓存):
     // deviceLost 期间 vkCreateGraphicsPipelines 可能因设备状态异常而失败，
     // 这些失败被缓存在 failedSignatures 中。即使设备恢复后着色器可以正常

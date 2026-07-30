@@ -723,7 +723,21 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
     vci.subresourceRange.layerCount = ici.arrayLayers;
     vci.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                        VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
-    vkCreateImageView(b->device, &vci, nullptr, &e.view);
+    if (vkCreateImageView(b->device, &vci, nullptr, &e.view) != VK_SUCCESS) {
+        // ImageView creation failed — clean up the image+memory we just created
+        // and return NULL. Do NOT insert into texture_table.
+        vkDestroyImage(b->device, e.image, nullptr);
+        vkFreeMemory(b->device, e.memory, nullptr);
+        if (b->currentAllocationCount > 0) b->currentAllocationCount--;
+        static int ivFailLog = 0;
+        ivFailLog++;
+        if (ivFailLog <= 3 || ivFailLog % 100 == 0) {
+            MITHRIL_LOG_WARN("vk", "vkCreateImageView failed (texture %u, %dx%d) — "
+                              "texture will use default_texture fallback (log %d)",
+                              name, width, height, ivFailLog);
+        }
+        return VK_NULL_HANDLE;
+    }
 
     tbl[name] = e;
     return e.image;
