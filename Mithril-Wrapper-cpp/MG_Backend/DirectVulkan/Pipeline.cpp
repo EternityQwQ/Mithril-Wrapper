@@ -564,6 +564,82 @@ VkPipeline get_or_create_pipeline(GLuint program,
     return pipeline;
 }
 
+// Destroy and recreate the descriptor pool for a given slot. The old pool is
+// destroyed (its destructor chain ~MVKDescriptorPool → ~MVKDescriptorTypePool
+// → ~DescriptorClass → reset() → _mvkImageView->release() releases ALL retained
+// MVKImageView objects) and a fresh pool is created with the same configuration
+// as DescriptorSet.cpp's ensure_program_resources.
+//
+// This replaces vkResetDescriptorPool. In MoltenVK v1.2.9, vkResetDescriptorPool
+// does NOT release retained MVKImageView objects — it only resets availability
+// bits, deferring release to allocateDescriptor's "clear before reusing". If we
+// used vkResetDescriptorPool, drain_disposal_queue would destroy VkImageViews
+// while descriptor sets still reference them → UAF in allocateDescriptor's
+// reset() → SIGSEGV in MVKCombinedImageSamplerDescriptor::write (si_addr=0x108).
+//
+// The destroy+recreate destructor chain releases retained views BEFORE
+// drain_disposal_queue destroys them, eliminating the UAF. Called after the
+// fence wait (reset_descriptor_caches_for_slot) or after vkDeviceWaitIdle
+// (clear_all_pipeline_caches), so no in-flight command buffer references these
+// sets.
+static void recreate_descriptor_pool_slot(Backend* b, ProgramResources& pr, int slot) {
+    // Destroy the old pool — the destructor chain (~MVKDescriptorPool →
+    // ~MVKDescriptorTypePool → ~DescriptorClass → reset() → _mvkImageView->release())
+    // releases ALL retained MVKImageView objects. This is CRITICAL:
+    // vkResetDescriptorPool does NOT release them (MoltenVK v1.2.9 only resets
+    // availability bits, deferring release to allocateDescriptor's "Clear before
+    // reusing"). If we used vkResetDescriptorPool, drain_disposal_queue would
+    // destroy VkImageViews while descriptor sets still reference them → UAF in
+    // allocateDescriptor's reset() → SIGSEGV (si_addr=0x108).
+    if (pr.descriptorPools[slot] != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(b->device, pr.descriptorPools[slot], nullptr);
+        pr.descriptorPools[slot] = VK_NULL_HANDLE;
+    }
+
+    // Recreate the pool with the same configuration as the original creation
+    // (mirrors the logic in DescriptorSet.cpp's ensure_program_resources).
+    bool hasUBO = false, hasImg = false;
+    for (const auto& db : pr.bindings) {
+        if (db.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) hasUBO = true;
+        else if (db.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) hasImg = true;
+    }
+    std::vector<VkDescriptorPoolSize> poolSizes;
+    if (hasUBO) {
+        VkDescriptorPoolSize ps{};
+        ps.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        ps.descriptorCount = 1024;
+        poolSizes.push_back(ps);
+    }
+    if (hasImg) {
+        VkDescriptorPoolSize ps{};
+        ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ps.descriptorCount = 1024;
+        poolSizes.push_back(ps);
+    }
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpci.maxSets = 1024;
+    dpci.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+    dpci.pPoolSizes = poolSizes.data();
+    // Function-level static counter shared across all callers (per-frame slot
+    // reset + device-recovery clear). Declared once here, not inside the loop,
+    // so it isn't per-program.
+    static int poolCreateFailLog = 0;
+    if (vkCreateDescriptorPool(b->device, &dpci, nullptr, &pr.descriptorPools[slot]) != VK_SUCCESS) {
+        poolCreateFailLog++;
+        if (poolCreateFailLog <= 3 || poolCreateFailLog % 100 == 0) {
+            MITHRIL_LOG_WARN("vk", "vkCreateDescriptorPool failed during slot reset "
+                              "(slot=%d, log %d) — descriptor binding will be skipped",
+                              slot, poolCreateFailLog);
+        }
+        pr.descriptorPools[slot] = VK_NULL_HANDLE;
+    }
+    pr.allocatedSets[slot].clear();
+    pr.setCursor[slot] = 0;
+    pr.lastFrameGen[slot] = 0;
+}
+
 // FIX (红屏根因 - deviceLost 恢复后清除负缓存):
 // deviceLost 期间 vkCreateGraphicsPipelines 可能因设备状态异常而失败。
 // 如果这些失败被加入 failedSignatures 负缓存，即使设备恢复后着色器
@@ -601,31 +677,19 @@ void clear_all_pipeline_caches() {
         // bind_program_descriptors 复用某个 cached set 并通过
         // vkUpdateDescriptorSets 重写它时，MoltenMVk 会解引用旧（已释放）的
         // view → SIGSEGV。
-        // 这里 reset 每个 slot 的 descriptor pool（释放其中所有 set，但不
-        // 销毁 pool 本身，pool 被复用）并清空缓存，使后续
-        // bind_program_descriptors 走 vkAllocateDescriptorSets 分配全新 set，
-        // 不再引用已释放的 view。注意：descriptorSetLayout / pipelineLayout
-        // 跨恢复保持稳定，不销毁；descriptorPools 本身也不销毁，只 reset。
-        // vkResetDescriptorPool 在 vkDeviceWaitIdle 之后调用是安全的（此时
-        // 无 in-flight 命令引用这些 set）。
+        // 这里对每个 slot 销毁并重建 descriptor pool（而非 vkResetDescriptorPool）。
+        // 销毁会触发 ~MVKDescriptorPool 析构链，释放所有 retained MVKImageView，
+        // 这发生在 drain_disposal_queue 销毁 VkImageView 之前，消除 UAF。
+        // 注意：descriptorSetLayout / pipelineLayout 跨恢复保持稳定，不销毁。
+        // vkDeviceWaitIdle 保证 GPU 空闲，销毁 pool 安全（无 in-flight 命令引用
+        // 这些 set）。
         for (int i = 0; i < kMaxFramesInFlight; ++i) {
-            if (pr.descriptorPools[i] != VK_NULL_HANDLE) {
-                VkResult rc = vkResetDescriptorPool(b->device,
-                                                    pr.descriptorPools[i], 0);
-                if (rc != VK_SUCCESS) {
-                    MITHRIL_LOG_WARN("vk", "clear_all_pipeline_caches: "
-                                     "vkResetDescriptorPool slot=%d failed "
-                                     "(rc=%d), continuing", i, rc);
-                }
-            }
-            pr.allocatedSets[i].clear();
-            pr.setCursor[i] = 0;
-            pr.lastFrameGen[i] = 0;
+            recreate_descriptor_pool_slot(b, pr, i);
         }
     }
     MITHRIL_LOG_INFO("vk", "clear_all_pipeline_caches: cleared all "
                       "failedSignatures + destroyed all cached pipelines + "
-                      "reset descriptor pools/caches (device recovery)");
+                      "destroyed/recreated descriptor pools/caches (device recovery)");
 }
 
 void reset_descriptor_caches_for_slot(int slot) {
@@ -634,21 +698,12 @@ void reset_descriptor_caches_for_slot(int slot) {
     auto& tbl = program_table();
     for (auto& kv : tbl) {
         ProgramResources& pr = kv.second;
-        if (pr.descriptorPools[slot] != VK_NULL_HANDLE) {
-            VkResult rc = vkResetDescriptorPool(b->device, pr.descriptorPools[slot], 0);
-            if (rc != VK_SUCCESS) {
-                static int resetFailLog = 0;
-                resetFailLog++;
-                if (resetFailLog <= 3 || resetFailLog % 100 == 0) {
-                    MITHRIL_LOG_WARN("vk", "vkResetDescriptorPool failed (slot=%d, "
-                                      "rc=%d, log %d) — descriptor sets may be stale",
-                                      slot, (int)rc, resetFailLog);
-                }
-            }
-        }
-        pr.allocatedSets[slot].clear();
-        pr.setCursor[slot] = 0;
-        pr.lastFrameGen[slot] = 0;
+        // Destroy + recreate the pool (see recreate_descriptor_pool_slot) instead
+        // of vkResetDescriptorPool. The destructor chain releases retained
+        // MVKImageView objects BEFORE drain_disposal_queue destroys the
+        // VkImageViews, eliminating the UAF in
+        // MVKCombinedImageSamplerDescriptor::write (si_addr=0x108).
+        recreate_descriptor_pool_slot(b, pr, slot);
     }
 }
 
