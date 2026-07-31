@@ -133,6 +133,15 @@ void backend_reset_device_lost() {
     if (b->device) {
         vkDeviceWaitIdle(b->device);
     }
+    // FIX (MVKImageView UAF - 销毁顺序不变式):
+    // 先 clear_all_pipeline_caches()（其内部调 reset_all_descriptor_caches
+    // 销毁/重建所有 slot 的描述符池，触发 MoltenVK 析构链释放 retained
+    // MVKImageView），再 drain_all_disposal_queues()（销毁 VkImageView），
+    // 最后 reset_default_texture()（池已重置，无描述符引用 default 视图）。
+    // 顺序倒置会导致 drain 销毁的 VkImageView 仍被 allocatedSets 中的陈旧
+    // set 引用，bind_program_descriptors 复用时 vkUpdateDescriptorSets 解引用
+    // 已释放 MVKImageView → SIGSEGV (si_addr=0x108)。
+    clear_all_pipeline_caches();
     drain_all_disposal_queues();
     reset_default_texture();  // 销毁 stale default_texture（Metal 后端可能已失效）
     // FIX (红屏根因 - deviceLost 恢复后清除着色器负缓存):
@@ -143,7 +152,8 @@ void backend_reset_device_lost() {
     // 让 get_or_create_pipeline 在下次 draw 时从干净状态重新创建。
     // 参考 MobileGL RecreateSwapchain（VulkanRenderer.cpp:8579）：
     // pipelineFactory->DestroyAll() 在 swapchain 重建时销毁全部 pipeline。
-    clear_all_pipeline_caches();
+    // (注：clear_all_pipeline_caches 已在上方调用，同时清除了负缓存 + 管线 +
+    // 描述符池；此处保留注释说明 deviceLost 恢复策略的历史背景。)
     b->deviceLost = false;
     b->consecutiveSubmitFailures = 0;
 }
@@ -167,6 +177,13 @@ void backend_reset_device_lost_pending_resources() {
                               (int)waitResult);
         }
     }
+    // FIX (MVKImageView UAF - 销毁顺序不变式):
+    // deviceLost 期间 ensure_command_buffer_recording 早退，allocatedSets 中
+    // 可能残留引用即将被 drain 销毁的 VkImageView 的陈旧 set。先
+    // reset_all_descriptor_caches()（仅重置描述符池，不动管线缓存）触发
+    // MoltenVK 析构链释放 retained MVKImageView，再 drain_all_disposal_queues
+    // 销毁 VkImageView，避免 vkUpdateDescriptorSets 复用陈旧 set 时空指针解引用。
+    reset_all_descriptor_caches();
     drain_all_disposal_queues();
 }
 
@@ -232,6 +249,14 @@ int backend_poll_completed_frames() {
         VkResult fr = vkGetFenceStatus(b->device, b->frameFences[s]);
         if (fr == VK_SUCCESS) {
             // GPU 已完成该 slot 的所有工作，安全 drain
+            // FIX (MVKImageView UAF - 销毁顺序不变式):
+            // 先 reset_descriptor_caches_for_slot(s) 销毁/重建该 slot 的描述符池，
+            // 触发 MoltenVK 析构链释放 retained MVKImageView，再 drain_disposal_queue
+            // 销毁 VkImageView。否则 drain 后 fencePending[s]=false 会让
+            // ensure_command_buffer_recording 复用该 slot 时跳过 reset，allocatedSets[s]
+            // 中陈旧 set 引用已销毁视图，bind_program_descriptors 复用时
+            // vkUpdateDescriptorSets 解引用已释放 MVKImageView → SIGSEGV (si_addr=0x108)。
+            reset_descriptor_caches_for_slot(s);
             drain_disposal_queue(s);
             b->fencePending[s] = false;
             drainedSlots++;

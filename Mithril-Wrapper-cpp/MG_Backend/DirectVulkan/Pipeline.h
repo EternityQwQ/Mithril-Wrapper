@@ -153,6 +153,14 @@ void clear_all_pipeline_caches();
 // no in-flight command buffer references these sets.
 void reset_descriptor_caches_for_slot(int slot);
 
+// FIX (MVKImageView UAF - 销毁顺序不变式):
+// 重置所有 program × 所有 slot 的描述符池（销毁 + 重建），触发 MoltenVK
+// 析构链释放所有 retained MVKImageView 引用。供 backend_reset_device_lost_pending_resources
+// 等路径在 drain_all_disposal_queues() 之前调用，以满足 "drain 前先释放 retained
+// 视图" 的销毁顺序不变式（详见 reset_descriptor_caches_for_slot 上方注释）。
+// 与 clear_all_pipeline_caches() 区别：本函数仅重置描述符池，不动管线缓存。
+void reset_all_descriptor_caches();
+
 } // namespace vk
 } // namespace mithril
 

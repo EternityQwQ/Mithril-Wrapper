@@ -206,10 +206,30 @@ void shutdown_device();
 // work submitted to that slot (i.e. after vkWaitForFences on frameFences[slot]
 // or vkDeviceWaitIdle). Called by ensure_command_buffer_recording() after the
 // per-slot fence wait, and by drain_all_disposal_queues() after vkDeviceWaitIdle.
+//
+// INVARIANT (MVKImageView UAF - 销毁顺序): 任何调用方在调用本函数前，必须先
+// 调用 reset_descriptor_caches_for_slot(slot)（或对全部 slot 调
+// reset_all_descriptor_caches / clear_all_pipeline_caches）销毁并重建该 slot
+// 的描述符池，以触发 MoltenVK 析构链 (~MVKDescriptorPool → ... → release())
+// 释放所有 retained MVKImageView。否则 drain 销毁的 VkImageView 仍被
+// allocatedSets[slot] 中的陈旧 set 引用，bind_program_descriptors 复用该 set
+// 时 vkUpdateDescriptorSets 会解引用已释放的 MVKImageView → SIGSEGV
+// (si_addr=0x108)。参考实现：ensure_command_buffer_recording()
+// (CommandStream.cpp) 在 fence wait 后先 reset_descriptor_caches_for_slot
+// 再 drain_disposal_queue。
 void drain_disposal_queue(int slot);
 
 // Drain ALL disposal queue buckets. Called after vkDeviceWaitIdle (which
 // guarantees all GPU work is complete) and during shutdown_device().
+//
+// INVARIANT (MVKImageView UAF - 销毁顺序): 任何调用方在调用本函数前，必须先
+// 调用 reset_all_descriptor_caches() 或 clear_all_pipeline_caches() 销毁并
+// 重建所有 slot 的描述符池（触发 MoltenVK 析构链释放 retained MVKImageView）。
+// 已知例外（spec.md Out of scope）：shutdown_device / delete_program_resources
+// （描述符池随 program 整体销毁，allocatedSets 不会被复用）、OOM GC 路径
+// （safe_device_wait_idle 先提交+编码当前命令缓冲区，drain 时 MTLTexture 已被
+// 编码器独立 retain）。参考实现：ensure_command_buffer_recording()
+// (CommandStream.cpp:361)。
 void drain_all_disposal_queues();
 
 // FIX (SIGBUS 根因 - vkDeviceWaitIdle 触发 deferred encoding):

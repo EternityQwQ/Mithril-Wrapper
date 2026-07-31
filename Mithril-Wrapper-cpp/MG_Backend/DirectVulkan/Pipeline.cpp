@@ -669,24 +669,21 @@ void clear_all_pipeline_caches() {
             }
         }
         pr.pipelines.clear();
-
-        // FIX (UAF in MVKCombinedImageSamplerDescriptor::write):
-        // device lost 恢复路径 (backend_reset_device_lost) 在 vkDeviceWaitIdle
-        // 之后调用 drain_all_disposal_queues，会销毁 VkImageView。但
-        // allocatedSets 里缓存的 descriptor set 仍引用这些 view —— 当下一帧
-        // bind_program_descriptors 复用某个 cached set 并通过
-        // vkUpdateDescriptorSets 重写它时，MoltenMVk 会解引用旧（已释放）的
-        // view → SIGSEGV。
-        // 这里对每个 slot 销毁并重建 descriptor pool（而非 vkResetDescriptorPool）。
-        // 销毁会触发 ~MVKDescriptorPool 析构链，释放所有 retained MVKImageView，
-        // 这发生在 drain_disposal_queue 销毁 VkImageView 之前，消除 UAF。
-        // 注意：descriptorSetLayout / pipelineLayout 跨恢复保持稳定，不销毁。
-        // vkDeviceWaitIdle 保证 GPU 空闲，销毁 pool 安全（无 in-flight 命令引用
-        // 这些 set）。
-        for (int i = 0; i < kMaxFramesInFlight; ++i) {
-            recreate_descriptor_pool_slot(b, pr, i);
-        }
     }
+    // FIX (UAF in MVKCombinedImageSamplerDescriptor::write):
+    // device lost 恢复路径 (backend_reset_device_lost) 在 vkDeviceWaitIdle
+    // 之后调用 drain_all_disposal_queues，会销毁 VkImageView。但
+    // allocatedSets 里缓存的 descriptor set 仍引用这些 view —— 当下一帧
+    // bind_program_descriptors 复用某个 cached set 并通过
+    // vkUpdateDescriptorSets 重写它时，MoltenMVk 会解引用旧（已释放）的
+    // view → SIGSEGV。
+    // 这里对每个 slot 销毁并重建 descriptor pool（而非 vkResetDescriptorPool）。
+    // 销毁会触发 ~MVKDescriptorPool 析构链，释放所有 retained MVKImageView，
+    // 这发生在 drain_disposal_queue 销毁 VkImageView 之前，消除 UAF。
+    // 注意：descriptorSetLayout / pipelineLayout 跨恢复保持稳定，不销毁。
+    // vkDeviceWaitIdle 保证 GPU 空闲，销毁 pool 安全（无 in-flight 命令引用
+    // 这些 set）。
+    reset_all_descriptor_caches();
     MITHRIL_LOG_INFO("vk", "clear_all_pipeline_caches: cleared all "
                       "failedSignatures + destroyed all cached pipelines + "
                       "destroyed/recreated descriptor pools/caches (device recovery)");
@@ -704,6 +701,28 @@ void reset_descriptor_caches_for_slot(int slot) {
         // VkImageViews, eliminating the UAF in
         // MVKCombinedImageSamplerDescriptor::write (si_addr=0x108).
         recreate_descriptor_pool_slot(b, pr, slot);
+    }
+}
+
+// FIX (MVKImageView UAF - 销毁顺序不变式):
+// 重置所有 program × 所有 slot 的描述符池（销毁 + 重建），触发 MoltenVK
+// 析构链 (~MVKDescriptorPool → ~MVKDescriptorTypePool → ~DescriptorClass →
+// reset() → _mvkImageView->release()) 释放所有 retained MVKImageView 引用。
+// 供 backend_reset_device_lost_pending_resources 等路径在调用
+// drain_all_disposal_queues() (销毁 VkImageView) 之前调用，以满足
+// "drain 前先释放 retained 视图" 的销毁顺序不变式。
+//
+// 与 clear_all_pipeline_caches() 的区别：本函数仅重置描述符池，不触碰
+// failedSignatures / pipelines 缓存（那是 clear_all_pipeline_caches 的职责）。
+void reset_all_descriptor_caches() {
+    Backend* b = backend();
+    if (!b->device) return;
+    auto& tbl = program_table();
+    for (auto& kv : tbl) {
+        ProgramResources& pr = kv.second;
+        for (int i = 0; i < kMaxFramesInFlight; ++i) {
+            recreate_descriptor_pool_slot(b, pr, i);
+        }
     }
 }
 
