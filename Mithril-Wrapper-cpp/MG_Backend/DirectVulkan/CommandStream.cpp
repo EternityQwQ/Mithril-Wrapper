@@ -1084,6 +1084,12 @@ void commit_frame() {
             if (b->device) {
                 vkDeviceWaitIdle(b->device);
             }
+            // FIX (MVKImageView UAF - submit 失败 GC 路径):
+            // vkDeviceWaitIdle 后所有 fence 已 signaled 但 fencePending 未清除。
+            // allocatedSets 中陈旧 set 可能引用即将被 drain 销毁的 VkImageView。
+            // 必须先 reset_all_descriptor_caches 释放 retained MVKImageView，
+            // 再 drain 销毁 VkImageView，避免复用陈旧 set 时 SIGSEGV。
+            reset_all_descriptor_caches();
             drain_all_disposal_queues();
         }
         // vkQueueSubmit failure (e.g. VK_ERROR_OUT_OF_DEVICE_MEMORY /
@@ -1263,6 +1269,11 @@ void drain_and_detach_swapchain() {
     for (int i = 0; i < kMaxFramesInFlight; ++i) {
         b->fencePending[i] = false;
     }
+    // FIX (MVKImageView UAF - swapchain detach 路径):
+    // vkDeviceWaitIdle + 清除 fencePending 后，allocatedSets 中陈旧 set
+    // 仍引用即将被 drain 销毁的 VkImageView。必须先 reset_all_descriptor_caches
+    // 释放 retained MVKImageView，再 drain 销毁 VkImageView。
+    reset_all_descriptor_caches();
     drain_all_disposal_queues();
     b->commandBufferRecording = false;
 }

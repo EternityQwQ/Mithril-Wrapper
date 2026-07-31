@@ -5,6 +5,7 @@
 #include "Resources.h"
 #include "Device.h"
 #include "CommandStream.h"  // ensure_command_buffer_recording
+#include "Pipeline.h"       // reset_all_descriptor_caches (OOM GC UAF fix)
 #include "../Backend.h"
 #include "../../MG_Impl/Log.h"
 
@@ -69,7 +70,7 @@ VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo
     if (gcTriggerCount <= 3 || gcTriggerCount % 50 == 0) {
         MITHRIL_LOG_WARN("vk", "OOM detected (vkAllocateMemory failed), "
                           "triggering forced GC (attempt #%d): safe_device_wait_idle "
-                          "+ drain_all_disposal_queues",
+                          "+ reset_all_descriptor_caches + drain_all_disposal_queues",
                           gcTriggerCount);
     }
     Backend* b = backend();
@@ -80,6 +81,16 @@ VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo
     // deferred encoding → MVKCmdBufferImageCopy::encode → SIGBUS。
     // safe_device_wait_idle 先安全结束+提交当前 command buffer，wait 后重新 begin。
     safe_device_wait_idle();
+    // FIX (MVKImageView UAF - OOM GC 路径):
+    // safe_device_wait_idle 清除所有 fencePending=false 后调
+    // ensure_command_buffer_recording，后者因 fencePending==false 跳过
+    // reset_descriptor_caches_for_slot。若不在此处显式 reset_all_descriptor_caches，
+    // drain_all_disposal_queues 销毁 VkImageView 后，allocatedSets 中陈旧 set
+    // 仍引用已释放的 MVKImageView → 下次 bind_program_descriptors 复用该 set 时
+    // vkUpdateDescriptorSets → MVKCombinedImageSamplerDescriptor::write 解引用
+    // 已释放 MVKImageView → SIGSEGV (si_addr=0x108)。
+    // 此路径是初始化期重纹理加载（unifont/vanilla resources）时 OOM 的主要触发点。
+    reset_all_descriptor_caches();
     drain_all_disposal_queues();
 
     // GC 后重试一次

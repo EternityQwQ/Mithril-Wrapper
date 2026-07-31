@@ -327,6 +327,14 @@ bool backend_proactive_gc_if_needed() {
         // safe_device_wait_idle 先结束+提交当前 command buffer，wait 后重新 begin，
         // 让 stage_and_copy_image 可以透明地继续录制。
         safe_device_wait_idle();
+        // FIX (MVKImageView UAF - proactive GC 路径):
+        // 与 try_allocate_memory_with_gc 同理：safe_device_wait_idle 清除
+        // fencePending=false → ensure_command_buffer_recording 跳过
+        // reset_descriptor_caches_for_slot。必须在 drain 前显式
+        // reset_all_descriptor_caches，否则 allocatedSets 中陈旧 set 引用
+        // 被 drain 销毁的 VkImageView → bind_program_descriptors 复用时
+        // SIGSEGV (si_addr=0x108)。此路径在初始化期重纹理加载时频繁触发。
+        reset_all_descriptor_caches();
         drain_all_disposal_queues();
         // safe_device_wait_idle 已清除 fencePending，但重复清除无害（防御性）
         for (int i = 0; i < kMaxFramesInFlight; ++i) {

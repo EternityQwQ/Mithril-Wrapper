@@ -17,6 +17,7 @@
 #include "Swapchain.h"
 #include "Device.h"
 #include "Resources.h"
+#include "Pipeline.h"  // reset_all_descriptor_caches (OOM GC UAF fix)
 #include "../../MG_Impl/Log.h"
 
 #include <algorithm>
@@ -395,6 +396,10 @@ VkImageView swapchain_acquire_color(Swapchain* sc) {
                 if (b->device) {
                     vkDeviceWaitIdle(b->device);
                 }
+                // FIX (MVKImageView UAF - acquire VK_TIMEOUT GC 路径):
+                // vkDeviceWaitIdle 后 allocatedSets 中陈旧 set 仍引用即将被
+                // drain 销毁的 VkImageView。必须先 reset_all_descriptor_caches。
+                reset_all_descriptor_caches();
                 drain_all_disposal_queues();
                 // 清除所有 fencePending（vkDeviceWaitIdle 后所有 fence 已 signaled）
                 for (int i = 0; i < kMaxFramesInFlight; ++i) {
@@ -542,6 +547,10 @@ void swapchain_present_and_acquire(Swapchain* sc) {
             if (b->device) {
                 vkDeviceWaitIdle(b->device);
             }
+            // FIX (MVKImageView UAF - present 失败 GC 路径):
+            // vkDeviceWaitIdle 后 allocatedSets 中陈旧 set 仍引用即将被
+            // drain 销毁的 VkImageView。必须先 reset_all_descriptor_caches。
+            reset_all_descriptor_caches();
             drain_all_disposal_queues();
         }
         // The render-finished signal for THIS image has now been consumed by

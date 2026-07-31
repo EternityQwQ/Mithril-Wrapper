@@ -736,6 +736,13 @@ void delete_program_resources(GLuint program) {
     // 使用 safe_device_wait_idle 安全结束+提交当前 command buffer 后再 wait，
     // 避免 MoltenVK deferred encoding 触发 SIGBUS。
     safe_device_wait_idle();
+    // FIX (MVKImageView UAF - delete_program_resources 路径):
+    // safe_device_wait_idle 清除 fencePending=false → ensure_command_buffer_recording
+    // 跳过 reset_descriptor_caches_for_slot。drain_all_disposal_queues 销毁的
+    // VkImageView 可能被 OTHER program 的 allocatedSets 中的陈旧 set 引用。
+    // 必须先 reset_all_descriptor_caches 释放所有 program 的 retained MVKImageView，
+    // 再 drain 销毁 VkImageView。（本 program 的池会在下面被显式销毁，重复但无害。）
+    reset_all_descriptor_caches();
     // safe_device_wait_idle 保证所有 GPU 工作已完成 — drain 任何之前帧延迟的
     // buffer/texture/sampler 销毁，确保没有过期的 Vulkan handle 比 program 的
     // shader module 存活更久。
