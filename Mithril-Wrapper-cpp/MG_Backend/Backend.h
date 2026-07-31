@@ -273,12 +273,20 @@ void        backend_blit_texture(GLuint src_name, GLuint dst_name,
  *   srcX0..srcY1 / dstX0..dstY1 : source + destination rectangles (GL coords)
  *   mask   : GLbitfield of GL_COLOR_BUFFER_BIT (depth/stencil not yet supported)
  *   filter : GL_NEAREST or GL_LINEAR
+ *   is_dst_default_fbo : 1 if dst_image is the EGL default framebuffer (swapchain
+ *                        drawable), 0 if it is a user FBO texture. When 1, the
+ *                        destination Y is flipped (vulkanDstY = dst_height - glDstY)
+ *                        to convert GL bottom-left coords to Vulkan top-left coords.
+ *                        Deep reference: MobileGL ApplyNativeBlitDefaultFramebufferTransform.
+ *   dst_height : height of the destination framebuffer (in pixels). Used only when
+ *                is_dst_default_fbo is 1 for the Y flip computation.
  */
 void        backend_blit_images(VkImage src_image, VkFormat src_format,
                                 VkImage dst_image, VkFormat dst_format,
                                 int srcX0, int srcY0, int srcX1, int srcY1,
                                 int dstX0, int dstY0, int dstX1, int dstY1,
-                                GLbitfield mask, GLenum filter);
+                                GLbitfield mask, GLenum filter,
+                                int is_dst_default_fbo, int dst_height);
 
 /* ---- Samplers ---- */
 VkSampler backend_get_or_create_sampler(GLuint name, GLint min_filter, GLint mag_filter,

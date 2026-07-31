@@ -44,12 +44,23 @@
 ## 二、不改动项确认（对应 spec 4.6 / 4.7）
 
 - [x] D1. `MG_Backend/DirectVulkan/CommandStream.cpp` 的 `backend_set_viewport` 未翻转 Y（直接透传 GL viewport 值；Y 翻转已从 MoltenVK 全局移至着色器层，viewport 行为等价不变）。
-- [x] D2. `MG_Impl/Framebuffer.cpp` 的 `glBlitFramebuffer` Y 处理保持不变（Framebuffer.cpp 不在本次修改文件列表）。
-- [ ] D3. 若运行后发现 blit 路径有 Y 翻转问题，记录为后续单独修复项（不阻塞本次合并）。【待目标环境运行验证】
+- [x] D2. `MG_Backend/DirectVulkan/CommandStream.cpp` 的 `backend_set_scissor` 未翻转 Y（直接透传 GL scissor 值；对标 MobileGL `MakeClampedScissorRect`，scissor Y 不翻转）。
+
+### 根因 D：blit 到 default framebuffer 的目标 Y 翻转
+
+- [x] D3. `MG_Backend/Backend.h` 的 `backend_blit_images` 声明已增加 `int is_dst_default_fbo` 和 `int dst_height` 参数（Backend.h:284-289）。
+- [x] D4. `MG_Backend/DirectVulkan/ImageOps.cpp` 的 `blit_images_impl` 签名已增加 `bool is_dst_default_fbo, int dst_height` 参数（ImageOps.cpp:487-494）。
+- [x] D5. `blit_images_impl` 在构造 `VkImageBlit` 前正确翻转目标 Y：`if (is_dst_default_fbo && dst_height > 0) { dstY0 = dst_height - dstY0; dstY1 = dst_height - dstY1; }`（ImageOps.cpp:503-525，对标 MobileGL `ApplyNativeBlitDefaultFramebufferTransform` identity 分支）。
+- [x] D6. `backend_blit_images` 签名同步增加参数并透传到 `blit_images_impl`（ImageOps.cpp:658-684，`is_dst_default_fbo != 0` 转为 bool）。
+- [x] D7. `MG_Impl/Framebuffer.cpp` 的 `glBlitFramebuffer` 计算 `is_dst_default_fbo = (currentDrawFBO == 0)` 并获取 `dst_height`（default FBO 从 `g_state->eglDefaultHeight` 获取；用户 FBO 从 `t->height` 获取）（Framebuffer.cpp:488-507）。
+- [x] D8. `glBlitFramebuffer` 调用 `backend_blit_images` 时传入 `is_dst_default_fbo ? 1 : 0` 和 `dst_height`（Framebuffer.cpp:522-527）。
+- [x] D9. 源 Y 坐标不翻转（对标 MobileGL，源内容方向由 draw 路径决定；blit_images_impl 仅翻转 dst Y）。
+- [x] D10. 用户 FBO 目标 Y 不翻转（`is_dst_default_fbo=false` 时 if 条件不满足，直接透传 GL 坐标）。
+- [x] D11. grep 确认全工程无其他 `backend_blit_images` 调用点遗漏新参数（仅 Framebuffer.cpp:522 一处调用，Backend.h:284 声明，ImageOps.cpp:658 定义，三处已同步更新）。
 
 ## 三、编译验证
 
-- [x] E1. 修改后 6 个 .cpp 文件通过 g++ -fsyntax-only（-std=c++20 -Wall -Wextra -Wno-unused-parameter），无新增 warning/error。（注：linux 沙箱无 MoltenVK/ObjC++，仅做跨平台 C++ TU 语法检查；完整链接构建需在 Apple 目标环境进行）
+- [x] E1. 修改后的 .cpp 文件（ImageOps.cpp、Framebuffer.cpp、Drawing.cpp）通过 g++ -fsyntax-only（-std=c++20 -Wall -Wextra -Wno-unused-parameter，使用 Khronos Vulkan-Headers），无新增 warning/error。（注：linux 沙箱无 MoltenVK/ObjC++，仅做跨平台 C++ TU 语法检查；完整链接构建需在 Apple 目标环境进行）
 - [x] E2. 无未使用变量 / 未包含头文件问题。
 - [x] E3. `inject_position_fixup` 使用 `std::regex`，Shader.cpp:43 已 `#include <regex>`。
 

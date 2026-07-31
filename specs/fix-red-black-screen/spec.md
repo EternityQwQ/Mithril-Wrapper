@@ -305,16 +305,46 @@ setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "0", 1);
 - Y 翻转通过着色器层面（PositionYFlip）处理，视口不翻转
 - Mithril 修复后也是着色器层面翻转，视口保持不变
 
-### 4.7 glBlitFramebuffer Y 处理（保持不变）
+### 4.7 glBlitFramebuffer Y 处理（需修复：blit 到 default framebuffer 时翻转目标 Y）
 
-**文件**：`MG_Impl/Framebuffer.cpp`
+**文件**：`MG_Impl/Framebuffer.cpp`、`MG_Backend/DirectVulkan/ImageOps.cpp`、`MG_Backend/Backend.h`
 
-**保持现状**：`glBlitFramebuffer` 直接传递 GL 坐标到 `backend_blit_images`。
+**问题**：draw 路径的 Y 翻转已从 MoltenVK 全局开关（`MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y`）移至着色器层面（仅 default FBO 翻转）。但 blit 操作（`vkCmdBlitImage`）不经过 vertex shader，MoltenVK 对 blit 不做 Y 翻转。因此 blit 到 default framebuffer 时，GL 底左坐标系的目标 Y 坐标直接传给 Vulkan 顶左坐标系，导致画面上下颠倒 → 黑屏/错位。
 
-**理由**：
-- [Framebuffer.cpp:225-228](file:///workspace/Mithril-Wrapper-cpp/MG_Impl/Framebuffer.cpp#L225-L228) 注释说明 MoltenVK 翻转 Y，所以 GL 坐标直接用
-- 修复后 Y 翻转改为着色器层面，但 blit 操作不经过 vertex shader，blit 的 Y 翻转由 `backend_blit_images` 内部处理
-- 需要验证 `backend_blit_images` 是否正确处理 Y（可能需要单独调整，但本次修复范围聚焦 draw 路径）
+**MobileGL 的实现**（深度参考）：
+- [VulkanRenderer.cpp:5828-5830](file:///workspace/.mobilegl_analysis/VulkanRenderer.cpp#L5828-L5830)：blit 到 default framebuffer 时调用 `ApplyNativeBlitDefaultFramebufferTransform`
+- [VulkanRenderer.cpp:1650-1665](file:///workspace/.mobilegl_analysis/VulkanRenderer.cpp#L1650-L1665)：identity 变换下翻转目标 Y：
+  ```cpp
+  case VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR:
+      blitRegion.dstOffsets[0].y = dstBinding.extent.y() - blitRegion.dstOffsets[0].y;
+      blitRegion.dstOffsets[1].y = dstBinding.extent.y() - blitRegion.dstOffsets[1].y;
+      break;
+  ```
+- 源 Y 永不翻转（源内容的方向已由 draw 路径决定，GL 坐标直接读即可）
+- 用户 FBO 目标永不翻转（用户 FBO 内容保持 GL 方向供后续采样）
+
+**坐标系分析**（为什么需要翻转目标 Y）：
+- default framebuffer 内容方向（draw 路径已翻转 Y）：Vulkan Y=0（顶部）= GL 顶部内容，Vulkan Y=H（底部）= GL 底部内容
+- GL blit 目标坐标：底左原点，GL dstY=0 表示底部
+- 要将 GL 底部内容写入 default framebuffer 的 Vulkan 底部（Y=H），需要：`vulkanDstY = H - glDstY`
+- 用户 FBO 内容方向（draw 路径未翻转）：Vulkan Y=0（顶部）= GL 底部内容，Vulkan Y=H（底部）= GL 顶部内容
+- GL blit 目标坐标直接对应 Vulkan 坐标，无需翻转
+
+**修复方案**：
+1. `glBlitFramebuffer`（Framebuffer.cpp）计算 `is_dst_default_fbo = (currentDrawFBO == 0)` 和目标帧缓冲高度 `dst_height`
+2. 将 `is_dst_default_fbo` 和 `dst_height` 传递给 `backend_blit_images`
+3. `blit_images_impl`（ImageOps.cpp）在 `is_dst_default_fbo=true` 时翻转目标 Y：
+   ```cpp
+   if (is_dst_default_fbo && dst_height > 0) {
+       dstY0 = dst_height - dstY0;
+       dstY1 = dst_height - dstY1;
+   }
+   ```
+4. 源 Y 不翻转（对标 MobileGL）
+
+**不改动项**：
+- 源 Y 坐标不翻转（MobileGL 也不翻转源 Y；Minecraft Java 的典型 blit 路径是用户 FBO → default FBO，源是用户 FBO 无需翻转）
+- 视口 Y、scissor Y 不翻转（对标 MobileGL，4.6 节已说明）
 
 ## 五、实现细节
 
@@ -328,6 +358,9 @@ setenv("MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y", "0", 1);
 | `MG_Impl/Drawing.cpp` | prepare_draw 判断 default FBO，选择 SPIR-V 版本，调整 frontFace/cullMode |
 | `MG_Backend/DirectVulkan/Pipeline.cpp` | pipeline 签名增加 is_default_fbo；调整 frontFace 默认值 |
 | `MG_Backend/DirectVulkan/Device.cpp` | 移除/关闭 MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y |
+| `MG_Impl/Framebuffer.cpp` | glBlitFramebuffer 计算 is_dst_default_fbo + dst_height，传给 backend_blit_images |
+| `MG_Backend/DirectVulkan/ImageOps.cpp` | blit_images_impl / backend_blit_images 增加 is_dst_default_fbo + dst_height 参数，翻转目标 Y |
+| `MG_Backend/Backend.h` | backend_blit_images 声明增加 is_dst_default_fbo + dst_height 参数 |
 
 ### 5.2 数据流
 
@@ -373,7 +406,7 @@ mix(&is_default_fbo, sizeof(is_default_fbo));
 
 3. **frontFace 硬编码 CLOCKWISE 的兼容性**：如果某些几何体的绕序与 MC 标准不同，可能剔除错误。缓解：完全对标 MobileGL，MobileGL 在 MC 上验证过。
 
-4. **glBlitFramebuffer Y 方向**：本次修复不修改 blit 路径，如果 blit 出现 Y 翻转问题需要单独修复。
+4. **glBlitFramebuffer Y 方向**：本次修复增加了 blit 到 default framebuffer 时的目标 Y 翻转（对标 MobileGL `ApplyNativeBlitDefaultFramebufferTransform`）。源 Y 不翻转（对标 MobileGL）。如果 default FBO → 用户 FBO 的 blit 出现上下颠倒，可能需要额外翻转源 Y（MobileGL 也未处理此罕见路径）。
 
 ### 6.2 回退方案
 

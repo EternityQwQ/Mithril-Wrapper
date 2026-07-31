@@ -481,12 +481,16 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
     }
 
     // Resolve the destination FBO's colour attachment. The draw FBO is the
-    // destination.
+    // destination. Also capture the destination height for the Y-flip
+    // computation (needed when dst is the default framebuffer — see below).
     VkImage dst_image = VK_NULL_HANDLE;
     VkFormat dst_format = VK_FORMAT_UNDEFINED;
-    if (g_state->currentDrawFBO == 0) {
+    int dst_height = 0;
+    bool is_dst_default_fbo = (g_state->currentDrawFBO == 0);
+    if (is_dst_default_fbo) {
         dst_image  = g_state->eglDefaultColorImage;
         dst_format = g_state->eglDefaultColorFormat;
+        dst_height = g_state->eglDefaultHeight;
     } else {
         mithril::Framebuffer* fbo = mithril::state_get_framebuffer(g_state->currentDrawFBO);
         if (fbo) {
@@ -494,7 +498,10 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
             if (tex) {
                 dst_image = backend_get_texture_image(tex);
                 mithril::Texture* t = mithril::state_get_texture(tex);
-                if (t) dst_format = backend_vk_format_for_gl((GLenum)t->internalFormat);
+                if (t) {
+                    dst_format = backend_vk_format_for_gl((GLenum)t->internalFormat);
+                    dst_height = t->height;
+                }
             }
         }
     }
@@ -503,15 +510,21 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
     if (src_format == VK_FORMAT_UNDEFINED) src_format = VK_FORMAT_R8G8B8A8_UNORM;
     if (dst_format == VK_FORMAT_UNDEFINED) dst_format = VK_FORMAT_R8G8B8A8_UNORM;
 
-    // GL's framebuffer origin is bottom-left; Vulkan's is top-left. MoltenVK
-    // flips the Y axis when translating to Metal, so passing the GL coordinates
-    // through unchanged matches the on-screen behaviour expected by the host
-    // app (this mirrors how backend_set_viewport handles the Y flip).
+    // Y-flip handling: the draw path now flips vertex Y in the shader for
+    // default-FBO rendering (MVK_CONFIG_SHADER_CONVERSION_FLIP_VERTEX_Y=0),
+    // so default-FBO content is in Vulkan's top-left orientation. But blits
+    // bypass the vertex shader, so blitting TO the default framebuffer needs
+    // the destination Y flipped to convert GL bottom-left coords to Vulkan
+    // top-left coords. User FBOs (no Y flip in draw path) keep GL orientation,
+    // so their blit coords pass through unchanged. Deep reference: MobileGL
+    // ApplyNativeBlitDefaultFramebufferTransform (identity branch).
+    // Source Y is never flipped (MobileGL never flips src Y).
     backend_blit_images(src_image, src_format,
                         dst_image, dst_format,
                         srcX0, srcY0, srcX1, srcY1,
                         dstX0, dstY0, dstX1, dstY1,
-                        mask, filter);
+                        mask, filter,
+                        is_dst_default_fbo ? 1 : 0, dst_height);
 }
 
 /* Renderbuffers: full state-machine implementation (used rarely by MC Java,

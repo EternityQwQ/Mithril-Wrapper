@@ -490,7 +490,8 @@ void blit_images_impl(VkImage src_image, VkFormat src_format,
                       VkImageLayout dst_initial, VkImageLayout dst_final,
                       int srcX0, int srcY0, int srcX1, int srcY1,
                       int dstX0, int dstY0, int dstX1, int dstY1,
-                      GLbitfield mask, GLenum filter) {
+                      GLbitfield mask, GLenum filter,
+                      bool is_dst_default_fbo, int dst_height) {
     Backend* b = backend();
     if (!b->initialized) return;
     if (src_image == VK_NULL_HANDLE || dst_image == VK_NULL_HANDLE) return;
@@ -498,6 +499,30 @@ void blit_images_impl(VkImage src_image, VkFormat src_format,
     // need VK_IMAGE_ASPECT_DEPTH_BIT and a NEAREST filter (Vulkan forbids
     // linear filtering on depth formats).
     if (!(mask & GL_COLOR_BUFFER_BIT)) return;
+
+    // Y-flip the destination rectangle when blitting TO the EGL default
+    // framebuffer (swapchain drawable). The draw path flips vertex Y in the
+    // shader for default-FBO rendering (so on-screen content is in Vulkan's
+    // top-left orientation), but blits bypass the vertex shader. GL's blit
+    // coords are bottom-left origin; Vulkan's VkImageBlit offsets are top-left
+    // origin. Without this flip, blits to the default framebuffer produce an
+    // upside-down image (black screen / misaligned content).
+    //
+    // Deep reference: MobileGL ApplyNativeBlitDefaultFramebufferTransform
+    // (VulkanRenderer.cpp:1650-1665, identity branch):
+    //   blitRegion.dstOffsets[0].y = extent.y - blitRegion.dstOffsets[0].y;
+    //   blitRegion.dstOffsets[1].y = extent.y - blitRegion.dstOffsets[1].y;
+    //
+    // Source Y is NOT flipped (MobileGL never flips src Y). The source
+    // content's orientation is determined by the draw path: user FBO textures
+    // are in GL orientation (GL bottom at Vulkan top), so GL src coords map
+    // directly; default FBO content is in Vulkan orientation, but GL src coords
+    // reading from it still produce correct results because the content
+    // orientation and coordinate mapping are consistent within the image.
+    if (is_dst_default_fbo && dst_height > 0) {
+        dstY0 = dst_height - dstY0;
+        dstY1 = dst_height - dstY1;
+    }
 
     OneShotCtx c;
     if (!begin_one_shot(c)) return;
@@ -634,7 +659,8 @@ void backend_blit_images(VkImage src_image, VkFormat src_format,
                          VkImage dst_image, VkFormat dst_format,
                          int srcX0, int srcY0, int srcX1, int srcY1,
                          int dstX0, int dstY0, int dstX1, int dstY1,
-                         GLbitfield mask, GLenum filter) {
+                         GLbitfield mask, GLenum filter,
+                         int is_dst_default_fbo, int dst_height) {
     // Both images are assumed to be in a sampling or attachment layout before
     // the blit. The swapchain color image is in COLOR_ATTACHMENT_OPTIMAL
     // (it was just rendered into, or will be rendered into next frame); user
@@ -653,7 +679,8 @@ void backend_blit_images(VkImage src_image, VkFormat src_format,
                                   dst_image, dst_format, dst_layout, dst_layout,
                                   srcX0, srcY0, srcX1, srcY1,
                                   dstX0, dstY0, dstX1, dstY1,
-                                  mask, filter);
+                                  mask, filter,
+                                  is_dst_default_fbo != 0, dst_height);
 }
 
 } // extern "C"

@@ -49,8 +49,21 @@
 - [ ] T4.1 完整构建工程，确认无新增 warning/error。
 - [ ] T4.2 修复编译过程中发现的问题（头文件缺失、未使用变量等）。
 
-## 阶段 5：运行验证
+## 阶段 4.5：根因 D —— blit 到 default framebuffer 的目标 Y 翻转
 
+- [x] T4.5.1 `MG_Backend/Backend.h`：`backend_blit_images` 声明增加 `int is_dst_default_fbo` 和 `int dst_height` 参数。
+- [x] T4.5.2 `MG_Backend/DirectVulkan/ImageOps.cpp`：
+  - `blit_images_impl` 签名增加 `bool is_dst_default_fbo, int dst_height` 参数。
+  - 在构造 `VkImageBlit` 前翻转目标 Y：`if (is_dst_default_fbo && dst_height > 0) { dstY0 = dst_height - dstY0; dstY1 = dst_height - dstY1; }`。
+  - `backend_blit_images` 签名同步增加参数，透传到 `blit_images_impl`。
+- [x] T4.5.3 `MG_Impl/Framebuffer.cpp` `glBlitFramebuffer`：
+  - 计算 `bool is_dst_default_fbo = (g_state->currentDrawFBO == 0)`。
+  - 计算目标帧缓冲高度 `dst_height`：default FBO 从 `g_state->eglDefaultHeight` 获取；用户 FBO 从纹理 `t->height` 获取。
+  - 调用 `backend_blit_images(..., is_dst_default_fbo ? 1 : 0, dst_height)`。
+- [x] T4.5.4 确认源 Y 不翻转（对标 MobileGL）。
+- [x] T4.5.5 grep 确认无其他 `backend_blit_images` 调用点遗漏新参数（仅 Framebuffer.cpp 一处调用）。
+
+## 阶段 5：运行验证
 - [ ] T5.1 启动应用，确认主界面无红屏（F1）。
 - [ ] T5.2 进入游戏，确认画面正常、有声音（F2）。
 - [ ] T5.3 验证 GUI 渲染正确（F3）。
