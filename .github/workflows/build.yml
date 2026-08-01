@@ -195,12 +195,11 @@ jobs:
             exit 1
           fi
           echo "OK: MoltenVK v1.4.x is statically linked."
-          # Verify the old crash class is gone (refactored away in v1.4.x).
-          if nm "${DYLIB}" 2>/dev/null | grep -q "CombinedImageSampler"; then
-            echo "::error::MVKCombinedImageSamplerDescriptor symbol found — this class was removed in MoltenVK v1.4.x refactor. The build may still be linking v1.2.9."
-            exit 1
-          fi
-          echo "OK: MVKCombinedImageSamplerDescriptor not found (v1.4.x refactor confirmed)."
+          # NOTE: MVKCombinedImageSamplerDescriptor still exists in v1.4.2
+          # (removed only in a later refactor). v1.4.2 has the class but WITH
+          # the "Guard against destroyed instance retained in a descriptor"
+          # (_planes.size() check in getMTLTexture). The version string check
+          # above is sufficient to confirm the correct version is linked.
 
       - name: Ad-hoc codesign
         run: |
