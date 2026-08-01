@@ -72,14 +72,39 @@ if(APPLE)
     )
     message(STATUS "MoltenVK headers: ${MOLTENVK_INCLUDE_DIR}")
 
-    # Link against the dynamic dylib bundled in the repo.
-    find_library(MOLTENVK_LIBRARY
+    # Prefer the CI-downloaded MoltenVK v1.4.2 static framework (contains
+    # the "Guard against destroyed instance retained in a descriptor" fix
+    # in MVKImageView::getMTLTexture) over the bundled v1.2.9 dynamic
+    # dylib (lacks this guard → SIGSEGV si_addr=0x108 in
+    # MVKCombinedImageSamplerDescriptor::write). The CI workflow
+    # (build.yml:27-51) downloads the v1.4.2 iOS tarball and extracts
+    # MoltenVK.xcframework to the repo root.
+    find_library(MOLTENVK_LIBRARY_STATIC
+        NAMES libMoltenVK.a
+        PATHS
+            "${CMAKE_SOURCE_DIR}/MoltenVK.xcframework/ios-arm64"
+            "${CMAKE_SOURCE_DIR}/Mithril-Wrapper-cpp/3rdparty/MoltenVK/MoltenVK.xcframework/ios-arm64"
+        NO_CMAKE_FIND_ROOT_PATH
+    )
+    find_library(MOLTENVK_LIBRARY_DYNAMIC
         NAMES MoltenVK
         PATHS "${CMAKE_SOURCE_DIR}/Mithril-Wrapper-cpp/3rdparty/MoltenVK"
         NO_CMAKE_FIND_ROOT_PATH
-        REQUIRED
     )
-    message(STATUS "MoltenVK library: ${MOLTENVK_LIBRARY}")
+    if(MOLTENVK_LIBRARY_STATIC)
+        set(MOLTENVK_LIBRARY "${MOLTENVK_LIBRARY_STATIC}")
+        set(MOLTENVK_LINK_MODE "static")
+        message(STATUS "MoltenVK: using STATIC framework (v1.4.x) — ${MOLTENVK_LIBRARY}")
+    elseif(MOLTENVK_LIBRARY_DYNAMIC)
+        set(MOLTENVK_LIBRARY "${MOLTENVK_LIBRARY_DYNAMIC}")
+        set(MOLTENVK_LINK_MODE "dynamic")
+        message(WARNING "MoltenVK: STATIC framework not found — falling back to "
+            "DYNAMIC dylib (v1.2.9) at ${MOLTENVK_LIBRARY}. This version LACKS the "
+            "'destroyed instance retained in a descriptor' guard and WILL crash in "
+            "MVKCombinedImageSamplerDescriptor::write (si_addr=0x108).")
+    else()
+        message(FATAL_ERROR "MoltenVK: neither static framework nor dynamic dylib found.")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -284,27 +309,47 @@ if(APPLE)
     # for static libraries containing Objective-C. This flag COMBINED with
     # -force_load above ensures both ObjC and C++ initializers are loaded.
     target_include_directories(${PROJECT_NAME} PRIVATE ${MOLTENVK_INCLUDE_DIR})
-    target_link_libraries(${PROJECT_NAME} PRIVATE
-        "${MOLTENVK_LIBRARY}"
-        "-framework Metal"
-        "-framework Foundation"
-        "-framework QuartzCore"
-        "-framework CoreGraphics"
-        "-framework IOSurface"
-        "-framework UIKit"
-    )
-    # The bundled libMoltenVK.dylib has install name
-    # "@rpath/MoltenVK.framework/MoltenVK", but it's a raw dylib, not a
-    # framework bundle. Patch the load reference so libmithril.dylib looks
-    # for "@rpath/libMoltenVK.dylib" instead — which is where Amethyst
-    # places it at runtime.
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND install_name_tool -change
-            "@rpath/MoltenVK.framework/MoltenVK"
-            "@rpath/libMoltenVK.dylib"
-            "$<TARGET_FILE:${PROJECT_NAME}>"
-        COMMENT "Patching MoltenVK load path: @rpath/MoltenVK.framework/MoltenVK → @rpath/libMoltenVK.dylib"
-    )
+    if(MOLTENVK_LINK_MODE STREQUAL "static")
+        # Static link: -force_load forces ALL object files from the
+        # archive (including C++ static initializers that register Vulkan
+        # extensions). -ObjC preserves ObjC class/category symbols.
+        # See the comment block above (L262-L285) for full rationale.
+        target_link_libraries(${PROJECT_NAME} PRIVATE
+            "-Wl,-force_load,${MOLTENVK_LIBRARY}"
+            "-ObjC"
+            "-framework Metal"
+            "-framework Foundation"
+            "-framework QuartzCore"
+            "-framework CoreGraphics"
+            "-framework IOSurface"
+            "-framework UIKit"
+        )
+        # No install_name_tool patch needed — MoltenVK is statically
+        # linked into libmithril.dylib, no runtime dylib dependency.
+    else()
+        # Dynamic link: bundled v1.2.9 libMoltenVK.dylib.
+        target_link_libraries(${PROJECT_NAME} PRIVATE
+            "${MOLTENVK_LIBRARY}"
+            "-framework Metal"
+            "-framework Foundation"
+            "-framework QuartzCore"
+            "-framework CoreGraphics"
+            "-framework IOSurface"
+            "-framework UIKit"
+        )
+        # The bundled libMoltenVK.dylib has install name
+        # "@rpath/MoltenVK.framework/MoltenVK", but it's a raw dylib, not a
+        # framework bundle. Patch the load reference so libmithril.dylib looks
+        # for "@rpath/libMoltenVK.dylib" instead — which is where Amethyst
+        # places it at runtime.
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND install_name_tool -change
+                "@rpath/MoltenVK.framework/MoltenVK"
+                "@rpath/libMoltenVK.dylib"
+                "$<TARGET_FILE:${PROJECT_NAME}>"
+            COMMENT "Patching MoltenVK load path: @rpath/MoltenVK.framework/MoltenVK → @rpath/libMoltenVK.dylib"
+        )
+    endif()
     target_compile_definitions(${PROJECT_NAME} PRIVATE MITHRIL_VULKAN=1)
 else()
     target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})

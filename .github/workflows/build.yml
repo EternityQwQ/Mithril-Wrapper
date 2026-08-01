@@ -179,6 +179,29 @@ jobs:
           # contains MoltenVK-linked code by checking for an indirect symbol.
           otool -L "$DYLIB" | head -20
 
+      - name: Verify MoltenVK version (v1.4.x static, not v1.2.9)
+        run: |
+          DYLIB="${{ steps.locate.outputs.path }}"
+          echo "=== MoltenVK version strings embedded in libmithril.dylib ==="
+          # Static linking embeds MoltenVK's version string into the dylib.
+          VERSION_STR=$(strings "${DYLIB}" | grep -E "^[0-9]+\.[0-9]+\.[0-9]+$" | sort -u)
+          echo "Found version strings: ${VERSION_STR}"
+          if echo "${VERSION_STR}" | grep -q "^1\.2\.9$"; then
+            echo "::error::MoltenVK v1.2.9 is linked — this version lacks the 'destroyed instance retained in a descriptor' guard and WILL crash (SIGSEGV si_addr=0x108) in MVKCombinedImageSamplerDescriptor::write. The build must link the v1.4.x static framework."
+            exit 1
+          fi
+          if ! echo "${VERSION_STR}" | grep -qE "^1\.[4-9]\."; then
+            echo "::error::MoltenVK v1.4.x not found in linked symbols. Expected v1.4.x (has destroyed-instance guard). Found: ${VERSION_STR}"
+            exit 1
+          fi
+          echo "OK: MoltenVK v1.4.x is statically linked."
+          # Verify the old crash class is gone (refactored away in v1.4.x).
+          if nm "${DYLIB}" 2>/dev/null | grep -q "CombinedImageSampler"; then
+            echo "::error::MVKCombinedImageSamplerDescriptor symbol found — this class was removed in MoltenVK v1.4.x refactor. The build may still be linking v1.2.9."
+            exit 1
+          fi
+          echo "OK: MVKCombinedImageSamplerDescriptor not found (v1.4.x refactor confirmed)."
+
       - name: Ad-hoc codesign
         run: |
           codesign -s - "${{ steps.locate.outputs.path }}" || echo "codesign skipped (best-effort)"
