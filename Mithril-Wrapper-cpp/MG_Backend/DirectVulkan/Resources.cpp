@@ -227,7 +227,8 @@ void defer_destroy_sampler_entry(SamplerEntry& e) {
 
 void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                           int w, int h, int d, const void* pixels,
-                          int unpack_alignment, GLenum format, GLenum type) {
+                          int unpack_alignment, GLenum format, GLenum type,
+                          bool is_full_upload) {
     Backend* b = backend();
     if (!b->commandBuffer) return;
     // With per-slot command buffers, the alias b->commandBuffer may point at
@@ -359,11 +360,15 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     region.imageExtent = { (uint32_t)w, (uint32_t)h, (uint32_t)d };
 
     // Transition the image layout to TRANSFER_DST for the copy.
+    // 根因 F：部分上传（glTexSubImage*）必须用 tex.currentLayout 作为 oldLayout，
+    // 保留未更新区域的既有内容；完整上传（glTexImage*）用 UNDEFINED 丢弃旧内容。
+    // 无条件用 UNDEFINED 会导致 glTexSubImage2D 后纹理其余区域变 undefined →
+    // 纹理损坏 → 物体黑色斑块。
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.oldLayout = is_full_upload ? VK_IMAGE_LAYOUT_UNDEFINED : tex.currentLayout;
     barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -726,12 +731,14 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
 
 void backend_texture_upload(GLuint name, int level, int x, int y, int z,
                             int w, int h, int d, GLenum format, GLenum type,
-                            const void* pixels, int unpack_alignment) {
+                            const void* pixels, int unpack_alignment,
+                            int is_full_upload) {
     auto& tbl = mithril::vk::texture_table();
     auto it = tbl.find(name);
     if (it == tbl.end() || !pixels) return;
     mithril::vk::stage_and_copy_image(it->second, level, x, y, z, w, h, d,
-                                      pixels, unpack_alignment, format, type);
+                                      pixels, unpack_alignment, format, type,
+                                      is_full_upload != 0);
 }
 
 void backend_texture_set_params(GLuint name, GLint min_filter, GLint mag_filter,

@@ -16,6 +16,28 @@ namespace vk {
 
 namespace {
 
+// 根因 G (深度参考 MobileGL VulkanRenderer.cpp:193-198 ResolveColorClearAlpha):
+// 若 swapchain 颜色格式无 alpha 通道（如 R8G8B8_UNORM / B8G8R8_UNORM），
+// clear color 的 alpha 必须强制为 1.0。否则合成器（compositor）会将
+// alpha=0 的窗口视为透明 → 显示窗口后面的内容（黑屏）。当前 swapchain 恒
+// BGRA8 + compositeAlpha=OPAQUE 未触发，但此 helper 是防御性加固，对标
+// MobileGL，防止未来引入 RGB swapchain 或降级 compositeAlpha 时黑屏。
+bool format_has_alpha(VkFormat fmt) {
+    switch (fmt) {
+        case VK_FORMAT_R8G8B8_UNORM:
+        case VK_FORMAT_B8G8R8_UNORM:
+        case VK_FORMAT_R8G8B8_SRGB:
+        case VK_FORMAT_B8G8R8_SRGB:
+        case VK_FORMAT_R5G6B5_UNORM_PACK16:
+        case VK_FORMAT_R16G16B16_UNORM:
+        case VK_FORMAT_R16G16B16_SFLOAT:
+        case VK_FORMAT_R32G32B32_SFLOAT:
+            return false;
+        default:
+            return true;  // 所有 RGBA / RG / R 格式及未知格式视为有 alpha
+    }
+}
+
 // Encoder state carried between begin_render_pass() and the draw calls.
 struct EncoderState {
     bool passActive = false;
@@ -450,7 +472,14 @@ void begin_render_pass(VkImageView* color_views, int color_count,
         colorAttachs[i].clearValue.color.float32[0] = e.clearColor[0];
         colorAttachs[i].clearValue.color.float32[1] = e.clearColor[1];
         colorAttachs[i].clearValue.color.float32[2] = e.clearColor[2];
-        colorAttachs[i].clearValue.color.float32[3] = e.clearColor[3];
+        // 根因 G: 若该 attachment 是 swapchain image 且格式无 alpha，强制 alpha=1.0
+        // （对标 MobileGL ResolveColorClearAlpha），防止合成器视窗口透明 → 黑屏。
+        bool attachHasAlpha = true;
+        if (e.activeSwapchain &&
+            e.colorViews[i] == e.activeSwapchain->views[e.activeSwapchain->currentImage]) {
+            attachHasAlpha = format_has_alpha(e.activeSwapchain->format);
+        }
+        colorAttachs[i].clearValue.color.float32[3] = attachHasAlpha ? e.clearColor[3] : 1.0f;
     }
     // Depth/stencil loadOp (MobileGL ResolveDepthStencilAttachmentLoadInfo,
     // VkRenderPassManager.cpp:140-155). Same priority: hasClear -> CLEAR;
@@ -543,7 +572,12 @@ void clear_attachments(uint32_t mask, int x, int y, int w, int h) {
         cv.color.float32[0] = e.clearColor[0];
         cv.color.float32[1] = e.clearColor[1];
         cv.color.float32[2] = e.clearColor[2];
-        cv.color.float32[3] = e.clearColor[3];
+        // 根因 G: 若当前 render pass 的某个 color attachment 是 swapchain image
+        // 且格式无 alpha，强制 clear alpha=1.0（对标 MobileGL ResolveColorClearAlpha）。
+        // 对非 swapchain attachment（用户 FBO 纹理）原样使用 clearColor[3]。
+        // 这里用 activeSwapchain 格式做统一判断（MRT 中 swapchain 通常是 attachment 0）。
+        bool clearHasAlpha = !e.activeSwapchain || format_has_alpha(e.activeSwapchain->format);
+        cv.color.float32[3] = clearHasAlpha ? e.clearColor[3] : 1.0f;
         // One clear attachment per color attachment (VK_IMAGE_ASPECT_COLOR_BIT
         // covers all color aspects, but per-attachment is safer with MRT).
         for (int i = 0; i < e.colorCount; ++i) {
