@@ -280,7 +280,14 @@ static void prepare_draw(GLenum mode) {
         MGVertexAttrib& m = attribs[i];
         VkBuffer buf = backend_get_buffer(m.buffer_name);
         if (buf != VK_NULL_HANDLE) {
-            backend_set_vertex_buffer(m.location, buf, (VkDeviceSize)m.offset);
+// FIX (Root Cause H - 顶点属性偏移双重应用):
+// Vulkan 顶点寻址公式: buffer + pOffsets[binding] + vertexIndex*stride + attr.offset
+// m.offset 是属性在顶点结构内的成员偏移，必须只由 VkVertexInputAttributeDescription::offset
+// 处理（见 Pipeline.cpp:302 ad.offset = a.offset）。若同时作为 binding offset 传入，
+// 偏移会被应用两次 → 有效地址 = buffer + 2*m.offset，导致交错顶点格式（如
+// position@0/color@12/uv@24）的属性读取错位 → 加载界面红屏/花屏。
+// 参考 MobileGL VkglVertexAttribBindingState：binding offset 恒为 0，偏移由属性描述处理。
+            backend_set_vertex_buffer(m.location, buf, 0);
             if (m.location < 16) bound_slots[m.location] = true;
         }
     }

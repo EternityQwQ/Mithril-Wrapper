@@ -677,7 +677,16 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
     ici.arrayLayers = (imgType == VK_IMAGE_TYPE_3D) ? 1 : (target == GL_TEXTURE_CUBE_MAP ? 6 : 1);
     ici.samples = (VkSampleCountFlagBits)(samples > 1 ? samples : 1);
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // FIX (Root Cause I - 颜色纹理缺 COLOR_ATTACHMENT_BIT):
+    // Minecraft 延迟渲染器通过 glFramebufferTexture2D 将颜色纹理绑定为 FBO 颜色附件。
+    // Vulkan 规范要求颜色附件图像必须含 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT，
+    // 否则渲染被 MoltenVK 静默丢弃（无验证错误，release 构建下不可见）→ FBO 渲染
+    // 内容丢失 → swapchain 仅剩 clear color → 进游戏后黑屏。
+    // 对所有颜色纹理无条件添加此 bit（Vulkan 允许设置未使用的 usage bit，无副作用），
+    // 对标 MobileGL VulkanRenderer::CreateTexture 的纹理创建策略。
+    // 注意：仅对颜色格式添加；depth/stencil 格式由下方 if 分支单独处理。
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+              | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     // Depth/stencil attachments also need to be renderable.
     if (fmt == VK_FORMAT_D16_UNORM || fmt == VK_FORMAT_D32_SFLOAT ||
         fmt == VK_FORMAT_D24_UNORM_S8_UINT || fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) {

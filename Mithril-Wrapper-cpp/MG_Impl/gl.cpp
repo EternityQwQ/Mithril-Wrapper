@@ -46,17 +46,24 @@ void glClear(GLbitfield mask) {
     int w = 0, h = 0;
     int n = mithril::collect_draw_fbo_attachments(colors, &depth, &w, &h);
 
-    // FIX: Use LOAD (not CLEAR) for the render pass, then vkCmdClearAttachments
-    // to clear ONLY the aspects specified by `mask`. The old code used
-    // loadOp=CLEAR which cleared ALL attachments regardless of mask — so
-    // glClear(GL_DEPTH_BUFFER_BIT) would wipe the color buffer too, causing
-    // black screen. This matches MobileGL's Clear() implementation
-    // (VulkanRenderer.cpp:4230-4358) which uses vkCmdClearAttachments.
+    // FIX (Root Cause J - glClear 帧内提前提交):
+    // GL 语义: glClear 是录制命令，仅追加 clear 到当前 command buffer，不触发帧提交。
+    // 帧边界是 eglSwapBuffers（eglWaitClient/glFinish 是显式同步点）。
+    // 旧代码在 glClear 末尾调用 backend_commit() → 提交 command buffer 并信号
+    // renderFinished → 后续 glDraw* 无法追加到同一 command buffer（已提交）。
+    // 典型帧序列 glClear→glDraw→eglSwapBuffers 被破坏：compositor 只看到 clear
+    // color（黑屏），draw 命令丢失或错位到下一帧 → 进游戏后黑屏有声音。
+    // 移除 backend_commit()，clear 命令保留在当前 command buffer，由 eglSwapBuffers
+    // 统一提交。对标 MobileGL Clear() (VulkanRenderer.cpp:4230-4358): 仅录
+    // vkCmdClearAttachments，不调用 EndCommandBuffer/QueueSubmit。
+    //
+    // 同时保留 LOAD+vkCmdClearAttachments 模式（旧 FIX）：只清除 mask 指定的 aspect，
+    // 避免 glClear(GL_DEPTH_BUFFER_BIT) 误清颜色缓冲。
     backend_set_load_load();
     backend_begin_render_pass(colors, n, depth, w, h, 1);
     backend_clear_attachments(mask, 0, 0, w, h);
     backend_end_render_pass();
-    backend_commit();
+    // 不调用 backend_commit() — 帧提交由 eglSwapBuffers 统一处理。
 }
 
 /* ---- Enable / Disable ----
