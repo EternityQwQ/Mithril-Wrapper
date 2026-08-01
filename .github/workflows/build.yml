@@ -217,8 +217,14 @@ jobs:
           fi
           echo "OK: no vk*/mvk* symbols exported."
           echo "=== Verifying libmithril public API still exported ==="
+          # nm on Darwin prefixes every symbol with a leading underscore
+          # (e.g. "_eglGetDisplay"), so the grep MUST match the optional '_'
+          # and the nm type flag — same pattern used by the EGL verification
+          # step above. A bare " ${sym}$" pattern silently fails to match the
+          # underscore-prefixed name, producing a false "NOT exported" error
+          # even though the symbol IS in the export table.
           for sym in eglGetDisplay eglCreateContext eglSwapBuffers backend_init backend_available; do
-            if ! nm -gU "${DYLIB}" | grep -q " ${sym}$"; then
+            if ! nm -gU "${DYLIB}" | grep -qE " [Tt] _?${sym}$"; then
               echo "::error::Required public symbol '${sym}' is NOT exported — export list is too restrictive."
               exit 1
             fi
