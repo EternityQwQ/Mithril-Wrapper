@@ -1,0 +1,25 @@
+# libmithril.dylib exported symbol whitelist.
+# Applied via -Wl,-exported_symbols_list when statically linking MoltenVK
+# (MOLTENVK_LINK_MODE == "static") to prevent vk*/mvk* symbol leakage.
+#
+# libmithril's public API is entirely extern "C" (no C++ mangling).
+# Darwin symbol names have a leading underscore prefix.
+# ld64 (Xcode 12+) supports glob wildcards (* and ?) in export lists.
+#
+# These patterns export ONLY libmithril's own API. All MoltenVK vk*/mvk*/
+# MVK* symbols become hidden (not exported), restoring the implicit
+# contract that libmithril is an OpenGL/EGL drop-in, NOT a Vulkan ICD.
+#
+# EGL 1.5 API (egl.cpp)
+_egl*
+# GL / GLES API (gl.cpp, Drawing.cpp, Buffer.cpp, Texture.cpp, etc.)
+_gl*
+# Backend C API (Backend.h — backend_init, backend_create_swapchain, ...)
+_backend_*
+# Mithril getter functions (Getter.cpp, Getter_gpu.mm)
+_mithril_*
+# Surface platform functions (SurfaceMetal.mm)
+_surface_create
+_surface_get_size
+# JNI entry points (if any Java_* native methods are registered)
+_Java_*

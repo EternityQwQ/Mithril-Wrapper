@@ -201,6 +201,30 @@ jobs:
           # (_planes.size() check in getMTLTexture). The version string check
           # above is sufficient to confirm the correct version is linked.
 
+      - name: Verify no Vulkan symbol leakage
+        run: |
+          DYLIB="build/libmithril.dylib"
+          echo "=== Checking vk* symbol leakage ==="
+          # nm -gU lists only exported (global undefined) symbols.
+          # With -exported_symbols_list, vk* should NOT appear.
+          LEAKED=$(nm -gU "${DYLIB}" | grep -iE ' [Tt] _?(vk[A-Z]|mvk[A-Z])' || true)
+          if [ -n "${LEAKED}" ]; then
+            echo "::error::Vulkan symbols leaked into libmithril exports:"
+            echo "${LEAKED}"
+            echo "These cause LWJGL's Vulkan probe (dlsym RTLD_DEFAULT) to succeed,"
+            echo "making MC think Vulkan is available → Main.main hangs."
+            exit 1
+          fi
+          echo "OK: no vk*/mvk* symbols exported."
+          echo "=== Verifying libmithril public API still exported ==="
+          for sym in eglGetDisplay eglCreateContext eglSwapBuffers backend_init backend_available; do
+            if ! nm -gU "${DYLIB}" | grep -q " ${sym}$"; then
+              echo "::error::Required public symbol '${sym}' is NOT exported — export list is too restrictive."
+              exit 1
+            fi
+          done
+          echo "OK: all required public symbols exported."
+
       - name: Ad-hoc codesign
         run: |
           codesign -s - "${{ steps.locate.outputs.path }}" || echo "codesign skipped (best-effort)"

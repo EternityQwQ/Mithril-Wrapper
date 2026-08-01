@@ -311,11 +311,21 @@ if(APPLE)
     target_include_directories(${PROJECT_NAME} PRIVATE ${MOLTENVK_INCLUDE_DIR})
     if(MOLTENVK_LINK_MODE STREQUAL "static")
         # Static link: -force_load forces ALL object files from the
-        # archive (including C++ static initializers that register Vulkan
-        # extensions). -ObjC preserves ObjC class/category symbols.
-        # See the comment block above (L262-L285) for full rationale.
-        target_link_libraries(${PROJECT_NAME} PRIVATE
-            "-Wl,-force_load,${MOLTENVK_LIBRARY}"
+            # archive (including C++ static initializers that register Vulkan
+            # extensions). -ObjC preserves ObjC class/category symbols.
+            # See the comment block above (L262-L285) for full rationale.
+            # Hide MoltenVK's vk*/mvk* symbols from the dylib's export table.
+            # MoltenVK marks its vk* API with __attribute__((visibility("default")))
+            # (MVK_PUBLIC_VULKAN_SYMBOL) for ICD loader discovery. With -force_load,
+            # these leak into libmithril's exports → dlsym(RTLD_DEFAULT,
+            # "vkGetInstanceProcAddr") succeeds → LWJGL/MC thinks Vulkan is
+            # available → Main.main hangs at backend selection (+1504).
+            # The export list whitelists only libmithril's EGL/GL/backend_* API.
+            target_link_options(${PROJECT_NAME} PRIVATE
+                "-Wl,-exported_symbols_list,${CMAKE_SOURCE_DIR}/Mithril-Wrapper-cpp/mithril.exports"
+            )
+            target_link_libraries(${PROJECT_NAME} PRIVATE
+                "-Wl,-force_load,${MOLTENVK_LIBRARY}"
             "-ObjC"
             "-framework Metal"
             "-framework Foundation"
