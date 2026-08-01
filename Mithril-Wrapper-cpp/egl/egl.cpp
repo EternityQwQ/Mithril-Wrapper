@@ -921,6 +921,18 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                 s->recoveryFailCount = 0;
             } else {
                 // 重建失败：deviceLost 标志未清除，10 帧后重试。
+                // FIX (dangling eglDefaultColor): the swapchain was destroyed
+                // above (backend_destroy_swapchain + s->swapchain_state=null)
+                // and recreation failed, so eglDefaultColor/activeSwapchain
+                // still reference the destroyed swapchain's freed VkImageView.
+                // Without clearing, the next glClear records
+                // vkCmdClearAttachments against the freed view →
+                // MVKCmdClearAttachments::encode SIGSEGV.
+                // install_surface_on_state takes the else branch
+                // (swapchain_state null) and clears them.
+                if (t_currentDraw == s) {
+                    install_surface_on_state(s);
+                }
                 // FIX (日志刷屏): 限流 — 首次 + 每 30 次重试（约 5 秒 @ 60fps）
                 // 打印一条，避免持续失败时每 0.17 秒刷一条日志。
                 s->recoveryFailCount++;
@@ -1031,7 +1043,14 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     // so the next frame's draws land on a valid drawable. This also re-
     // registers the swapchain with the encoder (backend_set_active_swapchain)
     // so layout barriers + per-image renderFinished signaling work next frame.
-    if (s->swapchain_state && t_currentDraw == s) {
+    if (t_currentDraw == s) {
+        // Always (re)install. When swapchain_state is null (creation/rebuild
+        // failed above), install_surface_on_state takes the else branch and
+        // CLEARS eglDefaultColor/activeSwapchain. Without this, a failed
+        // rebuild leaves eglDefaultColor dangling on the destroyed
+        // swapchain's VkImageView, and the next glClear records
+        // vkCmdClearAttachments against the freed view → SIGSEGV in
+        // MVKCmdClearAttachments::encode.
         install_surface_on_state(s);
     }
     return EGL_TRUE;

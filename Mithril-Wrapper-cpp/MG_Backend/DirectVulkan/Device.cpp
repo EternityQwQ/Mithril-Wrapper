@@ -478,17 +478,23 @@ bool init_device() {
     vkEnumerateInstanceExtensionProperties(nullptr, &extCount, instExtProps.data());
 
     std::vector<const char*> instExts;
-    // Portability enumeration is mandatory for MoltenVK-backed Vulkan.
-    if (has_extension(instExtProps, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
-        instExts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-    }
-    if (has_extension(instExtProps, VK_EXT_METAL_SURFACE_EXTENSION_NAME)) {
-        instExts.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
-    }
-    if (has_extension(instExtProps, VK_KHR_SURFACE_EXTENSION_NAME)) {
-        instExts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-    }
-    // Debug utils optional.
+    // Mithril unconditionally requires these three instance extensions on
+    // Apple platforms. Previously we gated on vkEnumerateInstanceExtensionProperties,
+    // but that creates a spurious dependency on MoltenVK's advertiseExtensions
+    // config (MVK_CONFIG_ADVERTISE_EXTENSIONS). If that config filters out
+    // WSI extensions (e.g. set to PORTABILITY_ONLY=4), vkEnumerate... would
+    // not return VK_EXT_metal_surface, we wouldn't enable it, and
+    // vkGetInstanceProcAddr("vkCreateMetalSurfaceEXT") would return null →
+    // swapchain creation fails → SIGSEGV in MVKCmdClearAttachments::encode.
+    //
+    // MoltenVK on iOS/macOS ALWAYS supports these extensions (MIN_OS 10.11/8.0).
+    // Unconditionally requesting them makes the failure mode louder and
+    // earlier (vkCreateInstance returns VK_ERROR_EXTENSION_NOT_PRESENT
+    // instead of a silent null function pointer 400ms later).
+    instExts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    instExts.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
+    instExts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+    // Debug utils optional (only if advertised).
     bool wantDebugUtils = has_extension(instExtProps, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     if (wantDebugUtils) instExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
@@ -541,13 +547,15 @@ bool init_device() {
     b->createMetalSurfaceEXT =
         vkGetInstanceProcAddr(b->instance, "vkCreateMetalSurfaceEXT");
     if (!b->createMetalSurfaceEXT) {
-        // Diagnostic: this function is only exported when VK_EXT_metal_surface
-        // is enabled at instance creation. Dump the enumerated instance
-        // extensions so a null resolution is self-explaining on-device.
-        MITHRIL_LOG_WARN("vk", "vkCreateMetalSurfaceEXT not resolved; "
-                              "enumerated instance extensions:");
+        // Not fatal: SwapchainMetal.mm falls back to the static-link
+        // vkCreateMetalSurfaceEXT symbol when this pointer is null.
+        // MoltenVK's implementation does not gate on extension enablement;
+        // only vkGetInstanceProcAddr does. Log for diagnostics.
+        MITHRIL_LOG_INFO("vk", "vkCreateMetalSurfaceEXT not resolved via "
+                               "vkGetInstanceProcAddr (will use static-link fallback); "
+                               "enumerated instance extensions:");
         for (const auto& e : instExtProps) {
-            MITHRIL_LOG_WARN("vk", "  %s", e.extensionName);
+            MITHRIL_LOG_INFO("vk", "  %s", e.extensionName);
         }
     }
 

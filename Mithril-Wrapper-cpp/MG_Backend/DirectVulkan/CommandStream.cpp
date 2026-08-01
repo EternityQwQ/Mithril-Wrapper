@@ -426,6 +426,33 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     EncoderState& e = encoder();
     if (e.passActive) return;  // coalesce draws into one pass
 
+    // Defensive: if there is no valid render target (all color views null
+    // AND no depth view), skip the pass entirely. This occurs when the EGL
+    // swapchain is absent (window not yet sized / creation failed) and
+    // eglDefaultColor has been cleared to VK_NULL_HANDLE.
+    // collect_draw_fbo_attachments then returns 0 color attachments and no
+    // depth. Recording a render pass + vkCmdClearAttachments against a null
+    // target crashes MoltenVK (MVKCmdClearAttachments::encode dereferences
+    // the null render target → SIGSEGV at si_addr=0x3b0). Skipping is the
+    // correct GL behavior (analogous to GL_INVALID_OPERATION with no
+    // drawable bound) — passActive stays false, so clear_attachments() and
+    // draw calls no-op via their existing passActive guards.
+    bool hasColorTarget = false;
+    if (color_views) {
+        for (int i = 0; i < color_count; ++i) {
+            if (color_views[i] != VK_NULL_HANDLE) { hasColorTarget = true; break; }
+        }
+    }
+    if (!hasColorTarget && depth_view == VK_NULL_HANDLE) {
+        static bool warnedNoTarget = false;
+        if (!warnedNoTarget) {
+            warnedNoTarget = true;
+            MITHRIL_LOG_WARN("vk", "begin_render_pass: no valid render target "
+                              "(color=null, depth=null) — skipping pass (swapchain absent?)");
+        }
+        return;
+    }
+
     // Invalidate the cached last-applied render-state version so the first
     // draw of this pass re-issues all vkCmdSet* dynamic state. The command
     // buffer may have been reset+begun since the last pass (new frame slot,
@@ -709,13 +736,18 @@ void clear_attachments(uint32_t mask, int x, int y, int w, int h) {
             attaches.push_back(a);
         }
     }
-    if (mask & GL_DEPTH_BUFFER_BIT) {
+    // Only clear depth/stencil if the current render pass actually has a
+    // depth attachment (e.depthView, set by begin_render_pass from the
+    // depth_view argument). Recording a depth/stencil clear against a pass
+    // with no depth target causes MoltenVK to dereference a null depth view
+    // in MVKCmdClearAttachments::encode → SIGSEGV.
+    if ((mask & GL_DEPTH_BUFFER_BIT) && e.depthView != VK_NULL_HANDLE) {
         VkClearAttachment a{};
         a.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         a.clearValue.depthStencil.depth = (float)e.clearDepth;
         attaches.push_back(a);
     }
-    if (mask & GL_STENCIL_BUFFER_BIT) {
+    if ((mask & GL_STENCIL_BUFFER_BIT) && e.depthView != VK_NULL_HANDLE) {
         VkClearAttachment a{};
         a.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
         a.clearValue.depthStencil.stencil = (uint32_t)e.clearStencil;

@@ -42,14 +42,34 @@ Swapchain* create_swapchain(void* native_window, int width, int height,
     // surface creation without transferring ownership. A plain C cast is
     // rejected under -fobjc-arc.
     sci.pLayer = (__bridge const CAMetalLayer*)native_window;
-    if (!b->createMetalSurfaceEXT) {
-        MITHRIL_LOG_ERROR("vk", "vkCreateMetalSurfaceEXT not resolved");
-        return nullptr;
+    // Resolve vkCreateMetalSurfaceEXT. Two paths:
+    //
+    // 1. Function pointer (preferred, spec-compliant): resolved via
+    //    vkGetInstanceProcAddr in Device.cpp. Works when VK_EXT_metal_surface
+    //    is explicitly enabled at vkCreateInstance time.
+    //
+    // 2. Static-link fallback: when vkGetInstanceProcAddr returns null
+    //    (extension not enabled — e.g. vkEnumerateInstanceExtensionProperties
+    //    didn't advertise it, or advertiseExtensions config filtered it out),
+    //    fall back to the statically-linked vkCreateMetalSurfaceEXT symbol.
+    //    MoltenVK's implementation (vulkan.mm → MVKInstance::createSurface →
+    //    MVKSurface ctor) does NOT check extension enablement — the gate
+    //    exists ONLY in vkGetInstanceProcAddr's lookup. So a direct call
+    //    succeeds regardless of extension state, as long as the CAMetalLayer
+    //    is valid. This eliminates a spurious dependency on the runtime
+    //    extension-advertising config for a symbol that is already resolved
+    //    at link time.
+    PFN_vkCreateMetalSurfaceEXT createMetalSurfaceEXT = nullptr;
+    if (b->createMetalSurfaceEXT) {
+        createMetalSurfaceEXT = (PFN_vkCreateMetalSurfaceEXT)b->createMetalSurfaceEXT;
+    } else {
+        createMetalSurfaceEXT = &vkCreateMetalSurfaceEXT;
+        MITHRIL_LOG_WARN("vk", "vkCreateMetalSurfaceEXT: vkGetInstanceProcAddr returned null, "
+                               "falling back to static-link symbol");
     }
-    auto createMetalSurfaceEXT = (PFN_vkCreateMetalSurfaceEXT)b->createMetalSurfaceEXT;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     if (createMetalSurfaceEXT(b->instance, &sci, nullptr, &surface) != VK_SUCCESS) {
-        MITHRIL_LOG_ERROR("vk", "vkCreateMetalSurfaceEXT failed");
+        MITHRIL_LOG_ERROR("vk", "vkCreateMetalSurfaceEXT failed (surface creation error)");
         return nullptr;
     }
 
