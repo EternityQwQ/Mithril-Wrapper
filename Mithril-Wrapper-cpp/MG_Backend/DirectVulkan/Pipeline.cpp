@@ -69,33 +69,72 @@ VkPrimitiveTopology gl_prim_to_vk(GLenum m) {
 }
 
 // ---- GL attribute type -> VkFormat ----
+//
+// FIX (根因 V - 3 分量顶点属性格式映射):
+// Metal MTLVertexFormat 枚举对**非 float** 类型不含 3 分量变体
+// （无 UChar3/Char3/UShort3/Short3/Half3，仅有 1/2/4 分量及 Float3）。
+// MoltenVK 无法将 VK_FORMAT_R8G8B8_UNORM / R16G16B16_SFLOAT 等 3 分量顶点
+// 格式映射到任何 MTLVertexFormat → vkCreateGraphicsPipelines 失败 → draw
+// 被跳过 → 屏幕只剩 clear color（红屏）。
+//
+// 修复策略（最小影响域）：对 size==3 的**非 float** 类型，统一映射到对应的
+// 4 分量 VkFormat（如 R8G8B8_UNORM→R8G8B8A8_UNORM）。shader 中 vec3 属性
+// 仅取前 3 分量，第 4 分量从 stride 内的 padding 字节读取（Metal vertex
+// fetch 对 padding 容忍）。不引入数据流重打包，仅改格式枚举。
+//
+// 保留不变：
+//   - GL_FLOAT size==3 → R32G32B32_SFLOAT（Metal 支持 MTLVertexFormatFloat3）
+//   - GL_DOUBLE size==3 → R64G64B64_SFLOAT（不动）
+//   - GL_INT / GL_UNSIGNED_INT size==3 → R32G32B32_SINT/_UINT（Metal 支持
+//     32-bit Int3/Uint3）
+//   - GL_INT_2_10_10_10_REV / GL_UNSIGNED_INT_2_10_10_10_REV：A2B10G10R10
+//     本身是 4 分量打包格式，无需转换
+//
+// 深度对照 MobileGL ConvertIntegerVertexStreamToFloat32 /
+// RepackVertexStream (VulkanRenderer.cpp:602-666)：MobileGL 在 pipeline 创建
+// 前将不支持格式的顶点数据流整体重打包。本修复采用更小影响域：仅改格式枚举，
+// 不动顶点缓冲数据。
 VkFormat attrib_type_to_vk_format(GLenum type, int size, bool normalized, bool integer) {
     if (integer) {
         switch (type) {
-            case GL_UNSIGNED_BYTE:  switch (size) { case 1: return VK_FORMAT_R8_UINT;   case 2: return VK_FORMAT_R8G8_UINT;   case 3: return VK_FORMAT_R8G8B8_UINT;   case 4: return VK_FORMAT_R8G8B8A8_UINT; }
+            // FIX (根因 V): UChar3 不存在于 MTLVertexFormat → 用 UChar4，
+            // shader 取前 3 分量，第 4 分量读 stride 内 padding
+            case GL_UNSIGNED_BYTE:  switch (size) { case 1: return VK_FORMAT_R8_UINT;   case 2: return VK_FORMAT_R8G8_UINT;   case 3: return VK_FORMAT_R8G8B8A8_UINT;   case 4: return VK_FORMAT_R8G8B8A8_UINT; }
+            // GL_INT 32-bit：Metal 支持 Int3，保持不变
             case GL_INT:            switch (size) { case 1: return VK_FORMAT_R32_SINT;  case 2: return VK_FORMAT_R32G32_SINT; case 3: return VK_FORMAT_R32G32B32_SINT; case 4: return VK_FORMAT_R32G32B32A32_SINT; }
+            // GL_UNSIGNED_INT 32-bit：Metal 支持 Uint3，保持不变
             case GL_UNSIGNED_INT:   switch (size) { case 1: return VK_FORMAT_R32_UINT;  case 2: return VK_FORMAT_R32G32_UINT; case 3: return VK_FORMAT_R32G32B32_UINT; case 4: return VK_FORMAT_R32G32B32A32_UINT; }
-            case GL_SHORT:          switch (size) { case 1: return VK_FORMAT_R16_SINT;  case 2: return VK_FORMAT_R16G16_SINT; case 3: return VK_FORMAT_R16G16B16_SINT; case 4: return VK_FORMAT_R16G16B16A16_SINT; }
-            case GL_UNSIGNED_SHORT: switch (size) { case 1: return VK_FORMAT_R16_UINT;  case 2: return VK_FORMAT_R16G16_UINT; case 3: return VK_FORMAT_R16G16B16_UINT; case 4: return VK_FORMAT_R16G16B16A16_UINT; }
+            // FIX (根因 V): Short3 不存在于 MTLVertexFormat → 用 Short4
+            case GL_SHORT:          switch (size) { case 1: return VK_FORMAT_R16_SINT;  case 2: return VK_FORMAT_R16G16_SINT; case 3: return VK_FORMAT_R16G16B16A16_SINT; case 4: return VK_FORMAT_R16G16B16A16_SINT; }
+            // FIX (根因 V): UShort3 不存在于 MTLVertexFormat → 用 UShort4
+            case GL_UNSIGNED_SHORT: switch (size) { case 1: return VK_FORMAT_R16_UINT;  case 2: return VK_FORMAT_R16G16_UINT; case 3: return VK_FORMAT_R16G16B16A16_UINT; case 4: return VK_FORMAT_R16G16B16A16_UINT; }
             default: break;
         }
     }
     switch (type) {
+        // GL_FLOAT：Metal 支持 MTLVertexFormatFloat3，保持 R32G32B32_SFLOAT
         case GL_FLOAT:          switch (size) { case 1: return VK_FORMAT_R32_SFLOAT;   case 2: return VK_FORMAT_R32G32_SFLOAT;   case 3: return VK_FORMAT_R32G32B32_SFLOAT;   case 4: return VK_FORMAT_R32G32B32A32_SFLOAT; }
-        case GL_HALF_FLOAT:     switch (size) { case 1: return VK_FORMAT_R16_SFLOAT;   case 2: return VK_FORMAT_R16G16_SFLOAT;   case 3: return VK_FORMAT_R16G16B16_SFLOAT;   case 4: return VK_FORMAT_R16G16B16A16_SFLOAT; }
+        // FIX (根因 V): Half3 不存在于 MTLVertexFormat → 用 Half4
+        case GL_HALF_FLOAT:     switch (size) { case 1: return VK_FORMAT_R16_SFLOAT;   case 2: return VK_FORMAT_R16G16_SFLOAT;   case 3: return VK_FORMAT_R16G16B16A16_SFLOAT;   case 4: return VK_FORMAT_R16G16B16A16_SFLOAT; }
+        // GL_DOUBLE：不动
         case GL_DOUBLE:         switch (size) { case 1: return VK_FORMAT_R64_SFLOAT;   case 2: return VK_FORMAT_R64G64_SFLOAT;  case 3: return VK_FORMAT_R64G64B64_SFLOAT;  case 4: return VK_FORMAT_R64G64B64A64_SFLOAT; }
         case GL_UNSIGNED_BYTE:
-            if (normalized) switch (size) { case 1: return VK_FORMAT_R8_UNORM;  case 2: return VK_FORMAT_R8G8_UNORM;  case 3: return VK_FORMAT_R8G8B8_UNORM;  case 4: return VK_FORMAT_R8G8B8A8_UNORM; }
-            else            switch (size) { case 1: return VK_FORMAT_R8_UINT;   case 2: return VK_FORMAT_R8G8_UINT;   case 3: return VK_FORMAT_R8G8B8_UINT;   case 4: return VK_FORMAT_R8G8B8A8_UINT; }
+            // FIX (根因 V): UChar3 normalized/unnormalized 均不存在 → 用 UChar4
+            if (normalized) switch (size) { case 1: return VK_FORMAT_R8_UNORM;  case 2: return VK_FORMAT_R8G8_UNORM;  case 3: return VK_FORMAT_R8G8B8A8_UNORM;  case 4: return VK_FORMAT_R8G8B8A8_UNORM; }
+            else            switch (size) { case 1: return VK_FORMAT_R8_UINT;   case 2: return VK_FORMAT_R8G8_UINT;   case 3: return VK_FORMAT_R8G8B8A8_UINT;   case 4: return VK_FORMAT_R8G8B8A8_UINT; }
         case GL_BYTE:
-            if (normalized) switch (size) { case 1: return VK_FORMAT_R8_SNORM;  case 2: return VK_FORMAT_R8G8_SNORM;  case 3: return VK_FORMAT_R8G8B8_SNORM;  case 4: return VK_FORMAT_R8G8B8A8_SNORM; }
-            else            switch (size) { case 1: return VK_FORMAT_R8_SINT;   case 2: return VK_FORMAT_R8G8_SINT;   case 3: return VK_FORMAT_R8G8B8_SINT;   case 4: return VK_FORMAT_R8G8B8A8_SINT; }
+            // FIX (根因 V): Char3 normalized/unnormalized 均不存在 → 用 Char4
+            if (normalized) switch (size) { case 1: return VK_FORMAT_R8_SNORM;  case 2: return VK_FORMAT_R8G8_SNORM;  case 3: return VK_FORMAT_R8G8B8A8_SNORM;  case 4: return VK_FORMAT_R8G8B8A8_SNORM; }
+            else            switch (size) { case 1: return VK_FORMAT_R8_SINT;   case 2: return VK_FORMAT_R8G8_SINT;   case 3: return VK_FORMAT_R8G8B8A8_SINT;   case 4: return VK_FORMAT_R8G8B8A8_SINT; }
         case GL_UNSIGNED_SHORT:
-            if (normalized) switch (size) { case 1: return VK_FORMAT_R16_UNORM; case 2: return VK_FORMAT_R16G16_UNORM; case 3: return VK_FORMAT_R16G16B16_UNORM; case 4: return VK_FORMAT_R16G16B16A16_UNORM; }
-            else            switch (size) { case 1: return VK_FORMAT_R16_UINT;  case 2: return VK_FORMAT_R16G16_UINT;  case 3: return VK_FORMAT_R16G16B16_UINT;  case 4: return VK_FORMAT_R16G16B16A16_UINT; }
+            // FIX (根因 V): UShort3 normalized/unnormalized 均不存在 → 用 UShort4
+            if (normalized) switch (size) { case 1: return VK_FORMAT_R16_UNORM; case 2: return VK_FORMAT_R16G16_UNORM; case 3: return VK_FORMAT_R16G16B16A16_UNORM; case 4: return VK_FORMAT_R16G16B16A16_UNORM; }
+            else            switch (size) { case 1: return VK_FORMAT_R16_UINT;  case 2: return VK_FORMAT_R16G16_UINT;  case 3: return VK_FORMAT_R16G16B16A16_UINT;  case 4: return VK_FORMAT_R16G16B16A16_UINT; }
         case GL_SHORT:
-            if (normalized) switch (size) { case 1: return VK_FORMAT_R16_SNORM; case 2: return VK_FORMAT_R16G16_SNORM; case 3: return VK_FORMAT_R16G16B16_SNORM; case 4: return VK_FORMAT_R16G16B16A16_SNORM; }
-            else            switch (size) { case 1: return VK_FORMAT_R16_SINT;  case 2: return VK_FORMAT_R16G16_SINT;  case 3: return VK_FORMAT_R16G16B16_SINT;  case 4: return VK_FORMAT_R16G16B16A16_SINT; }
+            // FIX (根因 V): Short3 normalized/unnormalized 均不存在 → 用 Short4
+            if (normalized) switch (size) { case 1: return VK_FORMAT_R16_SNORM; case 2: return VK_FORMAT_R16G16_SNORM; case 3: return VK_FORMAT_R16G16B16A16_SNORM; case 4: return VK_FORMAT_R16G16B16A16_SNORM; }
+            else            switch (size) { case 1: return VK_FORMAT_R16_SINT;  case 2: return VK_FORMAT_R16G16_SINT;  case 3: return VK_FORMAT_R16G16B16A16_SINT;  case 4: return VK_FORMAT_R16G16B16A16_SINT; }
+        // 打包格式 A2B10G10R10 本身是 4 分量，无需转换
         case GL_INT_2_10_10_10_REV:
             if (normalized) return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
             return VK_FORMAT_A2B10G10R10_UINT_PACK32;
@@ -120,6 +159,33 @@ VkCompareOp gl_compare_to_vk(GLenum f) {
         case GL_ALWAYS:   return VK_COMPARE_OP_ALWAYS;
         default:          return VK_COMPARE_OP_LESS;
     }
+}
+
+// 查询格式是否支持 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT。
+// 结果缓存到 static unordered_map，避免每次 pipeline 创建都调用
+// vkGetPhysicalDeviceFormatProperties。
+//
+// FIX (根因 X - blend 格式校验):
+// Vulkan VUID-VkGraphicsPipelineCreateInfo-blendEnable-04727 要求启用 blend
+// 的颜色附件格式必须支持 COLOR_ATTACHMENT_BLEND_BIT。Mithril 原直接按 GL blend
+// 状态设置 blendEnable 不校验格式，对不支持 blend 的格式（如某些 GPU 的
+// RGBA16F、整数 FBO RGBA8UI）启用 blend 属非法 pipeline 状态 → MoltenVK
+// 编译 Metal blend 状态失败或静默丢 draw → 红屏。
+//
+// 深度对照 MobileGL VulkanRenderer.cpp:4124-4157: pipeline 创建前查询格式
+// 属性，不支持时强制 effectiveBlendEnabled = false。
+bool format_supports_color_attachment_blend(VkFormat fmt) {
+    if (fmt == VK_FORMAT_UNDEFINED) return false;
+    static std::unordered_map<VkFormat, bool> cache;
+    auto it = cache.find(fmt);
+    if (it != cache.end()) return it->second;
+    Backend* b = backend();
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(b->physicalDevice, fmt, &props);
+    bool ok = (props.optimalTilingFeatures &
+               VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+    cache[fmt] = ok;
+    return ok;
 }
 
 // FNV-1a 64-bit hash over the pipeline signature.
@@ -396,9 +462,43 @@ VkPipeline get_or_create_pipeline(GLuint program,
     // signature (color_write_mask is hashed above), so depth-only pre-passes
     // that disable color writes get a distinct pipeline that does not corrupt
     // the color buffer.
+    //
+    // FIX (根因 X - blend 格式校验):
+    // 启用 blend 前校验颜色附件格式是否支持 COLOR_ATTACHMENT_BLEND_BIT。
+    // 不支持时强制 blendEnable=VK_FALSE，避免非法 pipeline 状态导致
+    // MoltenVK 编译失败或静默丢 draw → 红屏。深度对照 MobileGL
+    // VulkanRenderer.cpp:4124-4157 effectiveBlendEnabled 逻辑。
+    // VUID-VkGraphicsPipelineCreateInfo-blendEnable-04727。
+    //
+    // 注意：hash_signature 含 blend_enabled（原始值）而非 effective_blend_enabled，
+    // 但 color_formats 也参与哈希，故两个不同格式的 FBO 会得到不同 sig，pipeline
+    // 缓存不会冲突，无需修改 hash_signature。
+    bool effective_blend_enabled = blend_enabled != 0;
+    if (effective_blend_enabled && color_count > 0) {
+        // 校验所有颜色附件格式（多附件时任一不支持则禁用 blend）
+        for (int i = 0; i < color_count; ++i) {
+            if (!format_supports_color_attachment_blend(color_formats[i])) {
+                effective_blend_enabled = false;
+                // 限流日志：每格式仅警告一次（cache 已保证查询一次，
+                // 但 pipeline 创建可能多次走此路径）
+                static std::unordered_map<VkFormat, bool> warned;
+                if (!warned[color_formats[i]]) {
+                    warned[color_formats[i]] = true;
+                    MITHRIL_LOG_WARN("vk", "Root cause X: color attachment format "
+                                      "(VkFormat=%d) does not support "
+                                      "COLOR_ATTACHMENT_BLEND_BIT, forcing "
+                                      "blendEnable=VK_FALSE to avoid illegal "
+                                      "pipeline state (VUID-04727)",
+                                      (int)color_formats[i]);
+                }
+                break;
+            }
+        }
+    }
+
     VkPipelineColorBlendAttachmentState cbAttach{};
-    cbAttach.blendEnable = blend_enabled ? VK_TRUE : VK_FALSE;
-    if (blend_enabled) {
+    cbAttach.blendEnable = effective_blend_enabled ? VK_TRUE : VK_FALSE;
+    if (effective_blend_enabled) {
         cbAttach.srcColorBlendFactor = gl_blend_to_vk(blend_src);
         cbAttach.dstColorBlendFactor = gl_blend_to_vk(blend_dst);
         cbAttach.colorBlendOp = VK_BLEND_OP_ADD;
@@ -406,6 +506,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
         cbAttach.dstAlphaBlendFactor = gl_blend_to_vk(blend_dst_alpha);
         cbAttach.alphaBlendOp = VK_BLEND_OP_ADD;
     }
+    // colorWriteMask 部分保持不变
     VkColorComponentFlags cwm = 0;
     if (color_write_mask & 1) cwm |= VK_COLOR_COMPONENT_R_BIT;
     if (color_write_mask & 2) cwm |= VK_COLOR_COMPONENT_G_BIT;

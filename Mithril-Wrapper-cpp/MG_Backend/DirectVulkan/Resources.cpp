@@ -246,9 +246,52 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     // VkBufferImageCopy.bufferRowLength == 0 below.
     int bpp = host_texel_bytes(format, type);
     if (bpp <= 0) bpp = 4;  // conservative fallback
-    size_t tight_row = (size_t)w * (size_t)bpp;
+
+    // ---- FIX (根因 W - CRITICAL): RGB→RGBA 逐像素展开 ----
+    // Metal 的 MTLPixelFormat 枚举不含 3 分量格式（无 RGB8/RGB16F/RGB32F），
+    // FormatMap.cpp 已将 GL_RGB8/GL_RGB/GL_RGB16F/GL_RGB32F 映射到 4 分量
+    // VkFormat（R8G8B8A8_*）。但 GL 上传源数据（format=GL_RGB/GL_BGR/
+    // GL_RGB_INTEGER）每像素仅 3 分量字节（3/6/12 字节），而 VkImage 期望
+    // 4 分量（4/8/16 字节）。若直接 memcpy，GPU 按 4 字节/像素读取 3 字节/
+    // 像素数据 → 颜色错位 → 红屏/花屏。
+    // 深度参考 MobileGL ExpandRgbSourceToRgba (VkTextureManager.cpp:429+)：
+    // 检测源 3 分量 + 目标 4 分量，逐像素复制 RGB 并补 alpha。
+    // 对照 ResolveTextureFormatInfo (VkTextureManager.cpp:374-427)。
+    //
+    // 触发条件：源 format 是 3 分量（GL_RGB/GL_BGR/GL_RGB_INTEGER）且 type
+    // 是非 packed 逐分量类型（packed 类型如 GL_UNSIGNED_SHORT_5_6_5 源数据
+    // 已与目标 packed 格式匹配，host_texel_bytes 返回 2，无需展开）。
+    // 不修改 tex.format（已由 FormatMap 映射为 4 分量）。
+    bool expand_rgb = false;
+    int src_bpp = bpp;   // 源每像素字节数
+    int dst_bpp = bpp;   // 目标每像素字节数（展开后；非展开时 == src_bpp）
+    if (format == GL_RGB || format == GL_BGR || format == GL_RGB_INTEGER) {
+        switch (type) {
+            case GL_UNSIGNED_BYTE:
+            case GL_BYTE:
+                src_bpp = 3;  dst_bpp = 4;  expand_rgb = true; break;
+            case GL_UNSIGNED_SHORT:
+            case GL_SHORT:
+            case GL_HALF_FLOAT:
+                src_bpp = 6;  dst_bpp = 8;  expand_rgb = true; break;
+            case GL_UNSIGNED_INT:
+            case GL_INT:
+            case GL_FLOAT:
+                src_bpp = 12; dst_bpp = 16; expand_rgb = true; break;
+            default:
+                // packed 类型（GL_UNSIGNED_SHORT_5_6_5 等）：源与目标均为
+                // packed 字节，host_texel_bytes 已正确返回，无需展开。
+                break;
+        }
+    }
+
     size_t mask = (size_t)unpack_alignment - 1;
-    size_t src_stride = (tight_row + mask) & ~mask;
+    // staging 装的是展开后的 RGBA 数据（紧密排列）；tight_row 按 dst_bpp 计算。
+    // 源行 stride 按 src_bpp 计算并受 GL_UNPACK_ALIGNMENT 约束。
+    // 非展开路径下 src_bpp == dst_bpp == bpp，行为与原实现完全一致。
+    size_t tight_row = (size_t)w * (size_t)dst_bpp;
+    size_t src_tight_row = (size_t)w * (size_t)src_bpp;
+    size_t src_stride = (src_tight_row + mask) & ~mask;
     size_t staging = tight_row * (size_t)h * (size_t)d;
 
     // ---- FIX (Invalid Resource 根因 - per-frame transient staging arena) ----
@@ -319,7 +362,57 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     // Copy pixel data into staging buffer at stagingOffset
     if (stagingMapped && pixels) {
         char* dst = (char*)stagingMapped + stagingOffset;
-        if (src_stride == tight_row) {
+        if (expand_rgb) {
+            // ---- FIX (根因 W): RGB→RGBA 逐像素展开 ----
+            // 源每像素 src_bpp 字节（3/6/12 = RGB），目标每像素 dst_bpp 字节
+            // （4/8/16 = RGBA）。逐像素复制 RGB 3 分量，第 4 分量（alpha）填
+            // 1.0 的位模式。深度参考 MobileGL ExpandRgbSourceToRgba
+            // (VkTextureManager.cpp:429+)。
+            //
+            // alpha 填充按 type 区分（对 sfloat 用 1.0 位模式，避免 0xFF→NaN）：
+            //   - unorm byte:  0xFF       (== 1.0)
+            //   - unorm short: 0xFFFF     (== 1.0)
+            //   - half float:  0x3C00     (1.0 half)
+            //   - float:       0x3F800000 (1.0f)
+            //   - int/uint:    0x00000001 (integer 1；Minecraft 主流程不采样
+            //                              RGB_INTEGER 的 alpha，可接受）
+            // alpha_bytes == src_bpp/3 == 每分量字节数（1/2/4）；展开后 staging
+            // 紧密排列（dst_bpp * w 每行），VkBufferImageCopy.bufferRowLength==0
+            // 仍有效。
+            uint32_t alpha_bits = 0x000000FFu;
+            switch (type) {
+                case GL_UNSIGNED_BYTE:
+                case GL_BYTE:
+                    alpha_bits = 0x000000FFu; break;       // unorm: 0xFF == 1.0
+                case GL_UNSIGNED_SHORT:
+                case GL_SHORT:
+                    alpha_bits = 0x0000FFFFu; break;       // unorm: 0xFFFF == 1.0
+                case GL_HALF_FLOAT:
+                    alpha_bits = 0x00003C00u; break;       // 1.0 half-float
+                case GL_FLOAT:
+                    alpha_bits = 0x3F800000u; break;       // 1.0f
+                case GL_UNSIGNED_INT:
+                case GL_INT:
+                    alpha_bits = 0x00000001u; break;       // integer 1
+                default:
+                    alpha_bits = 0x000000FFu; break;
+            }
+            const int alpha_bytes = src_bpp / 3;  // 每分量字节数: 1/2/4
+            const char* s8 = (const char*)pixels;
+            for (int layer = 0; layer < d; ++layer) {
+                for (int row = 0; row < h; ++row) {
+                    const char* src_row = s8;
+                    for (int px = 0; px < w; ++px) {
+                        std::memcpy(dst, src_row, src_bpp);         // 复制 RGB 3 分量
+                        dst += src_bpp;
+                        src_row += src_bpp;
+                        std::memcpy(dst, &alpha_bits, alpha_bytes); // 填充 alpha 第 4 分量
+                        dst += alpha_bytes;
+                    }
+                    s8 += src_stride;  // 源行按 GL_UNPACK_ALIGNMENT stride
+                }
+            }
+        } else if (src_stride == tight_row) {
             // Source rows are already tightly packed — single memcpy.
             std::memcpy(dst, pixels, staging);
         } else {

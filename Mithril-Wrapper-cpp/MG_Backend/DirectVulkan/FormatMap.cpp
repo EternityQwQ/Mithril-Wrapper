@@ -17,14 +17,23 @@ VkFormat gl_internal_to_vk(GLenum internal) {
     switch (internal) {
         case GL_RGBA8:                return VK_FORMAT_R8G8B8A8_UNORM;
         case GL_SRGB8_ALPHA8:         return VK_FORMAT_R8G8B8A8_SRGB;
-        case GL_RGB8:                 return VK_FORMAT_R8G8B8_UNORM;
+        // ---- FIX (根因 W - CRITICAL): Metal 无 3 分量 MTLPixelFormat ----
+        // Metal 的 MTLPixelFormat 枚举不含 3 分量格式（无 RGB8/RGB16F/RGB32F，
+        // 从 RG8 直接跳到 RGBA8）。MoltenVK 无法映射 VK_FORMAT_R8G8B8_* →
+        // vkCreateImage/vkCreateImageView 失败 → 用作 FBO 颜色附件时 pipeline
+        // 创建失败（pColorAttachmentFormats 含不支持格式）→ draw 被跳过 → 红屏。
+        // 修复：将 3 分量 GL 格式统一展开为 4 分量 RGBA VkFormat；alpha 由上传
+        // 路径（Resources.cpp:stage_and_copy_image 的 RGB→RGBA 展开）补 0xFF
+        // （unorm）/1.0 位模式（sfloat）。
+        // 对照 MobileGL ResolveTextureFormatInfo (VkTextureManager.cpp:374-427)。
+        case GL_RGB8:                 return VK_FORMAT_R8G8B8A8_UNORM;  // 根因 W: 原 R8G8B8_UNORM
         case GL_RGB565:               return VK_FORMAT_R5G6B5_UNORM_PACK16;
         case GL_RGBA4:                return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
         case GL_RGB5_A1:              return VK_FORMAT_R5G5B5A1_UNORM_PACK16;
         case GL_RGBA16F:              return VK_FORMAT_R16G16B16A16_SFLOAT;
-        case GL_RGB16F:               return VK_FORMAT_R16G16B16_SFLOAT;
+        case GL_RGB16F:               return VK_FORMAT_R16G16B16A16_SFLOAT;  // 根因 W: 原 R16G16B16_SFLOAT（Metal 无 3 分量）
         case GL_RGBA32F:              return VK_FORMAT_R32G32B32A32_SFLOAT;
-        case GL_RGB32F:               return VK_FORMAT_R32G32B32_SFLOAT;
+        case GL_RGB32F:               return VK_FORMAT_R32G32B32A32_SFLOAT;  // 根因 W: 原 R32G32B32_SFLOAT（Metal 无 3 分量）
         case GL_R8:                   return VK_FORMAT_R8_UNORM;
         case GL_R8_SNORM:             return VK_FORMAT_R8_SNORM;
         case GL_R16F:                 return VK_FORMAT_R16_SFLOAT;
@@ -48,7 +57,7 @@ VkFormat gl_internal_to_vk(GLenum internal) {
         // returns VK_FORMAT_UNDEFINED and the texture falls back to a color
         // format — which is especially wrong for GL_DEPTH_COMPONENT.
         case GL_RGBA:             return VK_FORMAT_R8G8B8A8_UNORM;  // 0x1908
-        case GL_RGB:              return VK_FORMAT_R8G8B8_UNORM;    // 0x1907
+        case GL_RGB:              return VK_FORMAT_R8G8B8A8_UNORM;    // 根因 W: 原 R8G8B8_UNORM（unsized GL_RGB，Metal 无 3 分量）0x1907
         case GL_DEPTH_COMPONENT:  return VK_FORMAT_D32_SFLOAT;      // 0x1902
         case GL_COMPRESSED_RGBA_S3TC_DXT1_EXT:
         case GL_COMPRESSED_RGB_S3TC_DXT1_EXT: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
