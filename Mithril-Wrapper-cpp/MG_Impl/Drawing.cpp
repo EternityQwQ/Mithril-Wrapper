@@ -236,19 +236,29 @@ static void prepare_draw(GLenum mode) {
     //     CCW triangles appear as CW in Vulkan). MobileGL does the same.
     // User FBOs (no Y flip) keep the original cull mode and frontFace.
     if (g_state->cullFace) {
-        bool invert_clockwise = is_default_fbo;  // Y flipped → winding inverted
+        // FIX (Root Cause K - Y翻转面剔除双重补偿):
+        // Vulkan 面剔除由两个独立状态控制：frontFace（定义正面缠绕方向）+ cullMode（剔除哪面）。
+        // Y 翻转（gl_Position.y = -y）反转缠绕：GL-CCW → Vulkan-CW。
+        // 正确补偿（二选一，不可同时）：
+        //   方案A: frontFace=CW（GL-CCW→Vulkan-CW="正面"），不交换 cull mode（GL_BACK→VK_BACK 剔除 GL-背面）
+        //   方案B: frontFace=CCW（GL-CCW→Vulkan-CW="背面"），交换 cull mode（GL_BACK→VK_FRONT 剔除 GL-背面）
+        // 旧代码同时执行 A+B → 双重补偿：frontFace=CW 使 GL-正面=Vulkan-正面，再交换 cull=VK_FRONT
+        // 剔除 Vulkan-正面=GL-正面 → 所有正面几何被剔除，只剩 clear color（红色）→ 红屏。
+        // 修复：采用方案A，仅 frontFace=CW 补偿，cull mode 直接按 GL 值映射不交换。
+        // 参考 MobileGL VulkanRenderer ConvertCullFaceModeToVkEnum：不交换 cull mode，
+        // 仅通过 frontFace=CLOCKWISE 补偿 Y 翻转。
         int vk_cull = 0;
         if (g_state->cullMode == GL_FRONT) {
-            vk_cull = invert_clockwise ? 2 /*VK_BACK*/ : 1 /*VK_FRONT*/;
+            vk_cull = 1;  // VK_CULL_MODE_FRONT_BIT
         } else if (g_state->cullMode == GL_BACK) {
-            vk_cull = invert_clockwise ? 1 /*VK_FRONT*/ : 2 /*VK_BACK*/;
+            vk_cull = 2;  // VK_CULL_MODE_BACK_BIT
         } else {  // GL_FRONT_AND_BACK
-            vk_cull = 3;  // VK_CULL_MODE_FRONT_AND_BACK (unaffected by invert)
+            vk_cull = 3;  // VK_CULL_MODE_FRONT_AND_BACK
         }
         backend_set_cull_mode(vk_cull);
-        // frontFace hardcoded CLOCKWISE for Y-flipped draws; for user FBOs use
-        // the GL frontFace directly (CCW=1, CW=0).
-        backend_set_front_face(invert_clockwise ? 0 /*CW*/ :
+        // Y 翻转使缠绕反转：GL-CCW → Vulkan-CW。设 frontFace=CW 补偿（仅默认帧缓冲）。
+        // 用户 FBO 无 Y 翻转，frontFace 按 GL 值映射（CCW→1, CW→0）。
+        backend_set_front_face(is_default_fbo ? 0 /*CW*/ :
                                (g_state->frontFace == GL_CCW ? 1 : 0));
     } else {
         backend_set_cull_mode(0);  // VK_CULL_MODE_NONE

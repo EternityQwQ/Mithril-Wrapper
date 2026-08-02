@@ -453,9 +453,22 @@ void bind_program_descriptors(GLuint program) {
             VkSampler samp = VK_NULL_HANDLE;
             if (tex_id) {
                 view = backend_get_texture_view(tex_id);
+                // FIX (Root Cause M - 采样器参数硬编码): 旧代码硬编码 GL_LINEAR/GL_REPEAT，
+                // 完全忽略纹理通过 glTexParameteri 设置的真实 sampler 参数。
+                // Minecraft 像素风纹理（GL_NEAREST）被双线性插值，图集纹理
+                // （GL_CLAMP_TO_EDGE）被 REPEAT → 采样到错误纹素 → 颜色偏红/花屏。
+                // 修复：从 Texture 结构体读取真实 minFilter/magFilter/wrapS/wrapT/wrapR。
+                // 采样器按纹理名缓存（Resources.cpp:793-830），首次绑定读取的参数
+                // 即为最终参数。Minecraft 通常在纹理创建后立即设置参数并不再修改，
+                // 因此无需额外缓存失效逻辑。
+                mithril::Texture* tex = mithril::state_get_texture(tex_id);
+                GLenum minF = tex ? (GLenum)tex->minFilter : GL_NEAREST_MIPMAP_LINEAR;
+                GLenum magF = tex ? (GLenum)tex->magFilter : GL_LINEAR;
+                GLenum wrapS = tex ? (GLenum)tex->wrapS : GL_REPEAT;
+                GLenum wrapT = tex ? (GLenum)tex->wrapT : GL_REPEAT;
+                GLenum wrapR = tex ? (GLenum)tex->wrapR : GL_REPEAT;
                 samp = backend_get_or_create_sampler(
-                    tex_id, GL_LINEAR, GL_LINEAR,
-                    GL_REPEAT, GL_REPEAT, GL_REPEAT, nullptr);
+                    tex_id, minF, magF, wrapS, wrapT, wrapR, nullptr);
             }
             // FIX (root cause L): if no texture is bound (or the bound texture
             // has no view/sampler), use the process-wide default 1x1 black

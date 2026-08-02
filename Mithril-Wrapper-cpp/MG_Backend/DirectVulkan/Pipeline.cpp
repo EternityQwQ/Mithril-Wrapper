@@ -144,6 +144,11 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
         mix(&attribs[i].normalized, sizeof(attribs[i].normalized));
         mix(&attribs[i].integer, sizeof(attribs[i].integer));
         mix(&attribs[i].stride, sizeof(attribs[i].stride));
+        // FIX (Root Cause L - 缓存键遗漏 offset): offset 被烘焙进管线
+        // (VkVertexInputAttributeDescription.offset, Pipeline.cpp:302 ad.offset)，
+        // 必须参与缓存键哈希。否则不同 offset 的 VAO 复用同一管线 → 属性从错误
+        // 字节偏移读取 → 顶点数据错位 → 红屏/花屏。
+        mix(&attribs[i].offset, sizeof(attribs[i].offset));
     }
     mix(&color_count, sizeof(color_count));
     for (int i = 0; i < color_count; ++i) mix(&color_formats[i], sizeof(color_formats[i]));
