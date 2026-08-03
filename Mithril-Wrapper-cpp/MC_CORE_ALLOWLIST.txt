@@ -1,0 +1,245 @@
+================================================================================
+MC_CORE_ALLOWLIST.txt — Mithril-Wrapper OpenGL Core Profile surface (versioned)
+================================================================================
+
+Purpose
+-------
+Canonical record of the OpenGL surface that Mithril-Wrapper exports for running
+Minecraft: Java Edition (Core Profile) on iOS via the Vulkan/MoltenVK backend.
+
+Mithril-Wrapper targets OpenGL 3.3 Core Profile. OpenGL Core Profile, by
+definition, EXCLUDES the legacy fixed-function pipeline (GL 1.x/2.x immediate
+mode, matrix stack, display lists, lighting/material/fog, evaluators, pixel
+transfer, selection/feedback, accumulation buffer, legacy client vertex arrays,
+attrib stacks, etc.). Minecraft: Java Edition 1.21 renders through shaders and
+the Core Profile programmable pipeline; it does not call the fixed-function
+entry points.
+
+Pruning policy
+--------------
+- Legacy fixed-function no-op stubs (definitions whose body was exactly `{}`,
+  present only for dlsym() symbol presence) have been REMOVED from
+  MG_Impl/Stubs.cpp. The Core Profile path never calls them.
+- The full GL 3.3 Core Profile implementation (real, multi-line definitions
+  backed by MITHRIL_ENSURE_INIT() + state/backend calls) is RETAINED.
+- Three trivial-return one-liners (glIsList -> GL_FALSE, glGenLists -> 0,
+  glRenderMode -> 0) are RETAINED: they return meaningful "unsupported"
+  defaults and are safer to keep than remove.
+
+Date:   2026-08-03
+Branch: aether/mc-core-slim
+
+References used
+---------------
+- /workspace/refs/MobileGlues  — MobileGlues gl_stub.cpp (the MC battle-tested
+  sibling implementation).
+- /workspace/refs/MobileGL     — MG_Impl (next-generation MC reference).
+- LWJGL 3 GL33                 — canonical OpenGL 3.3 Core Profile entry-point
+  set as exposed to Java MC by LWJGL.
+
+
+================================================================================
+## RETAINED — GL 3.3 Core Profile implementation (KEEP)
+================================================================================
+
+The authoritative retained set = ALL `gl*` definitions across MG_Impl/*.cpp
+AFTER pruning. Stubs.cpp now contains ONLY real implementations plus the three
+trivial-return stubs listed above; every other `gl*` definition in MG_Impl
+(Buffer.cpp, Drawing.cpp, Framebuffer.cpp, Getter.cpp, Program.cpp, Shader.cpp,
+Texture.cpp, VertexArray.cpp, gl.cpp, init.cpp) is a real Core Profile
+implementation and is retained.
+
+Categories retained, with example entry points:
+
+- Drawing:
+    glDrawArrays, glDrawElements, glDrawArraysInstanced
+- Buffer objects:
+    glGenBuffers, glBindBuffer, glBufferData, glBufferSubData
+- Vertex array objects (VAO):
+    glGenVertexArrays, glBindVertexArray
+- Textures:
+    glGenTextures, glBindTexture, glTexImage2D, glTexStorage2D,
+    glTexImage2DMultisample, glTexParameteri
+- Framebuffer objects (FBO):
+    glGenFramebuffers, glBindFramebuffer, glFramebufferTexture2D
+- Shaders / programs:
+    glCreateShader, glCreateProgram, glAttachShader, glLinkProgram,
+    glUseProgram, glUniform* (e.g. glUniformMatrix4fv, glUniform1i)
+- State:
+    glEnable, glDisable, glViewport, glClearColor, glClear, glBlendFunc,
+    glDepthFunc, glCullFace
+- Getters:
+    glGetString, glGetStringi, glGetIntegerv, glGetBooleanv
+- Sync objects:
+    glFenceSync, glClientWaitSync
+- Query objects:
+    glGenQueries, glQueryCounter, glGetQueryObjectuiv
+- Sampler objects:
+    glGenSamplers, glBindSampler, glSamplerParameter* (i/f/iv/fv)
+- Transform feedback:
+    glGenTransformFeedbacks, glBindTransformFeedback,
+    glBeginTransformFeedback, glEndTransformFeedback
+
+
+================================================================================
+## REMOVED — Legacy fixed-function no-op stubs (D)
+================================================================================
+
+Reason: Core Profile excludes the fixed-function pipeline; Minecraft: Java
+Edition 1.21 (Core Profile) does not call these; they were no-op `{}`
+stubs present only for symbol presence. Each was verified to have NO internal
+caller in any MG_Impl/*.cpp, MG_State/*.cpp, MG_Backend/*.cpp(*.mm), or
+egl/*.cpp(*.mm) file outside MG_Impl/Stubs.cpp itself. Their declarations
+remain in include/GL/gl.h (harmless header declarations; that file is
+intentionally left untouched).
+
+Full list of removed empty-body `{}` stubs (118):
+
+glClearIndex
+glIndexMask
+glAlphaFunc
+glLogicOp
+glLineStipple
+glPolygonStipple
+glGetPolygonStipple
+glEdgeFlag
+glEdgeFlagv
+glClipPlane
+glGetClipPlane
+glClearAccum
+glAccum
+glMatrixMode
+glOrtho
+glFrustum
+glPushMatrix
+glPopMatrix
+glLoadIdentity
+glLoadMatrixd
+glLoadMatrixf
+glMultMatrixd
+glMultMatrixf
+glRotated
+glRotatef
+glScaled
+glScalef
+glTranslated
+glTranslatef
+glDeleteLists
+glNewList
+glEndList
+glCallList
+glCallLists
+glListBase
+glBegin
+glEnd
+glVertex2d
+glVertex2f
+glVertex2i
+glVertex3f
+glVertex3fv
+glVertex4f
+glNormal3f
+glColor3f
+glColor3ub
+glColor4f
+glColor4ub
+glTexCoord2f
+glTexCoord4f
+glRasterPos2i
+glRasterPos3f
+glWindowPos2i
+glShadeModel
+glMaterialf
+glMaterialfv
+glMateriali
+glLightf
+glLightfv
+glLightModelf
+glLightModelfv
+glFogf
+glFogi
+glFogfv
+glFogiv
+glColorMaterial
+glTexGend
+glTexGenf
+glTexGeni
+glTexGenfv
+glTexGeniv
+glTexEnvf
+glTexEnvi
+glTexEnvfv
+glTexEnviv
+glPixelTransferf
+glPixelTransferi
+glPixelMapfv
+glPixelMapuiv
+glPixelMapusv
+glPixelZoom
+glCopyPixels
+glInitNames
+glLoadName
+glPushName
+glPopName
+glSelectBuffer
+glFeedbackBuffer
+glPassThrough
+glMap1d
+glMap2d
+glEvalCoord1d
+glEvalCoord2d
+glMapGrid1d
+glMapGrid2d
+glEvalMesh1
+glEvalMesh2
+glEvalPoint1
+glEvalPoint2
+glRectd
+glRectf
+glRecti
+glPushAttrib
+glPopAttrib
+glPushClientAttrib
+glPopClientAttrib
+glEnableClientState
+glDisableClientState
+glVertexPointer
+glNormalPointer
+glColorPointer
+glTexCoordPointer
+glIndexPointer
+glEdgeFlagPointer
+glInterleavedArrays
+glArrayElement
+glPrioritizeTextures
+glDepthBoundsEXT
+
+
+================================================================================
+## NON-NEGOTIABLE invariants
+================================================================================
+
+These invariants MUST hold after pruning and are asserted in CI
+(.github/workflows/build.yml, step "Verify exported EGL/GL symbols"):
+
+1. glGetString(GL_VERSION) returns a string containing both "3.3" and
+   "Mithril-Wrapper".
+2. glGetIntegerv(GL_MAJOR_VERSION) == 3.
+3. glGetIntegerv(GL_MINOR_VERSION) == 3.
+4. glGetIntegerv(GL_CONTEXT_PROFILE_MASK) == GL_CONTEXT_CORE_PROFILE_BIT
+   (i.e. the context advertises Core Profile, not Compatibility).
+5. The EGL 1.5 surface is UNCHANGED: libmithril.dylib exports at least 40
+   egl* symbols (EGL 1.5 surface/config/context/sync/image/platform-surface
+   API), and the required EGL entry-point set is fully present.
+6. Key Core Profile GL entry points (glDrawArrays, glDrawElements,
+   glGenBuffers, glBindBuffer, glBufferData, glVertexAttribPointer,
+   glEnableVertexAttribArray, glUniformMatrix4fv, glGetUniformLocation,
+   glUseProgram, glCreateProgram, glLinkProgram, glAttachShader, glTexImage2D,
+   glGenFramebuffers, glFramebufferTexture2D, glViewport, glClearColor,
+   glClear, glEnable, glDisable, glBlendFunc, glDepthFunc, glGetString,
+   glGetStringi, glGenVertexArrays, glBindVertexArray, glTexStorage2D,
+   glDrawArraysInstanced) MUST be present in the dylib export table.
+
+================================================================================
+End of MC_CORE_ALLOWLIST.txt
+================================================================================

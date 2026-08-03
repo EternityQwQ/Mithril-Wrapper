@@ -166,6 +166,60 @@ jobs:
             echo "::error::Expected at least 40 exported egl* symbols, found $TOTAL — EGL 1.5 sync/image/platform-surface impl may be missing."
             exit 1
           fi
+          echo "=== Removed legacy fixed-function stubs absent from export table? ==="
+          # Removed legacy fixed-function no-op stubs (see Mithril-Wrapper-cpp/MC_CORE_ALLOWLIST.txt). Each MUST be absent from the dylib's export table.
+          removed_gl_stubs=(
+            glClearIndex glIndexMask glAlphaFunc glLogicOp glLineStipple
+            glPolygonStipple glGetPolygonStipple glEdgeFlag glEdgeFlagv
+            glClipPlane glGetClipPlane glClearAccum glAccum glMatrixMode
+            glOrtho glFrustum glPushMatrix glPopMatrix glLoadIdentity
+            glLoadMatrixd glLoadMatrixf glMultMatrixd glMultMatrixf glRotated
+            glRotatef glScaled glScalef glTranslated glTranslatef glDeleteLists
+            glNewList glEndList glCallList glCallLists glListBase glBegin glEnd
+            glVertex2d glVertex2f glVertex2i glVertex3f glVertex3fv glVertex4f
+            glNormal3f glColor3f glColor3ub glColor4f glColor4ub glTexCoord2f
+            glTexCoord4f glRasterPos2i glRasterPos3f glWindowPos2i glShadeModel
+            glMaterialf glMaterialfv glMateriali glLightf glLightfv glLightModelf
+            glLightModelfv glFogf glFogi glFogfv glFogiv glColorMaterial glTexGend
+            glTexGenf glTexGeni glTexGenfv glTexGeniv glTexEnvf glTexEnvi glTexEnvfv
+            glTexEnviv glPixelTransferf glPixelTransferi glPixelMapfv glPixelMapuiv
+            glPixelMapusv glPixelZoom glCopyPixels glInitNames glLoadName glPushName
+            glPopName glSelectBuffer glFeedbackBuffer glPassThrough glMap1d glMap2d
+            glEvalCoord1d glEvalCoord2d glMapGrid1d glMapGrid2d glEvalMesh1 glEvalMesh2
+            glEvalPoint1 glEvalPoint2 glRectd glRectf glRecti glPushAttrib glPopAttrib
+            glPushClientAttrib glPopClientAttrib glEnableClientState glDisableClientState
+            glVertexPointer glNormalPointer glColorPointer glTexCoordPointer
+            glIndexPointer glEdgeFlagPointer glInterleavedArrays glArrayElement
+            glPrioritizeTextures glDepthBoundsEXT
+          )
+          bad_present=0
+          for sym in "${removed_gl_stubs[@]}"; do
+            if echo "$NM_OUT" | grep -qE " [Tt] _?${sym}$"; then
+              echo "::error::Removed legacy stub '${sym}' is still exported by libmithril.dylib — Core Profile surface must not export fixed-function entry points."
+              bad_present=1
+            else
+              echo "OK   ${sym} (absent)"
+            fi
+          done
+          if [ "$bad_present" -ne 0 ]; then
+            exit 1
+          fi
+          echo "=== Key Core Profile GL entry points present? ==="
+          for sym in glDrawArrays glDrawElements glGenBuffers glBindBuffer glBufferData \
+                     glVertexAttribPointer glEnableVertexAttribArray \
+                     glUniformMatrix4fv glGetUniformLocation glUseProgram \
+                     glCreateProgram glLinkProgram glAttachShader glTexImage2D \
+                     glGenFramebuffers glFramebufferTexture2D glViewport glClearColor \
+                     glClear glEnable glDisable glBlendFunc glDepthFunc glGetString \
+                     glGetStringi glGenVertexArrays glBindVertexArray glTexStorage2D \
+                     glDrawArraysInstanced; do
+            if echo "$NM_OUT" | grep -qE " [Tt] _?${sym}$"; then
+              echo "OK   ${sym} (present)"
+            else
+              echo "::error::Required Core Profile entry point '${sym}' missing from libmithril.dylib export table."
+              exit 1
+            fi
+          done
 
       - name: Verify Vulkan backend symbols
         run: |
