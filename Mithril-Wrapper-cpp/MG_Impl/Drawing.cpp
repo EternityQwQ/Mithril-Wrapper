@@ -195,6 +195,27 @@ static void prepare_draw(GLenum mode) {
         is_default_fbo ? 1 : 0);
     if (pipeline == VK_NULL_HANDLE) return;
 
+    // FIX (root cause Y, CRITICAL): Register user-FBO attachment tex_ids so
+    // begin_render_pass can barrier their images to attachment-optimal and
+    // end_render_pass can barrier them back to read-only + update
+    // TextureEntry::currentLayout. VK_KHR_dynamic_rendering does NOT
+    // auto-transition attachment layouts — without this registration, the
+    // declared imageLayout (COLOR_ATTACHMENT_OPTIMAL) would mismatch the
+    // actual layout (SHADER_READ_ONLY_OPTIMAL from a prior upload) → spec
+    // violation → MoltenVK drops the draw → black screen.
+    // For FBO 0 (swapchain), pass null/0 to clear any stale registration;
+    // the swapchain path's barriers are handled by the activeSwapchain block.
+    if (fbo) {
+        GLuint color_tex_ids[8] = {0};
+        for (int i = 0; i < color_count && i < 8; ++i) {
+            color_tex_ids[i] = fbo->colors[i].texture;
+        }
+        GLuint depth_tex_id = fbo->depth.texture;
+        backend_set_fbo_attachment_tex_ids(color_tex_ids, color_count, depth_tex_id);
+    } else {
+        backend_set_fbo_attachment_tex_ids(nullptr, 0, 0);
+    }
+
     // Begin render pass (Load action preserves previous contents).
     backend_set_load_load();
     backend_begin_render_pass(colors, color_count, depth_view, w, h, 1);
@@ -330,7 +351,16 @@ static void end_draw(void) {
 }
 
 static int index_type_to_int(GLenum type) {
-    return (type == GL_UNSIGNED_INT) ? 1 : 0;
+    // FIX (root cause AE - GL_UNSIGNED_BYTE 索引支持):
+    // 0 = UINT16 (GL_UNSIGNED_SHORT), 1 = UINT32 (GL_UNSIGNED_INT),
+    // 2 = UINT8 (GL_UNSIGNED_BYTE)。原代码仅返回 0/1，GL_UNSIGNED_BYTE
+    // 被当作 UINT16 → 1 字节索引按 2 字节解释 → 索引值错乱 → 几何腐败 → 红屏。
+    // backend_draw_indexed 的 case 2 映射到 VK_INDEX_TYPE_UINT8
+    // （需 Device.cpp 启用 VK_EXT_index_type_uint8）。
+    // 深度对照 MobileGL VulkanRenderer.cpp:3093-3109。
+    if (type == GL_UNSIGNED_INT)   return 1;
+    if (type == GL_UNSIGNED_BYTE)  return 2;
+    return 0;  // GL_UNSIGNED_SHORT → UINT16
 }
 
 // P1-9: Validate primitive mode + vertex count for draw calls.
@@ -376,9 +406,13 @@ void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei prim
 void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
                                        GLsizei primcount, GLuint baseinstance) {
     MITHRIL_ENSURE_INIT();
-    (void)baseinstance; // base-instance is not exposed by the current backend wrapper
+    // FIX (root cause AG - BaseInstance): 设置 currentBaseInstance 后调用 draw，
+    // 完成后重置为 0。backend_draw_arrays_instanced 从 g_state 读取后传给
+    // vkCmdDraw 的 firstInstance。深度对照 MobileGL drawParams.baseInstance。
+    g_state->currentBaseInstance = baseinstance;
     prepare_draw(mode);
     backend_draw_arrays_instanced((int)mode, (int)first, (int)count, (int)primcount);
+    g_state->currentBaseInstance = 0;
     end_draw();
 }
 
@@ -395,7 +429,9 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices
                              ib, (VkDeviceSize)(intptr_t)indices);
     } else if (indices) {
         // Client-space index pointer: stage into a transient VkBuffer.
-        size_t elem = (type == GL_UNSIGNED_INT) ? 4 : 2;
+        // FIX (root cause AE): GL_UNSIGNED_BYTE 索引按 1 字节/索引 staging，
+        // 否则 staging 大小翻倍 → 越界读 + 索引错乱。
+        size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
         GLuint transient = (GLuint)(uintptr_t)indices; // use address as throwaway name
         VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
                                                        indices, (size_t)count * elem);
@@ -410,8 +446,13 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices
 void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type,
                               const void* indices, GLint basevertex) {
     MITHRIL_ENSURE_INIT();
-    (void)basevertex; // base-vertex not exposed by the current backend wrapper
+    // FIX (root cause AG - BaseVertex): 将 baseVertex 通过 g_state->currentBaseVertex
+    // 传递给 backend_draw_indexed（vkCmdDrawIndexed 的 vertexOffset）。draw 完成后
+    // 立即重置为 0，避免泄漏到后续无 BaseVertex 的 draw（应保持 vertexOffset=0）。
+    // 深度对照 MobileGL drawParams.baseVertex。
+    g_state->currentBaseVertex = basevertex;
     glDrawElements(mode, count, type, indices);
+    g_state->currentBaseVertex = 0;
 }
 
 void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
@@ -426,7 +467,8 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
                                        index_type_to_int(type), ib,
                                        (VkDeviceSize)(intptr_t)indices, (int)primcount);
     } else if (indices) {
-        size_t elem = (type == GL_UNSIGNED_INT) ? 4 : 2;
+        // FIX (root cause AE): GL_UNSIGNED_BYTE 索引按 1 字节/索引 staging。
+        size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
         GLuint transient = (GLuint)(uintptr_t)indices;
         VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
                                                        indices, (size_t)count * elem);
@@ -443,16 +485,23 @@ void glDrawElementsInstancedBaseVertex(GLenum mode, GLsizei count, GLenum type,
                                        const void* indices, GLsizei primcount,
                                        GLint basevertex) {
     MITHRIL_ENSURE_INIT();
-    (void)basevertex;
+    // FIX (root cause AG - BaseVertex): 设置 currentBaseVertex 后调用 draw，
+    // 完成后重置为 0。深度对照 MobileGL drawParams.baseVertex。
+    g_state->currentBaseVertex = basevertex;
     glDrawElementsInstanced(mode, count, type, indices, primcount);
+    g_state->currentBaseVertex = 0;
 }
 
 void glDrawElementsInstancedBaseInstance(GLenum mode, GLsizei count, GLenum type,
                                          const void* indices, GLsizei primcount,
                                          GLuint baseinstance) {
     MITHRIL_ENSURE_INIT();
-    (void)baseinstance;
+    // FIX (root cause AG - BaseInstance): 设置 currentBaseInstance 后调用 draw，
+    // 完成后重置为 0。backend_draw_indexed_instanced 从 g_state 读取后传给
+    // vkCmdDrawIndexed 的 firstInstance。深度对照 MobileGL drawParams.baseInstance。
+    g_state->currentBaseInstance = baseinstance;
     glDrawElementsInstanced(mode, count, type, indices, primcount);
+    g_state->currentBaseInstance = 0;
 }
 
 void glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count,
@@ -466,8 +515,13 @@ void glDrawElementsBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum typ
                                           const void* indices, GLint basevertex,
                                           GLuint baseinstance) {
     MITHRIL_ENSURE_INIT();
-    (void)basevertex; (void)baseinstance;
+    // FIX (root cause AG - BaseVertex + BaseInstance): 同时设置 currentBaseVertex
+    // 与 currentBaseInstance，draw 完成后重置为 0。深度对照 MobileGL drawParams。
+    g_state->currentBaseVertex = basevertex;
+    g_state->currentBaseInstance = baseinstance;
     glDrawElements(mode, count, type, indices);
+    g_state->currentBaseVertex = 0;
+    g_state->currentBaseInstance = 0;
 }
 
 void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {

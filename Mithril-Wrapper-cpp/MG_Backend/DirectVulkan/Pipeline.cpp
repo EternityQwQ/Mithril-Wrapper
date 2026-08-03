@@ -9,6 +9,10 @@
 #include "DescriptorSet.h"
 #include "../Backend.h"
 #include "../../MG_Impl/Log.h"
+// FIX (root cause AF - Primitive Restart): 读取 g_state->primitiveRestart /
+// primitiveRestartFixedIndex 以动态设置 ia.primitiveRestartEnable，并将其
+// 纳入 hash_signature 缓存键。深度对照 MobileGL VulkanRenderer.cpp:3861-3877。
+#include "../../MG_State/State.h"
 
 #include <cstring>
 #include <vector>
@@ -227,6 +231,17 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
     mix(&color_write_mask, sizeof(color_write_mask));
     mix(&prim, sizeof(prim));
     mix(&is_default_fbo, sizeof(is_default_fbo));
+    // FIX (root cause AF - Primitive Restart): 将 primitiveRestart 状态纳入
+    // pipeline 缓存键。否则启用/禁用 restart 会复用同一管线 →
+    // ia.primitiveRestartEnable 与 g_state 不一致 → strip 在 restart 索引处
+    // 行为错误 → 几何腐败。直接读 g_state（与 get_or_create_pipeline 的
+    // ia.primitiveRestartEnable 计算保持同一来源），g_state 为 null 时按
+    // VK_FALSE 处理（与 get_or_create_pipeline 的 null 检查一致）。
+    // 深度对照 MobileGL VulkanRenderer.cpp:3861-3877。
+    bool pr = (mithril::g_state && mithril::g_state->primitiveRestart);
+    bool prfi = (mithril::g_state && mithril::g_state->primitiveRestartFixedIndex);
+    mix(&pr, sizeof(pr));
+    mix(&prfi, sizeof(prfi));
     return h;
 }
 
@@ -419,7 +434,17 @@ VkPipeline get_or_create_pipeline(GLuint program,
     VkPipelineInputAssemblyStateCreateInfo ia{};
     ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = gl_prim_to_vk(gl_primitive_mode);
-    ia.primitiveRestartEnable = VK_FALSE;
+    // FIX (root cause AF - Primitive Restart):
+    // 原 `ia.primitiveRestartEnable = VK_FALSE` 硬编码，忽略 GL 的
+    // GL_PRIMITIVE_RESTART / GL_PRIMITIVE_RESTART_FIXED_INDEX 状态。strip/fan
+    // 几何在 restart 索引处不断开 → 连接到无效顶点 → 几何腐败 → 红屏。
+    // 改为从 g_state 读取：两者任一启用时为 VK_TRUE。需 Device.cpp 启用
+    // VK_EXT_primitive_topology_list_restart 扩展以支持 list topology 上的 restart。
+    // 深度对照 MobileGL VulkanRenderer.cpp:3861-3877。
+    ia.primitiveRestartEnable =
+        (mithril::g_state && (mithril::g_state->primitiveRestart ||
+                              mithril::g_state->primitiveRestartFixedIndex))
+            ? VK_TRUE : VK_FALSE;
 
     // ---- Viewport / scissor (dynamic) ----
     VkPipelineViewportStateCreateInfo vp{};

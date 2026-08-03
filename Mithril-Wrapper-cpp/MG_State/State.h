@@ -564,6 +564,11 @@ struct GLState {
     bool    programPointSize = false;
     bool    primitiveRestart = false;
     GLuint  primitiveRestartIndex = 0;
+    // FIX (根因 AF - Primitive Restart): GL_PRIMITIVE_RESTART_FIXED_INDEX 状态。
+    // 与 primitiveRestart（GL_PRIMITIVE_RESTART）独立维护；Pipeline.cpp 的
+    // ia.primitiveRestartEnable 在两者任一启用时为 VK_TRUE。
+    // 深度对照 MobileGL VulkanRenderer.cpp:3861-3877。
+    bool    primitiveRestartFixedIndex = false;
     bool    framebufferSRGB = false;
     bool    depthClamp = false;
     bool    rasterizerDiscard = false;
@@ -575,6 +580,19 @@ struct GLState {
     GLsizei viewportW = 0, viewportH = 0;
     GLint   scissorX = 0, scissorY = 0;
     GLsizei scissorW = 0, scissorH = 0;
+
+    // FIX (根因 AG - BaseVertex / BaseInstance): draw-time base offsets.
+    // 由 glDrawElementsBaseVertex / glDrawElementsInstancedBaseVertex 设置
+    // currentBaseVertex；由 glDrawElementsInstancedBaseInstance /
+    // glDrawArraysInstancedBaseInstance 设置 currentBaseInstance。
+    // backend_draw_indexed / backend_draw_indexed_instanced /
+    // backend_draw / backend_draw_instanced 从 g_state 读取后传给
+    // vkCmdDrawIndexed 的 vertexOffset / firstInstance 与 vkCmdDraw 的
+    // firstInstance。每次 draw 完成后由 Drawing.cpp 重置为 0，避免泄漏到
+    // 下一个 draw（无 BaseVertex 的 draw 应保持 vertexOffset=0）。
+    // 深度对照 MobileGL drawParams.baseVertex / drawParams.baseInstance。
+    int32_t  currentBaseVertex = 0;
+    uint32_t currentBaseInstance = 0;
 
     // ---- Pixel store ----
     PixelStoreState pixelStore;

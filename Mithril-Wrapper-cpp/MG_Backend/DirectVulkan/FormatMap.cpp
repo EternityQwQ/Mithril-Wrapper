@@ -118,5 +118,38 @@ VkImageAspectFlags aspect_for_format(VkFormat fmt) {
     return VK_IMAGE_ASPECT_COLOR_BIT;
 }
 
+// FIX (Root Cause AH - depth-stencil descriptor layout):
+// 返回采样纹理应处的 read-only 布局，按 VkFormat 区分：
+//   - depth-stencil 格式 (D24S8/D32S8/S8) -> DEPTH_STENCIL_READ_ONLY_OPTIMAL
+//   - depth-only 格式 (D16/D32/X8_D24)    -> DEPTH_READ_ONLY_OPTIMAL
+//   - 其他 (color)                        -> SHADER_READ_ONLY_OPTIMAL
+//
+// 根因机制：DescriptorSet.cpp 写 descriptor imageInfo 时硬编码
+// SHADER_READ_ONLY_OPTIMAL，Resources.cpp 上传后 layout transition 也硬编码
+// SHADER_READ_ONLY_OPTIMAL。对 depth-stencil 纹理，image 实际布局（经根因 Y
+// 修复后为 DEPTH_STENCIL_READ_ONLY_OPTIMAL）与 descriptor 声明不匹配 →
+// MoltenVK 验证错误或静默丢 draw → 黑屏。
+//
+// 对照 MobileGL ResolveSampledReadOnlyLayout (VkTextureManager.cpp:177)：
+// 对 depth-stencil aspect 返回 DEPTH_STENCIL_READ_ONLY_OPTIMAL。
+VkImageLayout sampled_layout_for_format(VkFormat fmt) {
+    switch (fmt) {
+        // depth-stencil (含 stencil aspect): 采样时必须用 DEPTH_STENCIL_READ_ONLY_OPTIMAL
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        case VK_FORMAT_S8_UINT:
+            return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        // depth-only (无 stencil aspect): 用 DEPTH_READ_ONLY_OPTIMAL
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+            return VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL;
+        // color 及其他: 用 SHADER_READ_ONLY_OPTIMAL
+        default:
+            return VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+}
+
 } // namespace vk
 } // namespace mithril

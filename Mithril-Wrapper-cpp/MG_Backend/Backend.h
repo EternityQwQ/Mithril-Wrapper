@@ -84,6 +84,32 @@ void backend_begin_render_pass(VkImageView* color_views, int color_count,
                                VkImageView depth_view, int width, int height,
                                int samples);
 
+/*
+ * Register the GL texture names backing the user-FBO color/depth attachments
+ * for the NEXT backend_begin_render_pass. VK_KHR_dynamic_rendering does NOT
+ * auto-transition attachment image layouts — it only validates each image is
+ * in the layout declared by VkRenderingAttachmentInfo.imageLayout. User-FBO
+ * color/depth textures live in the backend texture table (TextureEntry) with
+ * a tracked currentLayout; without an explicit barrier to
+ * COLOR_ATTACHMENT_OPTIMAL / DEPTH_STENCIL_ATTACHMENT_OPTIMAL, the actual
+ * layout (SHADER_READ_ONLY_OPTIMAL from a prior upload) mismatches the
+ * declared layout → spec violation → MoltenVK drops the draw → black screen
+ * (root cause Y). begin_render_pass reads these tex_ids, looks up each
+ * TextureEntry, and barriers its image to attachment-optimal; end_render_pass
+ * barriers them back to a read-only layout and updates currentLayout, then
+ * auto-clears the registration.
+ *
+ *   color_tex_ids : array of GL texture names (may be NULL when color_count==0)
+ *   color_count   : number of color attachments (clamped to 8)
+ *   depth_tex_id  : GL texture name for the depth attachment (0 = none)
+ *
+ * For swapchain rendering (FBO 0) pass NULL/0/0 to clear any stale
+ * registration — the swapchain path's barriers are handled by the
+ * activeSwapchain block in begin_render_pass / commit_frame.
+ */
+void backend_set_fbo_attachment_tex_ids(GLuint* color_tex_ids, int color_count,
+                                        GLuint depth_tex_id);
+
 /* End + commit the active render pass / command buffer. */
 void backend_end_render_pass(void);
 void backend_commit(void);
@@ -171,7 +197,8 @@ void backend_set_color_write_mask(int r, int g, int b, int a);
 void backend_set_stencil_state(int enabled, int func, int ref, int mask,
                                int sfail, int dpfail, int dppass);
 
-/* Draw primitives. `index_type` 0=U16 (VK_INDEX_TYPE_UINT16), 1=U32. */
+/* Draw primitives. `index_type` 0=U16 (VK_INDEX_TYPE_UINT16), 1=U32,
+ * 2=U8 (VK_INDEX_TYPE_UINT8_EXT, requires VK_EXT_index_type_uint8). */
 void backend_draw_arrays(int primitive, int first, int count);
 void backend_draw_indexed(int primitive, int count, int index_type,
                           VkBuffer index_buffer, VkDeviceSize index_offset);

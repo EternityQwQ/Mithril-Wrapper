@@ -28,6 +28,18 @@ int host_texel_bytes(GLenum format, GLenum type);
 // VkImageAspectFlags for a VkFormat (color / depth / depth+stencil / stencil).
 VkImageAspectFlags aspect_for_format(VkFormat fmt);
 
+// FIX (Root Cause AH - depth-stencil descriptor layout):
+// Resolve the read-only image layout a sampled texture should be in, based on
+// its VkFormat. Color formats use SHADER_READ_ONLY_OPTIMAL; depth-only formats
+// (D16/D32/X8_D24) use DEPTH_READ_ONLY_OPTIMAL; depth-stencil formats
+// (D24S8/D32S8/S8) use DEPTH_STENCIL_READ_ONLY_OPTIMAL.
+//
+// The descriptor's imageLayout field and the post-upload layout transition
+// must both use this layout so the descriptor's declared layout matches the
+// image's actual layout. Mirrors MobileGL ResolveSampledReadOnlyLayout
+// (VkTextureManager.cpp:177).
+VkImageLayout sampled_layout_for_format(VkFormat fmt);
+
 } // namespace vk
 } // namespace mithril
 

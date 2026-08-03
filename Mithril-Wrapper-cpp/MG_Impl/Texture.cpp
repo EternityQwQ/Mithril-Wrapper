@@ -144,7 +144,18 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
     }
     if (t->levels < level + 1) t->levels = level + 1;
 
-    backend_get_or_create_texture(t->id, width, height, 1, t->levels,
+    // FIX (Root Cause AI - glTexImage2D mipmap uses base level dimensions):
+    // VkImage 的 extent 必须始终是 base level (level 0) 的尺寸，而非当前 level
+    // 的尺寸。旧代码用当前 level 的 width/height 调用 backend_get_or_create_texture，
+    // 上传 level 1 时 width/height = base/2 → Resources.cpp 的复用条件不满足 →
+    // 重建 VkImage with extent=(base/2, base/2) → base level 数据丢失 + VkImage
+    // extent 错误 → 纹理腐败 → 红屏/花屏。
+    // 修复：始终用 t->width / t->height（level==0 时更新的 base level 尺寸）。
+    // 当前 level 的数据仍通过 level 参数上传到正确的 mip level（imageExtent
+    // 在 backend_texture_upload 内按当前 level 的 width/height 设置）。
+    // 对照 MobileGL CheckMipmapCompleteness (VkTextureManager.cpp:1918-1957)：
+    // MobileGL 始终用 base level 尺寸作为 VkImage extent。
+    backend_get_or_create_texture(t->id, t->width, t->height, 1, t->levels,
                                   internalFormat, target, 1);
     if (pixels) {
         backend_texture_upload(t->id, level, 0, 0, 0, width, height, 1,

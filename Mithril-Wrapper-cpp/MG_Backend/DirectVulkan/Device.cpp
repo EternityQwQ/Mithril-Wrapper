@@ -609,6 +609,22 @@ bool init_device() {
     if (has_extension(devExtProps, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
         devExts.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
     }
+    // FIX (root cause AE - GL_UNSIGNED_BYTE 索引支持):
+    // VK_EXT_index_type_uint8 提供 VK_INDEX_TYPE_UINT8，让 GL_UNSIGNED_BYTE
+    // 索引可以正确解释为 1 字节/索引。不启用则被当作 UINT16（2 字节）→
+    // 索引值错乱 → 几何腐败 → 红屏。深度对照 MobileGL VulkanRenderer.cpp:3093-3109。
+    if (has_extension(devExtProps, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) {
+        devExts.push_back(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME);
+    }
+    // FIX (root cause AF - Primitive Restart):
+    // VK_EXT_primitive_topology_list_restart 让 list topology（POINT_LIST/
+    // LINE_LIST/TRIANGLE_LIST）也支持 primitiveRestartEnable。GL 的
+    // GL_PRIMITIVE_RESTART / GL_PRIMITIVE_RESTART_FIXED_INDEX 在 strip/fan/list
+    // 上都应生效；不启用则 strip 在 restart 索引处不断开 → 连接到无效顶点 →
+    // 几何腐败 → 红屏。深度对照 MobileGL VulkanRenderer.cpp:3861-3877。
+    if (has_extension(devExtProps, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
+        devExts.push_back(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
+    }
 
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueCI{};
@@ -631,6 +647,11 @@ bool init_device() {
     dynRenderFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
     dynRenderFeat.dynamicRendering = VK_TRUE;
     dynRenderFeat.pNext = &extDynStateFeat;
+
+    // Track the tail of the feature pNext chain so additional feature structs
+    // (portability-subset, index_type_uint8, primitive_topology_list_restart)
+    // can be appended in any order without hardcoding the previous link.
+    VkBaseOutStructure* chainTail = (VkBaseOutStructure*)&extDynStateFeat;
 
     // FIX (root cause Q): When VK_KHR_portability_subset is enabled (it is, on
     // MoltenVK — Device.cpp:197-199), the Vulkan spec REQUIRES
@@ -656,7 +677,35 @@ bool init_device() {
         // Chain portability-subset at the END of the feature chain
         // (after extended-dynamic-state). The order does not matter for
         // correctness; we just need all feature structs in the pNext chain.
-        extDynStateFeat.pNext = &portSubsetFeat;
+        chainTail->pNext = (VkBaseOutStructure*)&portSubsetFeat;
+        chainTail = (VkBaseOutStructure*)&portSubsetFeat;
+    }
+
+    // FIX (root cause AE - GL_UNSIGNED_BYTE 索引支持):
+    // 启用 VK_EXT_index_type_uint8 的 feature，让 vkCmdBindIndexBuffer 接受
+    // VK_INDEX_TYPE_UINT8。仅当设备支持该扩展时链入（spec-safe）。
+    // 深度对照 MobileGL VulkanRenderer.cpp:3093-3109。
+    VkPhysicalDeviceIndexTypeUint8FeaturesEXT indexTypeUint8Feat{};
+    indexTypeUint8Feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT;
+    indexTypeUint8Feat.indexTypeUint8 = VK_TRUE;
+    indexTypeUint8Feat.pNext = nullptr;
+    if (has_extension(devExtProps, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) {
+        chainTail->pNext = (VkBaseOutStructure*)&indexTypeUint8Feat;
+        chainTail = (VkBaseOutStructure*)&indexTypeUint8Feat;
+    }
+
+    // FIX (root cause AF - Primitive Restart):
+    // 启用 VK_EXT_primitive_topology_list_restart 的 feature，让 list topology
+    // 上的 primitiveRestartEnable=VK_TRUE 生效（strip/fan topology 在核心
+    // 1.2 已支持，list 需此扩展）。仅当设备支持时链入。
+    // 深度对照 MobileGL VulkanRenderer.cpp:3861-3877。
+    VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT primTopoListRestartFeat{};
+    primTopoListRestartFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT;
+    primTopoListRestartFeat.primitiveTopologyListRestart = VK_TRUE;
+    primTopoListRestartFeat.pNext = nullptr;
+    if (has_extension(devExtProps, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
+        chainTail->pNext = (VkBaseOutStructure*)&primTopoListRestartFeat;
+        chainTail = (VkBaseOutStructure*)&primTopoListRestartFeat;
     }
 
     // ---- Core VkPhysicalDeviceFeatures ----

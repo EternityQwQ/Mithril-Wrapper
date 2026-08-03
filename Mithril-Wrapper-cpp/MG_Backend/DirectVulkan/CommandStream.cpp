@@ -4,9 +4,12 @@
 #include "CommandStream.h"
 #include "Device.h"
 #include "Swapchain.h"
+#include "Resources.h"  // texture_table() / TextureEntry (root cause Y: FBO layout barriers)
 #include "../Backend.h"
 #include "../../MG_Impl/Log.h"
-#include "../../MG_State/State.h"  // g_state (for scissorTest in clear_attachments)
+#include "../../MG_State/State.h"  // g_state (for scissorTest in clear_attachments +
+                                  //  root cause AG: currentBaseVertex/currentBaseInstance +
+                                  //  root cause Z: viewportH fallback)
 
 #include <cstring>
 #include <vector>
@@ -15,6 +18,26 @@ namespace mithril {
 namespace vk {
 
 namespace {
+
+// Root cause AA (depth-only format pStencilAttachment, VUID-06126):
+// Returns true if `fmt` has a stencil aspect. Used by begin_render_pass to
+// decide whether to bind pStencilAttachment: dynamic-rendering REQUIRES the
+// stencil attachment's ImageView to contain a stencil aspect, but depth-only
+// formats (D32_SFLOAT / D16_UNORM) only have a depth aspect. Binding a
+// depth-only view as a stencil attachment is a spec violation
+// (VUID-VkRenderingInfo-pStencilAttachment-06126) and may cause MoltenVK to
+// drop the draw -> black screen. Mirrors MobileGL VkRenderPassManager's
+// aspect-based stencil-attachment decision.
+bool format_has_stencil(VkFormat fmt) {
+    switch (fmt) {
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        case VK_FORMAT_S8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
 
 // 根因 G (深度参考 MobileGL VulkanRenderer.cpp:193-198 ResolveColorClearAlpha):
 // 若 swapchain 颜色格式无 alpha 通道（如 R8G8B8_UNORM / B8G8R8_UNORM），
@@ -71,6 +94,39 @@ struct EncoderState {
     // races — can submit against a destroyed swapchain's semaphore, triggering
     // MoltenVK / IOSurface UAF crashes).
     bool hasCommands = false;
+
+    // ---- Root cause Y (CRITICAL): user-FBO attachment layout transitions ----
+    // VK_KHR_dynamic_rendering's vkCmdBeginRendering does NOT auto-transition
+    // attachment image layouts — it only validates that each image is in the
+    // layout declared by VkRenderingAttachmentInfo.imageLayout. The swapchain
+    // path barrier transitions are handled above (activeSwapchain block). User
+    // FBO color/depth textures are created with currentLayout=UNDEFINED and
+    // become SHADER_READ_ONLY_OPTIMAL after upload; without an explicit
+    // barrier to COLOR_ATTACHMENT_OPTIMAL / DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    // the actual layout != declared layout -> spec violation -> MoltenVK
+    // drops the draw -> black screen.
+    //
+    // MobileGL's VkRenderPassManager (VkRenderPassManager.cpp:711-784)
+    // barriers ALL attachments before render pass begin.
+    //
+    // The GL draw path (Drawing.cpp) calls backend_set_fbo_attachment_tex_ids
+    // right before backend_begin_render_pass for each non-swapchain
+    // attachment. begin_render_pass looks up the TextureEntry via tex_id and
+    // barriers its image to attachment-optimal; end_render_pass barriers it
+    // back to a read-only layout and updates TextureEntry::currentLayout.
+    // Cleared in end_render_pass.
+    GLuint fboColorTexIds[8] = {};
+    int    fboColorTexCount = 0;
+    GLuint fboDepthTexId = 0;
+
+    // ---- Root cause AA (HIGH): tracked depth format for this pass ----
+    // Set in begin_render_pass from the swapchain depth (D32_SFLOAT_S8_UINT,
+    // always has stencil) or the registered user-FBO depth TextureEntry
+    // (could be depth-only D32_SFLOAT / D16_UNORM, no stencil). Used to gate
+    // pStencilAttachment (VUID-06126). Reset to VK_FORMAT_UNDEFINED at the
+    // start of each begin_render_pass so a previous pass's depth format does
+    // not leak into a pass that has no depth attachment.
+    VkFormat depthFormat = VK_FORMAT_UNDEFINED;
 };
 
 EncoderState& encoder() {
@@ -102,17 +158,25 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
     b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
 
-    if (isDepthStencil) {
-        // D32_SFLOAT_S8_UINT has separate depth + stencil aspects.
-        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-    } else {
-        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    }
+    // FIX (root cause Y): derive the aspect mask from the format so depth-only
+    // images (D32_SFLOAT / D16_UNORM → DEPTH_BIT) and stencil-only (S8_UINT →
+    // STENCIL_BIT) get the correct mask. The previous hard-coded
+    // DEPTH_BIT | STENCIL_BIT was only correct for D24_UNORM_S8_UINT /
+    // D32_SFLOAT_S8_UINT (depth+stencil packed formats) and would emit a
+    // barrier whose aspectMask has no matching image aspect for depth-only
+    // formats -> spec-illegal (VUID-VkImageMemoryBarrier-aspectMask-0120).
+    // aspect_for_format returns COLOR_BIT for color formats (matches the old
+    // !isDepthStencil branch), DEPTH_BIT | STENCIL_BIT for packed depth+
+    // stencil (matches the old isDepthStencil branch for the swapchain depth),
+    // and the correct single-aspect mask for depth-only / stencil-only.
+    // `isDepthStencil` is retained only to gate the legacy swapchain call
+    // sites' expectation; the aspect mask is now format-driven.
+    (void)isDepthStencil;
+    b.subresourceRange.aspectMask = aspect_for_format(format);
     b.subresourceRange.baseMipLevel = 0;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.baseArrayLayer = 0;
     b.subresourceRange.layerCount = 1;
-    (void)format;
 
     // Source stage mask: who wrote the image in oldLayout.
     VkPipelineStageFlags srcStage;
@@ -136,6 +200,21 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
             srcStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
             srcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            break;
+        // FIX (root cause Y): proper src stage/access for the read-only
+        // layouts used by end_render_pass when transitioning user FBO
+        // attachments back. Previously fell through to the default case
+        // (ALL_COMMANDS_BIT + MEMORY_WRITE), which is valid but overly
+        // conservative and slows the fragment-shader visibility tracking.
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            srcAccess = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+            srcStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            srcAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_SHADER_READ_BIT;
             break;
         default:
             srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -173,6 +252,23 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
             dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             dstAccess = VK_ACCESS_MEMORY_READ_BIT;
             break;
+        // FIX (root cause Y): proper dst stage/access for the read-only
+        // layouts used by end_render_pass when transitioning user FBO
+        // attachments back. Color attachments become SHADER_READ_ONLY_OPTIMAL
+        // (sampled from the fragment shader), depth attachments become
+        // DEPTH_STENCIL_READ_ONLY_OPTIMAL (shadow-map sampling or depth
+        // compare). Previously fell through to the default case
+        // (ALL_COMMANDS_BIT + MEMORY_READ|MEMORY_WRITE).
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            dstAccess = VK_ACCESS_SHADER_READ_BIT;
+            break;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+            dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            dstAccess = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_SHADER_READ_BIT;
+            break;
         default:
             dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
             dstAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -190,6 +286,20 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
 
 bool render_pass_active() { return encoder().passActive; }
 
+/*
+ * Root cause Z: returns the active render pass's framebuffer height (the
+ * attachment extent set in begin_render_pass and clamped to the swapchain /
+ * actual drawable dimensions). Used by backend_set_viewport /
+ * backend_set_scissor to convert GL bottom-origin Y to Vulkan top-origin Y
+ * (vk_y = fbHeight - gl_y - gl_h). Returns 0 when no pass is active (callers
+ * fall back to g_state->viewportH). Lives in this TU so it can read the
+ * anonymous-namespace encoder() without exposing EncoderState publicly.
+ */
+int encoder_height_for_yflip() {
+    EncoderState& e = encoder();
+    return e.passActive ? e.height : 0;
+}
+
 void set_clear_color(float r, float g, float b, float a) {
     auto& e = encoder();
     e.clearColor[0] = r; e.clearColor[1] = g; e.clearColor[2] = b; e.clearColor[3] = a;
@@ -200,6 +310,55 @@ void set_load_clear(bool clear){ encoder().loadClear = clear; }
 
 void set_active_swapchain(Swapchain* sc) {
     encoder().activeSwapchain = sc;
+}
+
+/*
+ * Root cause Y (CRITICAL): register the GL texture names backing the upcoming
+ * user-FBO render pass's color/depth attachments. The GL draw path
+ * (Drawing.cpp) calls this IMMEDIATELY before backend_begin_render_pass for
+ * each non-swapchain attachment (i.e. whenever the bound FBO is not 0).
+ *
+ * begin_render_pass can only see VkImageView handles — it cannot reverse-
+ * resolve them back to GL texture names, and therefore cannot look up the
+ * TextureEntry (which holds the VkImage, VkFormat, and tracked currentLayout
+ * needed to emit a valid layout barrier). This registration bridges that gap:
+ * the GL layer passes the tex_ids here, and begin_render_pass uses them to
+ * look up TextureEntry via texture_table() and barrier each attachment to
+ * attachment-optimal before vkCmdBeginRendering (which only VALIDATES, never
+ * transitions, the declared imageLayout — see the EncoderState comment for
+ * the full root-cause mechanism).
+ *
+ * end_render_pass reads the same tex_ids to barrier the attachments back to
+ * a read-only layout and update TextureEntry::currentLayout, then clears the
+ * registration (auto-clear, no separate backend_clear_fbo_attachments call
+ * needed — the GL layer just re-registers before the next user-FBO pass).
+ *
+ * Contract:
+ *   - color_tex_ids may be null when color_count == 0 (depth-only FBO).
+ *   - Tex_id 0 (or any tex_id not in texture_table()) is silently skipped.
+ *   - For swapchain rendering (FBO 0) the GL layer does NOT call this — the
+ *     swapchain path's barriers are handled by the activeSwapchain block in
+ *     begin_render_pass / commit_frame.
+ *   - color_count is clamped to 8 (kMaxColorAttachments).
+ *   - depth_tex_id == 0 means no user-FBO depth attachment (the depth view
+ *     may still be the swapchain's depthView, handled separately).
+ */
+void set_fbo_attachment_tex_ids(GLuint* color_tex_ids, int color_count,
+                                GLuint depth_tex_id) {
+    auto& e = encoder();
+    // Clear any stale registration from a previous pass (defensive —
+    // end_render_pass already clears, but a stray set without a matching
+    // end_render_pass should not leak tex_ids into the next pass).
+    for (int i = 0; i < 8; ++i) e.fboColorTexIds[i] = 0;
+    e.fboColorTexCount = 0;
+    e.fboDepthTexId = 0;
+
+    int n = color_count > 8 ? 8 : (color_count < 0 ? 0 : color_count);
+    for (int i = 0; i < n; ++i) {
+        e.fboColorTexIds[i] = color_tex_ids ? color_tex_ids[i] : 0;
+    }
+    e.fboColorTexCount = n;
+    e.fboDepthTexId = depth_tex_id;
 }
 
 /*
@@ -302,7 +461,12 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     EncoderState& e = encoder();
     if (e.passActive) return;  // coalesce draws into one pass
 
-    // Ensure the current slot's command buffer is in the recording state.
+    // Root cause AA: reset the tracked depth format so a previous pass's
+    // format does not leak into this pass. Set below when the swapchain or
+    // user-FBO depth attachment is identified.
+    e.depthFormat = VK_FORMAT_UNDEFINED;
+
+    // Ensure the current frame slot's command buffer is in the recording state.
     // After commit_frame() submits slot N and advances to slot N+1, the
     // alias b->commandBuffer is stale (points at the pending slot N buffer).
     // This call lazily switches to slot N+1's buffer, waits on its fence,
@@ -434,6 +598,101 @@ void begin_render_pass(VkImageView* color_views, int color_count,
             sc->depthLayoutInitialized = true;
             swapchainDepthWasUndefined = true;
         }
+        // Root cause AA: track the swapchain depth format so the
+        // pStencilAttachment decision below uses the real format. The
+        // swapchain depth is always D32_SFLOAT_S8_UINT (has stencil), so
+        // pStencilAttachment will be bound — same as before this fix.
+        if (e.depthView == sc->depthView && e.depthView != VK_NULL_HANDLE) {
+            e.depthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+        }
+    }
+
+    // ---- Root cause Y (CRITICAL): user-FBO attachment layout barriers ----
+    // vkCmdBeginRendering does NOT auto-transition attachment image layouts.
+    // It only VALIDATES that each image is in the layout declared by
+    // VkRenderingAttachmentInfo.imageLayout. The swapchain path above
+    // barriers the swapchain color/depth. User FBO color/depth textures
+    // (registered via set_fbo_attachment_tex_ids by the GL draw path) are
+    // created with currentLayout=UNDEFINED and become
+    // SHADER_READ_ONLY_OPTIMAL after upload; without an explicit barrier
+    // here, the actual layout != declared COLOR_ATTACHMENT_OPTIMAL /
+    // DEPTH_STENCIL_ATTACHMENT_OPTIMAL -> spec violation -> MoltenVK drops
+    // the draw -> black screen.
+    //
+    // Mirrors MobileGL VkRenderPassManager (VkRenderPassManager.cpp:711-784),
+    // which barriers ALL attachments before render pass begin.
+    //
+    // The `isDepthStencil` parameter is now format-driven inside
+    // record_layout_barrier (aspect_for_format); we pass true for the depth
+    // attachment only to retain the legacy semantic of "depth-stencil stages"
+    // for the srcStage/dstStage computation. record_layout_barrier itself
+    // ignores the parameter for aspect-mask selection (see its comment).
+    if (e.fboColorTexCount > 0 || e.fboDepthTexId != 0) {
+        auto& tbl = texture_table();
+        // Color attachments: barrier each registered tex_id (index-aligned
+        // with e.colorViews[i]) to COLOR_ATTACHMENT_OPTIMAL. Skip indices
+        // where the tex_id is 0 (unbound slot) or where the bound view is
+        // the swapchain's current view (already barriered above).
+        VkImageView swapchainView = VK_NULL_HANDLE;
+        if (e.activeSwapchain && e.activeSwapchain->currentImage >= 0 &&
+            e.activeSwapchain->currentImage < (int)e.activeSwapchain->views.size()) {
+            swapchainView = e.activeSwapchain->views[e.activeSwapchain->currentImage];
+        }
+        for (int i = 0; i < e.fboColorTexCount && i < e.colorCount; ++i) {
+            GLuint tex_id = e.fboColorTexIds[i];
+            if (tex_id == 0) continue;
+            // Skip if this slot is the swapchain color attachment (already
+            // barriered above by the activeSwapchain block). This guards
+            // against a misregistration where the GL layer passes the
+            // swapchain tex_id (which is not in texture_table anyway, but
+            // be defensive).
+            if (swapchainView != VK_NULL_HANDLE && e.colorViews[i] == swapchainView) continue;
+            auto it = tbl.find(tex_id);
+            if (it == tbl.end()) continue;
+            TextureEntry& tex = it->second;
+            if (tex.image == VK_NULL_HANDLE) continue;
+            if (tex.currentLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) continue;
+            record_layout_barrier(b->commandBuffer,
+                                  tex.image, tex.format,
+                                  tex.currentLayout,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  /*isDepthStencil=*/false);
+            tex.currentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        }
+        // Depth attachment: barrier to DEPTH_STENCIL_ATTACHMENT_OPTIMAL and
+        // record the format for the pStencilAttachment decision (root cause AA).
+        // Skip if the bound depth view is the swapchain's depth view (already
+        // barriered above). The swapchain depth case sets e.depthFormat in
+        // the activeSwapchain block above; the user-FBO case sets it here.
+        if (e.fboDepthTexId != 0 && e.depthView != VK_NULL_HANDLE) {
+            bool isSwapchainDepth = (e.activeSwapchain &&
+                                     e.depthView == e.activeSwapchain->depthView);
+            if (!isSwapchainDepth) {
+                auto it = tbl.find(e.fboDepthTexId);
+                if (it != tbl.end()) {
+                    TextureEntry& tex = it->second;
+                    if (tex.image != VK_NULL_HANDLE &&
+                        tex.currentLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+                        record_layout_barrier(b->commandBuffer,
+                                              tex.image, tex.format,
+                                              tex.currentLayout,
+                                              VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                              /*isDepthStencil=*/true);
+                        tex.currentLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                    }
+                    // Root cause AA: capture the user-FBO depth format so
+                    // the pStencilAttachment decision below uses the real
+                    // format. For depth-only formats (D32_SFLOAT / D16_UNORM)
+                    // format_has_stencil returns false -> pStencilAttachment
+                    // = nullptr (VUID-06126 compliance). For D24_UNORM_S8_UINT /
+                    // D32_SFLOAT_S8_UINT it returns true -> pStencilAttachment
+                    // = &depthAttach (preserves the existing swapchain behavior).
+                    if (tex.format != VK_FORMAT_UNDEFINED) {
+                        e.depthFormat = tex.format;
+                    }
+                }
+            }
+        }
     }
 
     // Begin dynamic rendering.
@@ -519,7 +778,20 @@ void begin_render_pass(VkImageView* color_views, int color_count,
     ri.colorAttachmentCount = (uint32_t)e.colorCount;
     ri.pColorAttachments = e.colorCount > 0 ? colorAttachs : nullptr;
     ri.pDepthAttachment = e.depthView ? &depthAttach : nullptr;
-    ri.pStencilAttachment = e.depthView ? &depthAttach : nullptr;
+    // Root cause AA (HIGH, VUID-VkRenderingInfo-pStencilAttachment-06126):
+    // pStencilAttachment's ImageView MUST contain a stencil aspect. For
+    // depth-only formats (D32_SFLOAT / D16_UNORM) the view's aspect is
+    // DEPTH_BIT only, so binding it as a stencil attachment is a spec
+    // violation that may cause MoltenVK to drop the draw -> black screen.
+    // Bind pStencilAttachment only when the depth format actually has a
+    // stencil aspect (D24_UNORM_S8_UINT / D32_SFLOAT_S8_UINT / S8_UINT).
+    // e.depthFormat is set above from the swapchain depth
+    // (always D32_SFLOAT_S8_UINT, has stencil — preserves existing
+    // swapchain behavior) or the registered user-FBO depth TextureEntry.
+    // When no depth attachment is bound (e.depthView == null) or the depth
+    // format is depth-only, pStencilAttachment is null.
+    ri.pStencilAttachment = (e.depthView && format_has_stencil(e.depthFormat))
+                            ? &depthAttach : nullptr;
 
     // Resolve the dynamic-rendering entry point (Vulkan 1.2 + extension).
     static PFN_vkCmdBeginRenderingKHR fn = nullptr;
@@ -545,6 +817,88 @@ void end_render_pass() {
         if (!fn) fn = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(b->device, "vkCmdEndRenderingKHR");
     }
     if (fn) fn(b->commandBuffer);
+
+    // ---- Root cause Y (CRITICAL): barrier user-FBO attachments back to ----
+    // ---- read-only layouts and update TextureEntry::currentLayout.      --
+    // vkCmdEndRendering leaves color attachments in COLOR_ATTACHMENT_OPTIMAL
+    // and depth attachments in DEPTH_STENCIL_ATTACHMENT_OPTIMAL. For the
+    // swapchain color this is fixed up by commit_frame's PRESENT_SRC_KHR
+    // barrier; for the swapchain depth the layout stays at
+    // DEPTH_STENCIL_ATTACHMENT_OPTIMAL across frames (one-shot transition,
+    // never presented). For user FBO attachments, the texture is typically
+    // sampled right after the FBO render completes (post-process pass,
+    // shadow-map read, etc.) — it MUST be back in a read-only layout
+    // (SHADER_READ_ONLY_OPTIMAL for color, DEPTH_STENCIL_READ_ONLY_OPTIMAL
+    // for depth-stencil) before the next draw that samples it, otherwise
+    // the descriptor's declared layout won't match the actual layout and
+    // MoltenVK drops the sampling draw -> black screen.
+    //
+    // MobileGL's VkRenderPassManager barriers all attachments back to their
+    // read-only layouts at render pass end (VkRenderPassManager.cpp:711-784).
+    //
+    // Use format_has_stencil to pick the right read-only layout for the depth
+    // attachment: depth-stencil formats need DEPTH_STENCIL_READ_ONLY_OPTIMAL
+    // (sampling depth or stencil, with depth-stencil aspect), depth-only
+    // formats need SHADER_READ_ONLY_OPTIMAL (depth-compare sampler reads use
+    // the depth aspect as a sampled image, layout is SHADER_READ_ONLY_OPTIMAL
+    // for non-stencil depth textures).
+    if (e.fboColorTexCount > 0 || e.fboDepthTexId != 0) {
+        auto& tbl = texture_table();
+        for (int i = 0; i < e.fboColorTexCount; ++i) {
+            GLuint tex_id = e.fboColorTexIds[i];
+            if (tex_id == 0) continue;
+            auto it = tbl.find(tex_id);
+            if (it == tbl.end()) continue;
+            TextureEntry& tex = it->second;
+            if (tex.image == VK_NULL_HANDLE) continue;
+            // Use sampled_layout_for_format (the SAME helper DescriptorSet.cpp
+            // and Resources.cpp use) so the post-pass layout exactly matches
+            // the descriptor's declared imageLayout. A mismatch here would
+            // re-introduce the black screen (root cause Y/AH interaction):
+            // end_render_pass transitions to layout X, but the descriptor
+            // declares layout Y -> MoltenVK drops the sampling draw.
+            VkImageLayout readLayout = sampled_layout_for_format(tex.format);
+            if (tex.currentLayout == readLayout) continue;
+            record_layout_barrier(b->commandBuffer,
+                                  tex.image, tex.format,
+                                  tex.currentLayout,
+                                  readLayout,
+                                  /*isDepthStencil=*/false);
+            tex.currentLayout = readLayout;
+        }
+        if (e.fboDepthTexId != 0) {
+            auto it = tbl.find(e.fboDepthTexId);
+            if (it != tbl.end()) {
+                TextureEntry& tex = it->second;
+                if (tex.image != VK_NULL_HANDLE) {
+                    // Depth attachment read-only layout MUST match what
+                    // sampled_layout_for_format returns (used by
+                    // DescriptorSet.cpp for the descriptor's imageLayout and
+                    // by Resources.cpp for the post-upload transition).
+                    // depth-stencil formats -> DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+                    // depth-only formats -> DEPTH_READ_ONLY_OPTIMAL.
+                    // Using a different layout here would mismatch the
+                    // descriptor and drop the sampling draw (root cause AH).
+                    VkImageLayout readLayout = sampled_layout_for_format(tex.format);
+                    if (tex.currentLayout != readLayout) {
+                        record_layout_barrier(b->commandBuffer,
+                                              tex.image, tex.format,
+                                              tex.currentLayout,
+                                              readLayout,
+                                              /*isDepthStencil=*/true);
+                        tex.currentLayout = readLayout;
+                    }
+                }
+            }
+        }
+        // Auto-clear the registration so a stale tex_id cannot leak into
+        // the next pass (the GL layer re-registers before each user-FBO
+        // begin_render_pass; for swapchain passes it leaves the
+        // registration empty).
+        for (int i = 0; i < 8; ++i) e.fboColorTexIds[i] = 0;
+        e.fboColorTexCount = 0;
+        e.fboDepthTexId = 0;
+    }
 
     e.passActive = false;
 }
@@ -1159,6 +1513,40 @@ void backend_begin_render_pass(VkImageView* color_views, int color_count,
     mithril::vk::begin_render_pass(color_views, color_count, depth_view, width, height, samples);
 }
 
+/*
+ * Root cause Y (CRITICAL): register the GL texture names backing the upcoming
+ * user-FBO render pass's color/depth attachments. The GL draw path
+ * (Drawing.cpp) calls this IMMEDIATELY before backend_begin_render_pass for
+ * each non-swapchain attachment (i.e. whenever the bound FBO is not 0).
+ *
+ * begin_render_pass can only see VkImageView handles — it cannot reverse-
+ * resolve them to GL texture names, and therefore cannot look up the
+ * TextureEntry (which holds the VkImage, VkFormat, and tracked currentLayout
+ * needed to emit a valid layout barrier). This registration bridges that gap.
+ *
+ * end_render_pass reads the same tex_ids to barrier the attachments back to
+ * a read-only layout and update TextureEntry::currentLayout, then auto-clears
+ * the registration (no separate clear call needed).
+ *
+ * Contract:
+ *   - color_tex_ids may be NULL when color_count == 0 (depth-only FBO).
+ *   - tex_id 0 (or any tex_id not in the texture table) is silently skipped.
+ *   - For swapchain rendering (FBO 0) the GL layer does NOT call this — the
+ *     swapchain path's barriers are handled by the activeSwapchain block in
+ *     begin_render_pass / commit_frame.
+ *   - color_count is clamped to 8 (kMaxColorAttachments).
+ *   - depth_tex_id == 0 means no user-FBO depth attachment (the depth view
+ *     may still be the swapchain's depthView, handled separately).
+ *
+ * This is a NEW C API entry point; all existing backend_* signatures are
+ * unchanged. The corresponding namespace function is
+ * mithril::vk::set_fbo_attachment_tex_ids (defined above).
+ */
+void backend_set_fbo_attachment_tex_ids(GLuint* color_tex_ids, int color_count,
+                                        GLuint depth_tex_id) {
+    mithril::vk::set_fbo_attachment_tex_ids(color_tex_ids, color_count, depth_tex_id);
+}
+
 void backend_end_render_pass(void) { mithril::vk::end_render_pass(); }
 void backend_commit(void)          { mithril::vk::commit_frame(); }
 
@@ -1180,13 +1568,40 @@ void backend_bind_pipeline(VkPipeline pipeline) {
 void backend_set_viewport(int x, int y, int w, int h, double znear, double zfar) {
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
-    // Use the GL viewport directly. GL's viewport is bottom-left origin while
-    // Vulkan's is top-left, but MoltenVK flips the Y axis when translating to
-    // Metal, so passing the GL values through unchanged matches the on-screen
-    // behaviour of the previous Metal backend (and what host apps expect).
+    // FIX (root cause Z): GL viewport Y is bottom-origin (Y grows upward
+    // from the bottom-left of the framebuffer), but Vulkan viewport Y is
+    // top-origin (Y grows downward from the top-left). The previous code
+    // passed GL Y through directly, which is fine for a full-screen viewport
+    // (y=0, h=H → vk_y would also be 0) but breaks for any non-zero Y:
+    //   - GUI rendering that uses a non-full-screen viewport clips the wrong
+    //     vertical region (the bottom region in Vulkan terms, which is the
+    //     TOP region in GL terms).
+    //   - Sub-viewports used by post-process passes are vertically flipped.
+    //
+    // MoltenVK does NOT do a Y-flip when translating Vulkan viewport to
+    // Metal (the Y-flip is done in the vertex shader via gl_Position.y =
+    // -gl_Position.y for the default framebuffer — see Drawing.cpp's
+    // Y-flipped SPIR-V variant). So the Vulkan viewport's Y origin is the
+    // true top-left of the framebuffer, and the GL→Vulkan Y conversion
+    // must be: vk_y = framebufferHeight - gl_y - gl_h.
+    //
+    // Mirrors MobileGL VulkanRenderer (VulkanRenderer.cpp:
+    // viewport.y = extent.height - glViewport.y - glViewport.height).
+    //
+    // framebufferHeight: prefer the active render pass height (e.height,
+    // set in begin_render_pass and clamped to the swapchain/FBO dimensions)
+    // so the viewport matches the actual attachment extent. When no pass is
+    // active (rare — the GL frontend normally begins a pass before issuing
+    // viewport state), fall back to g_state->viewportH (the GL-tracked
+    // viewport height).
+    int fbHeight = mithril::vk::encoder_height_for_yflip();
+    if (fbHeight <= 0 && mithril::g_state) {
+        fbHeight = mithril::g_state->viewportH;
+    }
+    int vk_y = fbHeight - y - h;
     VkViewport vp{};
     vp.x        = (float)x;
-    vp.y        = (float)y;
+    vp.y        = (float)vk_y;
     vp.width    = (float)w;
     vp.height   = (float)h;
     vp.minDepth = (float)znear;
@@ -1197,8 +1612,21 @@ void backend_set_viewport(int x, int y, int w, int h, double znear, double zfar)
 void backend_set_scissor(int x, int y, int w, int h) {
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
+    // FIX (root cause Z): same Y-origin conversion as backend_set_viewport.
+    // GL scissor Y is bottom-origin; Vulkan scissor Y is top-origin. Without
+    // this conversion, a non-zero-Y scissor (e.g. GUI clipping) clips the
+    // wrong vertical region -> partial black screen where the clipped-out
+    // region should be drawn. MoltenVK does not Y-flip the scissor.
+    //
+    // Mirrors MobileGL VulkanRenderer's scissor.y = extent.height -
+    // glScissor.y - glScissor.height.
+    int fbHeight = mithril::vk::encoder_height_for_yflip();
+    if (fbHeight <= 0 && mithril::g_state) {
+        fbHeight = mithril::g_state->viewportH;
+    }
+    int vk_y = fbHeight - y - h;
     VkRect2D sc{};
-    sc.offset.x = x; sc.offset.y = y;
+    sc.offset.x = x; sc.offset.y = vk_y;
     sc.extent.width = (uint32_t)w; sc.extent.height = (uint32_t)h;
     vkCmdSetScissor(b->commandBuffer, 0, 1, &sc);
 }
@@ -1303,7 +1731,18 @@ void backend_draw_arrays(int primitive, int first, int count) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
-    vkCmdDraw(b->commandBuffer, (uint32_t)count, 1, (uint32_t)first, 0);
+    // Root cause AG (CRITICAL): pass firstInstance from g_state. glDrawArrays
+    // itself has no baseInstance, but glDrawArraysInstancedBaseInstance /
+    // glDrawArraysInstancedBaseVertexBaseInstance (rare) set
+    // g_state->currentBaseInstance before falling through to the
+    // non-indexed draw path. The GL layer (Drawing.cpp, modified by another
+    // agent) sets g_state->currentBaseInstance and resets it to 0 after the
+    // draw returns — we only read it here.
+    //   vkCmdDraw(cmdBuf, vertexCount, instanceCount, firstVertex, firstInstance)
+    // Mirrors MobileGL drawParams.firstInstance.
+    uint32_t firstInstance = 0;
+    if (mithril::g_state) firstInstance = mithril::g_state->currentBaseInstance;
+    vkCmdDraw(b->commandBuffer, (uint32_t)count, 1, (uint32_t)first, firstInstance);
 }
 
 void backend_draw_indexed(int primitive, int count, int index_type,
@@ -1311,16 +1750,51 @@ void backend_draw_indexed(int primitive, int count, int index_type,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !index_buffer) return;
-    VkIndexType t = (index_type == 1) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+    // FIX (root cause AE, CRITICAL): GL_UNSIGNED_BYTE index support.
+    // Drawing.cpp maps GL_UNSIGNED_BYTE → 2 (index_type_to_int), but the
+    // previous code only handled 0 (UINT16) and 1 (UINT32), treating
+    // GL_UNSIGNED_BYTE as UINT16 → 1-byte indices read as 2-byte → geometry
+    // corruption → red screen. Map 2 to VK_INDEX_TYPE_UINT8_EXT (requires
+    // VK_EXT_index_type_uint8, enabled in Device.cpp by another agent).
+    // Mirrors MobileGL VulkanRenderer.cpp:3093-3109.
+    VkIndexType t;
+    if (index_type == 1)      t = VK_INDEX_TYPE_UINT32;
+    else if (index_type == 2) t = VK_INDEX_TYPE_UINT8_EXT;  // GL_UNSIGNED_BYTE
+    else                      t = VK_INDEX_TYPE_UINT16;
     vkCmdBindIndexBuffer(b->commandBuffer, index_buffer, index_offset, t);
-    vkCmdDrawIndexed(b->commandBuffer, (uint32_t)count, 1, 0, 0, 0);
+    // FIX (root cause AG, CRITICAL): pass baseVertex + baseInstance from
+    // g_state. glDrawElementsBaseVertex sets g_state->currentBaseVertex
+    // (vertexOffset) and glDrawElementsInstancedBaseInstance sets
+    // g_state->currentBaseInstance (firstInstance) before falling through to
+    // glDrawElements. The previous hardcoded (vertexOffset=0, firstInstance=0)
+    // discarded both -> all instanced draws read the same vertex range ->
+    // geometry misalignment -> red/garbled screen.
+    //   vkCmdDrawIndexed(cmdBuf, indexCount, instanceCount, firstIndex,
+    //                    vertexOffset, firstInstance)
+    // Mirrors MobileGL drawParams.baseVertex / drawParams.baseInstance.
+    // The GL layer (Drawing.cpp) resets these to 0 after the draw returns.
+    int32_t  vertexOffset = 0;
+    uint32_t firstInstance = 0;
+    if (mithril::g_state) {
+        vertexOffset = mithril::g_state->currentBaseVertex;
+        firstInstance = mithril::g_state->currentBaseInstance;
+    }
+    vkCmdDrawIndexed(b->commandBuffer, (uint32_t)count, 1, 0,
+                     (int32_t)vertexOffset, firstInstance);
 }
 
 void backend_draw_arrays_instanced(int primitive, int first, int count, int primcount) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
-    vkCmdDraw(b->commandBuffer, (uint32_t)count, (uint32_t)primcount, (uint32_t)first, 0);
+    // Root cause AG (CRITICAL): pass firstInstance from g_state (see
+    // backend_draw_arrays for rationale). glDrawArraysInstancedBaseInstance
+    // sets g_state->currentBaseInstance before falling through to the
+    // instanced draw path.
+    uint32_t firstInstance = 0;
+    if (mithril::g_state) firstInstance = mithril::g_state->currentBaseInstance;
+    vkCmdDraw(b->commandBuffer, (uint32_t)count, (uint32_t)primcount,
+              (uint32_t)first, firstInstance);
 }
 
 void backend_draw_indexed_instanced(int primitive, int count, int index_type,
@@ -1329,9 +1803,26 @@ void backend_draw_indexed_instanced(int primitive, int count, int index_type,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !index_buffer) return;
-    VkIndexType t = (index_type == 1) ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
+    // FIX (root cause AE, CRITICAL): GL_UNSIGNED_BYTE index support — see
+    // backend_draw_indexed for the full rationale.
+    VkIndexType t;
+    if (index_type == 1)      t = VK_INDEX_TYPE_UINT32;
+    else if (index_type == 2) t = VK_INDEX_TYPE_UINT8_EXT;  // GL_UNSIGNED_BYTE
+    else                      t = VK_INDEX_TYPE_UINT16;
     vkCmdBindIndexBuffer(b->commandBuffer, index_buffer, index_offset, t);
-    vkCmdDrawIndexed(b->commandBuffer, (uint32_t)count, (uint32_t)primcount, 0, 0, 0);
+    // FIX (root cause AG, CRITICAL): pass baseVertex + baseInstance from
+    // g_state — see backend_draw_indexed for the full rationale.
+    // glDrawElementsInstancedBaseVertex sets currentBaseVertex,
+    // glDrawElementsInstancedBaseInstance sets currentBaseInstance; both
+    // fall through to glDrawElementsInstanced.
+    int32_t  vertexOffset = 0;
+    uint32_t firstInstance = 0;
+    if (mithril::g_state) {
+        vertexOffset = mithril::g_state->currentBaseVertex;
+        firstInstance = mithril::g_state->currentBaseInstance;
+    }
+    vkCmdDrawIndexed(b->commandBuffer, (uint32_t)count, (uint32_t)primcount, 0,
+                     (int32_t)vertexOffset, firstInstance);
 }
 
 } // extern "C"

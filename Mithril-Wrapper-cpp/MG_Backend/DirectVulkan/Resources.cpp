@@ -479,17 +479,30 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     vkCmdCopyBufferToImage(b->commandBuffer, stagingBuffer, tex.image,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // Transition to SHADER_READ_ONLY so the texture can be sampled afterwards.
+    // FIX (Root Cause AH - depth-stencil descriptor layout):
+    // 上传后 layout transition 必须按纹理格式选择正确的 read-only 布局。
+    // 旧代码硬编码 SHADER_READ_ONLY_OPTIMAL，对 depth-stencil 纹理不匹配
+    // image 实际布局 → MoltenVK 验证错误或静默丢 draw → 黑屏。
+    // 用 sampled_layout_for_format(tex.format) 选择正确布局：
+    //   depth-stencil -> DEPTH_STENCIL_READ_ONLY_OPTIMAL
+    //   depth-only    -> DEPTH_READ_ONLY_OPTIMAL
+    //   color         -> SHADER_READ_ONLY_OPTIMAL
+    // 对照 MobileGL ResolveSampledReadOnlyLayout (VkTextureManager.cpp:177)。
+    //
+    // 注意：dstAccessMask = SHADER_READ_BIT / dstStage = FRAGMENT_SHADER_BIT 保持
+    // 不变——纹理作为 sampler 资源被 shader 读取时，无论布局是 SHADER_READ_ONLY
+    // 还是 DEPTH_STENCIL_READ_ONLY，访问类型都是 SHADER_READ from FRAGMENT_SHADER。
+    VkImageLayout sampledLayout = sampled_layout_for_format(tex.format);
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.newLayout = sampledLayout;
     VkPipelineStageFlagBits dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     vkCmdPipelineBarrier(b->commandBuffer,
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
                          dstStage, 0,
                          0, nullptr, 0, nullptr, 1, &barrier);
-    tex.currentLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    tex.currentLayout = sampledLayout;
 
     // Arena path: no cleanup needed — staging buffer 是永久的，offset 在
     // 下次 ensure_command_buffer_recording 时 rewind。
@@ -746,10 +759,19 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
     }
     auto& tbl = mithril::vk::texture_table();
     auto it = tbl.find(name);
+    // FIX (Root Cause AI - glTexImage2D mipmap uses base level dimensions):
+    // 复用条件额外比较 levels（mip level count）。如果请求的 levels 与现有
+    // VkImage 的 levels 不同（例如 glTexImage2D 逐级上传时 t->levels 递增），
+    // 必须重建 VkImage 以匹配新的 mipLevels。否则 VkImage 的 mipLevels 不足，
+    // 上传高 level 数据时 vkCmdCopyBufferToImage 会写入越界 mip level →
+    // 纹理腐败 / 验证错误。
+    // 对照 MobileGL CheckMipmapCompleteness (VkTextureManager.cpp:1918-1957)。
+    int effective_levels = levels > 0 ? levels : 1;
     if (it != tbl.end() && it->second.image != VK_NULL_HANDLE &&
         it->second.format == fmt &&
         it->second.width == width && it->second.height == height &&
-        it->second.depth == depth) {
+        it->second.depth == depth &&
+        it->second.levels == effective_levels) {
         return it->second.image;
     }
     if (it != tbl.end()) mithril::vk::defer_destroy_texture_entry(it->second);

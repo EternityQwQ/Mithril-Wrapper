@@ -21,6 +21,8 @@
 #include "Pipeline.h"
 #include "CommandStream.h"  // ensure_command_buffer_recording
 #include "Reflect.h"  // reflect_stage / merge_bindings (pure-logic, unit-tested)
+#include "Resources.h"  // texture_table() — for TextureEntry::format lookup (root cause AH)
+#include "FormatMap.h"  // sampled_layout_for_format (root cause AH)
 #include "../Backend.h"
 #include "../../MG_State/State.h"
 #include "../../MG_Impl/Log.h"
@@ -484,10 +486,29 @@ void bind_program_descriptors(GLuint program) {
                 }
             }
             if (view != VK_NULL_HANDLE && samp != VK_NULL_HANDLE) {
+                // FIX (Root Cause AH - depth-stencil descriptor layout):
+                // 旧代码硬编码 imageLayout = SHADER_READ_ONLY_OPTIMAL，对 depth-stencil
+                // 纹理不匹配。descriptor 声明的 imageLayout 必须与 image 实际布局一致，
+                // 否则 MoltenVK 验证错误或静默丢 draw → 黑屏。
+                // 通过 TextureEntry.format 查找纹理的 VkFormat，用 sampled_layout_for_format
+                // 选择正确的 read-only 布局（depth-stencil -> DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                // depth-only -> DEPTH_READ_ONLY_OPTIMAL, color -> SHADER_READ_ONLY_OPTIMAL）。
+                // 对照 MobileGL ResolveSampledReadOnlyLayout (VkTextureManager.cpp:177)。
+                //
+                // 注意：当 view 是 default fallback texture (R8G8B8A8_UNORM, color) 时，
+                // tex_it->second.view != view，保持 SHADER_READ_ONLY_OPTIMAL（default 是 color 格式）。
+                VkImageLayout sampledLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                if (tex_id) {
+                    auto& tex_tbl = mithril::vk::texture_table();
+                    auto tex_it = tex_tbl.find(tex_id);
+                    if (tex_it != tex_tbl.end() && tex_it->second.view == view) {
+                        sampledLayout = mithril::vk::sampled_layout_for_format(tex_it->second.format);
+                    }
+                }
                 VkDescriptorImageInfo ii{};
                 ii.sampler = samp;
                 ii.imageView = view;
-                ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                ii.imageLayout = sampledLayout;
                 imgInfos.push_back(ii);
                 VkWriteDescriptorSet w{};
                 w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

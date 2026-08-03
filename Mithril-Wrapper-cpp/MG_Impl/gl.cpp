@@ -71,19 +71,40 @@ void glClear(GLbitfield mask) {
  * isCapabilityEnabled (bool fields). The old enabledCaps set is gone, so
  * there is a single source of truth — no possibility of the set and the
  * fields drifting out of sync.
+ *
+ * FIX (root cause AF - Primitive Restart): GL_PRIMITIVE_RESTART_FIXED_INDEX
+ * 在 State.cpp 的 setCapability 中未列项（GL_PRIMITIVE_RESTART 已列项）。
+ * 这里在 glEnable/glDisable 入口直接维护 g_state->primitiveRestartFixedIndex，
+ * 让 Pipeline.cpp 的 ia.primitiveRestartEnable 能在两者任一启用时为 VK_TRUE。
+ * 深度对照 MobileGL VulkanRenderer.cpp:3861-3877。
  */
 void glEnable(GLenum cap) {
     MITHRIL_ENSURE_INIT();
+    if (cap == GL_PRIMITIVE_RESTART_FIXED_INDEX) {
+        g_state->primitiveRestartFixedIndex = true;
+        g_state->bumpRenderVersion();
+        return;
+    }
     g_state->setCapability(cap, true);
 }
 
 void glDisable(GLenum cap) {
     MITHRIL_ENSURE_INIT();
+    if (cap == GL_PRIMITIVE_RESTART_FIXED_INDEX) {
+        g_state->primitiveRestartFixedIndex = false;
+        g_state->bumpRenderVersion();
+        return;
+    }
     g_state->setCapability(cap, false);
 }
 
 GLboolean glIsEnabled(GLenum cap) {
     if (!g_state) return GL_FALSE;
+    // FIX (root cause AF): GL_PRIMITIVE_RESTART_FIXED_INDEX 未在
+    // State.cpp isCapabilityEnabled 中列项，这里直接读 g_state 字段。
+    if (cap == GL_PRIMITIVE_RESTART_FIXED_INDEX) {
+        return g_state->primitiveRestartFixedIndex ? GL_TRUE : GL_FALSE;
+    }
     return g_state->isCapabilityEnabled(cap) ? GL_TRUE : GL_FALSE;
 }
 
