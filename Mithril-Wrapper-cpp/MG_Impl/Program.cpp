@@ -9,6 +9,7 @@
 // internally at vkCreateShaderModule time.
 #include "includes.h"
 #include "Shader.h"
+#include "../MG_Backend/DirectVulkan/Reflect.h"  // reflect_stage / merge_bindings / DescriptorBinding
 
 #include <algorithm>
 #include <vector>
@@ -244,6 +245,70 @@ void glLinkProgram(GLuint program) {
     }
     p->linked = true;
     p->infoLog.clear();
+
+    // ---- Uniform reflection (CRITICAL for black screen) ----
+    // Reflect SPIR-V to discover UBOs and their members, then populate
+    // p->uniforms / p->uniformByLocation / p->uniformBlocks / p->uboBackingStore.
+    // Without this, glGetUniformLocation returns -1 for ALL uniforms (even
+    // ones that exist in the shader), so every glUniform* is a no-op →
+    // shaders receive zero/uninitialized MVP matrices → geometry renders at
+    // origin with identity transform → black screen.
+    // 对照 MobileGL DirectVulkan.cpp:171-244 AddBufferVariablesRecursive.
+    p->uboBackingStore.clear();
+    p->uboSizes.clear();
+    try {
+        std::vector<mithril::vk::DescriptorBinding> bindings;
+        if (!p->vertexSpirv.empty()) {
+            auto b = mithril::vk::reflect_stage(p->vertexSpirv.data(),
+                                                (int)p->vertexSpirv.size(),
+                                                VK_SHADER_STAGE_VERTEX_BIT);
+            mithril::vk::merge_bindings(bindings, b);
+        }
+        if (!p->fragmentSpirv.empty()) {
+            auto b = mithril::vk::reflect_stage(p->fragmentSpirv.data(),
+                                                (int)p->fragmentSpirv.size(),
+                                                VK_SHADER_STAGE_FRAGMENT_BIT);
+            mithril::vk::merge_bindings(bindings, b);
+        }
+        GLint nextLocation = 0;
+        GLuint blockIndex = 0;
+        for (const auto& db : bindings) {
+            if (db.type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) continue;
+            if (!db.name.empty()) {
+                p->uniformBlocks[db.name] = blockIndex;
+            }
+            p->uboSizes[db.binding] = db.bufferSize;
+            auto& store = p->uboBackingStore[db.binding];
+            store.assign(db.bufferSize ? db.bufferSize : 0, 0);
+            for (const auto& m : db.members) {
+                if (m.name.empty()) continue;
+                mithril::Uniform u{};
+                u.name = m.name;
+                u.location = nextLocation++;
+                u.blockIndex = (GLint)blockIndex;
+                u.blockBinding = (GLint)db.binding;
+                u.offset = (GLint)m.offset;
+                switch (m.size) {
+                    case 8:  u.type = GL_FLOAT_VEC2; break;
+                    case 12: u.type = GL_FLOAT_VEC3; break;
+                    case 16: u.type = GL_FLOAT_VEC4; break;
+                    case 24: u.type = GL_FLOAT_MAT3; break;
+                    case 32: u.type = GL_FLOAT_MAT2x4; break;
+                    case 48: u.type = GL_FLOAT_MAT4x3; break;
+                    case 64: u.type = GL_FLOAT_MAT4; break;
+                    case 36: u.type = GL_FLOAT_MAT3x4; break;
+                    default: u.type = GL_FLOAT; break;
+                }
+                u.size = 1;
+                p->uniforms[m.name] = u;
+                p->uniformByLocation[u.location] = m.name;
+            }
+            ++blockIndex;
+        }
+    } catch (const std::exception& e) {
+        MITHRIL_LOG_WARN("program", "Uniform reflection failed for program %u: %s",
+                         program, e.what());
+    }
     MITHRIL_LOG_INFO("program", "Linked program %u (VS=%zu VS_yflip=%zu FS=%zu SPIR-V words)",
                      program, p->vertexSpirv.size(), p->vertexSpirvYFlipped.size(),
                      p->fragmentSpirv.size());
@@ -472,25 +537,41 @@ static void store_uniform(GLint location, const GLfloat* v, int count, int comps
     mithril::Program* p = current_program();
     if (!p || location < 0 || !v) return;
     auto it = p->uniformByLocation.find(location);
-    std::string name = (it != p->uniformByLocation.end()) ? it->second : "";
-    mithril::Uniform& u = p->uniforms[name];
-    u.name = name;
-    u.location = location;
-    u.type = GL_FLOAT;
+    if (it == p->uniformByLocation.end()) return;  // unknown location: drop
+    mithril::Uniform& u = p->uniforms[it->second];
     u.value.assign(v, v + (size_t)count * comps);
+    // Write raw bytes into the UBO backing store at the reflected offset.
+    // DescriptorSet.cpp memcpys the whole store into the UBO payload at draw.
+    if (u.blockBinding >= 0 && u.offset >= 0) {
+        auto bs = p->uboBackingStore.find((GLuint)u.blockBinding);
+        if (bs != p->uboBackingStore.end()) {
+            size_t bytes = (size_t)count * comps * sizeof(float);
+            if ((size_t)u.offset + bytes <= bs->second.size()) {
+                std::memcpy(bs->second.data() + u.offset, v, bytes);
+            }
+        }
+    }
 }
 
 static void store_uniform_int(GLint location, const GLint* v, int count, int comps) {
     mithril::Program* p = current_program();
     if (!p || location < 0 || !v) return;
     auto it = p->uniformByLocation.find(location);
-    std::string name = (it != p->uniformByLocation.end()) ? it->second : "";
-    mithril::Uniform& u = p->uniforms[name];
-    u.name = name;
-    u.location = location;
-    u.type = GL_INT;
-    u.value.clear();
-    for (int i = 0; i < count * comps; ++i) u.value.push_back((float)v[i]);
+    if (it == p->uniformByLocation.end()) return;  // unknown location: drop
+    mithril::Uniform& u = p->uniforms[it->second];
+    // Store as floats for glGetUniform* compatibility.
+    u.value.resize((size_t)count * comps);
+    for (size_t i = 0; i < u.value.size(); ++i) u.value[i] = (GLfloat)v[i];
+    // Write raw bytes into the UBO backing store at the reflected offset.
+    if (u.blockBinding >= 0 && u.offset >= 0) {
+        auto bs = p->uboBackingStore.find((GLuint)u.blockBinding);
+        if (bs != p->uboBackingStore.end()) {
+            size_t bytes = (size_t)count * comps * sizeof(GLint);
+            if ((size_t)u.offset + bytes <= bs->second.size()) {
+                std::memcpy(bs->second.data() + u.offset, v, bytes);
+            }
+        }
+    }
 }
 
 void glUniform1f(GLint loc, GLfloat v0)                                    { store_uniform(loc, &v0, 1, 1); }

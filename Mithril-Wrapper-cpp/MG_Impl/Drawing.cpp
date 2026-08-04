@@ -165,6 +165,7 @@ static void prepare_draw(GLenum mode) {
         m.offset       = (int)(intptr_t)a.pointer;
         m.enabled      = 1;
         m.buffer_name  = a.boundBuffer;
+        m.divisor      = a.divisor;
     }
 
     // Get-or-create the VkGraphicsPipeline. Blend state + colorWriteMask are
@@ -291,8 +292,16 @@ static void prepare_draw(GLenum mode) {
         g_state->depthTest ? 1 : 0,
         g_state->depthMask ? 1 : 0,
         (int)g_state->depthFunc);
+    // Apply dynamic pipeline state: depth bias + stencil.
+    // 对照 MobileGL 动态状态应用.
     if (g_state->polygonOffsetFill) {
-        backend_set_depth_bias(g_state->polygonOffsetUnits, 0.0f);
+        backend_set_depth_bias(g_state->polygonOffsetFactor, g_state->polygonOffsetUnits);
+    }
+    if (g_state->stencilTest) {
+        backend_set_stencil_state(1, (int)g_state->stencilFunc, g_state->stencilRef,
+                                  (int)g_state->stencilValueMask,
+                                  (int)g_state->stencilSfail, (int)g_state->stencilDpfail,
+                                  (int)g_state->stencilDppass);
     }
     if (g_state->blends[0].enabled) {
         backend_set_blend_color(

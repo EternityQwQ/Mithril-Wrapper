@@ -220,9 +220,22 @@ VkBuffer backend_get_zero_buffer(void);
 VkImage     backend_get_or_create_texture(GLuint name, int width, int height, int depth,
                                           int levels, GLenum internal_format, GLenum target,
                                           int samples);
+/* ---- Pixel unpack parameters ----
+ * Mirrors the GL UNPACK_* pixel-store state used by glTexImage2D/3D and
+ * glTexSubImage2D/3D to compute the source row stride and start offset.
+ * Passed through backend_texture_upload to stage_and_copy_image.
+ */
+struct MGUnpackParams {
+    int alignment;     /* GL_UNPACK_ALIGNMENT (1/2/4/8) */
+    int rowLength;     /* GL_UNPACK_ROW_LENGTH (0 = use width) */
+    int skipPixels;    /* GL_UNPACK_SKIP_PIXELS */
+    int skipRows;      /* GL_UNPACK_SKIP_ROWS */
+    int imageHeight;   /* GL_UNPACK_IMAGE_HEIGHT (3D; 0 = use height) */
+    int skipImages;    /* GL_UNPACK_SKIP_IMAGES (3D) */
+};
 void        backend_texture_upload(GLuint name, int level, int x, int y, int z,
                                    int w, int h, int d, GLenum format, GLenum type,
-                                   const void* pixels, int unpack_alignment,
+                                   const void* pixels, const struct MGUnpackParams* unpack,
                                    int is_full_upload);
 void        backend_texture_set_params(GLuint name, GLint min_filter, GLint mag_filter,
                                        GLint wrap_s, GLint wrap_t, GLint wrap_r,
@@ -321,6 +334,12 @@ VkSampler backend_get_or_create_sampler(GLuint name, GLint min_filter, GLint mag
                                         GLint wrap_s, GLint wrap_t, GLint wrap_r,
                                         const float* border_color);
 
+/* Invalidate (destroy + remove) the cached VkSampler for the given GL name.
+ * Called by glTexParameter* when min/mag/wrap params change. Vulkan samplers
+ * are immutable; param changes require recreation.
+ * 对照 MobileGL VkSamplerManager. */
+void backend_invalidate_sampler_cache(GLuint name);
+
 /* ---- Format helpers ----
  * Map a GL internal format to the matching VkFormat. Returns VK_FORMAT_UNDEFINED
  * when the format is unsupported. Used by the drawing path to describe pipeline
@@ -342,6 +361,7 @@ struct MGVertexAttrib {
     int     offset;       /* byte offset within the bound vertex buffer */
     int     enabled;      /* 0/1 */
     GLuint  buffer_name;  /* GL VBO name backing this attrib */
+    GLuint  divisor;      /* GL instancing divisor (glVertexAttribDivisor); 0 = per-vertex */
 };
 
 /*

@@ -80,6 +80,43 @@
 #ifndef GL_TEXTURE_CUBE_MAP_ARRAY
 #define GL_TEXTURE_CUBE_MAP_ARRAY       0x9009
 #endif
+// GL uniform type enums absent from the project's minimal glcorearb.h.
+#ifndef GL_FLOAT_VEC2
+#define GL_FLOAT_VEC2                   0x8B50
+#endif
+#ifndef GL_FLOAT_VEC3
+#define GL_FLOAT_VEC3                   0x8B51
+#endif
+#ifndef GL_FLOAT_VEC4
+#define GL_FLOAT_VEC4                   0x8B52
+#endif
+#ifndef GL_FLOAT_MAT2
+#define GL_FLOAT_MAT2                   0x8B5A
+#endif
+#ifndef GL_FLOAT_MAT3
+#define GL_FLOAT_MAT3                   0x8B5B
+#endif
+#ifndef GL_FLOAT_MAT4
+#define GL_FLOAT_MAT4                   0x8B5C
+#endif
+#ifndef GL_FLOAT_MAT2x3
+#define GL_FLOAT_MAT2x3                 0x8B65
+#endif
+#ifndef GL_FLOAT_MAT2x4
+#define GL_FLOAT_MAT2x4                 0x8B66
+#endif
+#ifndef GL_FLOAT_MAT3x2
+#define GL_FLOAT_MAT3x2                 0x8B67
+#endif
+#ifndef GL_FLOAT_MAT3x4
+#define GL_FLOAT_MAT3x4                 0x8B68
+#endif
+#ifndef GL_FLOAT_MAT4x2
+#define GL_FLOAT_MAT4x2                 0x8B69
+#endif
+#ifndef GL_FLOAT_MAT4x3
+#define GL_FLOAT_MAT4x3                 0x8B6A
+#endif
 
 namespace mithril {
 
@@ -307,6 +344,7 @@ struct Uniform {
     GLint       size = 0;
     GLint       location = -1;
     GLint       blockIndex = -1;
+    GLint       blockBinding = -1;
     GLint       offset = -1;
     GLint       arrayStride = 0;
     GLint       matrixStride = 0;
@@ -341,6 +379,12 @@ struct Program {
     std::vector<uint32_t> fragmentSpirv;
     // Uniform block binding table (glUniformBlockBinding).
     std::unordered_map<GLuint, GLuint> uniformBlockBindings;
+    // UBO backing stores keyed by descriptor binding. store_uniform*() writes
+    // raw bytes at each uniform's offset; DescriptorSet.cpp memcpys the whole
+    // store into the UBO payload at draw time. Sized to the reflected UBO size.
+    // 对照 MobileGL DirectVulkan.cpp:171-244 AddBufferVariablesRecursive.
+    std::unordered_map<GLuint, std::vector<uint8_t>> uboBackingStore;
+    std::unordered_map<GLuint, uint32_t> uboSizes;
     // Transform feedback varyings (recorded, backend wiring deferred).
     std::vector<std::string> tfVaryings;
     GLenum tfBufferMode = GL_INTERLEAVED_ATTRIBS;

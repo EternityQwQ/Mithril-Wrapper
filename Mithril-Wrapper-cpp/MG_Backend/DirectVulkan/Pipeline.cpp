@@ -165,6 +165,16 @@ VkCompareOp gl_compare_to_vk(GLenum f) {
     }
 }
 
+// GL polygon mode to Vulkan polygon mode. 对照 MobileGL 动态状态.
+VkPolygonMode gl_polygon_to_vk(GLenum mode) {
+    switch (mode) {
+        case GL_LINE:   return VK_POLYGON_MODE_LINE;
+        case GL_POINT:  return VK_POLYGON_MODE_POINT;
+        case GL_FILL:
+        default:        return VK_POLYGON_MODE_FILL;
+    }
+}
+
 // 查询格式是否支持 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT。
 // 结果缓存到 static unordered_map，避免每次 pipeline 创建都调用
 // vkGetPhysicalDeviceFormatProperties。
@@ -219,6 +229,7 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
         // 必须参与缓存键哈希。否则不同 offset 的 VAO 复用同一管线 → 属性从错误
         // 字节偏移读取 → 顶点数据错位 → 红屏/花屏。
         mix(&attribs[i].offset, sizeof(attribs[i].offset));
+        mix(&attribs[i].divisor, sizeof(attribs[i].divisor));
     }
     mix(&color_count, sizeof(color_count));
     for (int i = 0; i < color_count; ++i) mix(&color_formats[i], sizeof(color_formats[i]));
@@ -378,7 +389,9 @@ VkPipeline get_or_create_pipeline(GLuint program,
         VkVertexInputBindingDescription bd{};
         bd.binding = (uint32_t)a.location;
         bd.stride = a.stride > 0 ? (uint32_t)a.stride : 0;
-        bd.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        // GL instancing: divisor > 0 means per-instance advancement.
+        // 对照 MobileGL 顶点绑定按 divisor 分组.
+        bd.inputRate = (a.divisor > 0) ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
         bindDescs.push_back(bd);
 
         VkVertexInputAttributeDescription ad{};
@@ -457,13 +470,15 @@ VkPipeline get_or_create_pipeline(GLuint program,
     // ---- Rasterizer ----
     VkPipelineRasterizationStateCreateInfo rs{};
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.depthClampEnable = VK_FALSE;
+    // Dynamic state: read from g_state instead of hardcoding.
+    // 对照 MobileGL VulkanRenderer.cpp dynamic rasterizer state.
+    rs.depthClampEnable = (mithril::g_state && mithril::g_state->depthClamp) ? VK_TRUE : VK_FALSE;
     rs.rasterizerDiscardEnable = VK_FALSE;
-    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.polygonMode = gl_polygon_to_vk(mithril::g_state ? (GLenum)mithril::g_state->polygonModeFront : GL_FILL);
     rs.cullMode = VK_CULL_MODE_NONE;        // dynamic via vkCmdSetCullMode
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // dynamic
-    rs.depthBiasEnable = VK_FALSE;
-    rs.lineWidth = 1.0f;
+    rs.depthBiasEnable = (mithril::g_state && mithril::g_state->polygonOffsetFill) ? VK_TRUE : VK_FALSE;
+    rs.lineWidth = mithril::g_state ? mithril::g_state->lineWidth : 1.0f;
 
     // ---- Multisample ----
     VkPipelineMultisampleStateCreateInfo ms{};
@@ -478,7 +493,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
     ds.depthWriteEnable = VK_TRUE;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;  // dynamic
     ds.depthBoundsTestEnable = VK_FALSE;
-    ds.stencilTestEnable = VK_FALSE;
+    ds.stencilTestEnable = (mithril::g_state && mithril::g_state->stencilTest) ? VK_TRUE : VK_FALSE;
 
     // ---- Color blend ----
     // FIX (root cause I+J): use independent alpha blend factors (blend_src_alpha/
@@ -560,6 +575,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,   // factor/units via backend_set_depth_bias
     };
     VkPipelineDynamicStateCreateInfo dyn{};
     dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;

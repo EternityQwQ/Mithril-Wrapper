@@ -158,8 +158,16 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
     backend_get_or_create_texture(t->id, t->width, t->height, 1, t->levels,
                                   internalFormat, target, 1);
     if (pixels) {
+        MGUnpackParams unpack{
+            g_state->pixelStore.unpackAlignment,
+            g_state->pixelStore.unpackRowLength,
+            g_state->pixelStore.unpackSkipPixels,
+            g_state->pixelStore.unpackSkipRows,
+            g_state->pixelStore.unpackImageHeight,
+            g_state->pixelStore.unpackSkipImages
+        };
         backend_texture_upload(t->id, level, 0, 0, 0, width, height, 1,
-                               format, type, pixels, g_state->pixelStore.unpackAlignment,
+                               format, type, pixels, &unpack,
                                /*is_full_upload=*/1);
     }
 }
@@ -182,8 +190,16 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
     backend_get_or_create_texture(t->id, width, height, depth, t->levels,
                                   internalFormat, target, 1);
     if (pixels) {
+        MGUnpackParams unpack{
+            g_state->pixelStore.unpackAlignment,
+            g_state->pixelStore.unpackRowLength,
+            g_state->pixelStore.unpackSkipPixels,
+            g_state->pixelStore.unpackSkipRows,
+            g_state->pixelStore.unpackImageHeight,
+            g_state->pixelStore.unpackSkipImages
+        };
         backend_texture_upload(t->id, level, 0, 0, 0, width, height, depth,
-                               format, type, pixels, g_state->pixelStore.unpackAlignment,
+                               format, type, pixels, &unpack,
                                /*is_full_upload=*/1);
     }
 }
@@ -249,9 +265,16 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
     MITHRIL_ENSURE_INIT();
     mithril::Texture* t = bound_texture_for_target(target);
     if (!t || !pixels) return;
+    MGUnpackParams unpack{
+        g_state->pixelStore.unpackAlignment,
+        g_state->pixelStore.unpackRowLength,
+        g_state->pixelStore.unpackSkipPixels,
+        g_state->pixelStore.unpackSkipRows,
+        g_state->pixelStore.unpackImageHeight,
+        g_state->pixelStore.unpackSkipImages
+    };
     backend_texture_upload(t->id, level, xoffset, yoffset, 0,
-                           width, height, 1, format, type, pixels,
-                           g_state->pixelStore.unpackAlignment,
+                           width, height, 1, format, type, pixels, &unpack,
                            /*is_full_upload=*/0);
 }
 
@@ -262,9 +285,16 @@ void glTexSubImage3D(GLenum target, GLint level,
     MITHRIL_ENSURE_INIT();
     mithril::Texture* t = bound_texture_for_target(target);
     if (!t || !pixels) return;
+    MGUnpackParams unpack{
+        g_state->pixelStore.unpackAlignment,
+        g_state->pixelStore.unpackRowLength,
+        g_state->pixelStore.unpackSkipPixels,
+        g_state->pixelStore.unpackSkipRows,
+        g_state->pixelStore.unpackImageHeight,
+        g_state->pixelStore.unpackSkipImages
+    };
     backend_texture_upload(t->id, level, xoffset, yoffset, zoffset,
-                           width, height, depth, format, type, pixels,
-                           g_state->pixelStore.unpackAlignment,
+                           width, height, depth, format, type, pixels, &unpack,
                            /*is_full_upload=*/0);
 }
 
@@ -289,12 +319,13 @@ void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
     mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
     GLint p = (GLint)param;
+    bool samplerChanged = false;
     switch (pname) {
-        case GL_TEXTURE_MIN_FILTER:        t->minFilter = p; break;
-        case GL_TEXTURE_MAG_FILTER:        t->magFilter = p; break;
-        case GL_TEXTURE_WRAP_S:            t->wrapS = p; break;
-        case GL_TEXTURE_WRAP_T:            t->wrapT = p; break;
-        case GL_TEXTURE_WRAP_R:            t->wrapR = p; break;
+        case GL_TEXTURE_MIN_FILTER:        t->minFilter = p; samplerChanged = true; break;
+        case GL_TEXTURE_MAG_FILTER:        t->magFilter = p; samplerChanged = true; break;
+        case GL_TEXTURE_WRAP_S:            t->wrapS = p; samplerChanged = true; break;
+        case GL_TEXTURE_WRAP_T:            t->wrapT = p; samplerChanged = true; break;
+        case GL_TEXTURE_WRAP_R:            t->wrapR = p; samplerChanged = true; break;
         case GL_TEXTURE_BASE_LEVEL:        t->baseLevel = p; break;
         case GL_TEXTURE_MAX_LEVEL:         t->maxLevel = p; break;
         case GL_TEXTURE_MIN_LOD:           t->minLod = param; break;
@@ -310,6 +341,11 @@ void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
         default:
             mithril::state_set_error(GL_INVALID_ENUM);
             return;
+    }
+    if (samplerChanged) {
+        // Vulkan samplers are immutable; invalidate cached VkSampler so it's
+        // rebuilt on next use. 对照 MobileGL VkSamplerManager.
+        backend_invalidate_sampler_cache(t->id);
     }
     ++t->paramsVersion;
     backend_texture_set_params(t->id, t->minFilter, t->magFilter,
@@ -328,6 +364,7 @@ void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColor[i] = params[i];
+            backend_invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];
@@ -354,6 +391,7 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColor[i] = (GLfloat)params[i];
+            backend_invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];
@@ -378,6 +416,7 @@ void glTexParameterIiv(GLenum target, GLenum pname, const GLint* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColorI[i] = params[i];
+            backend_invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];
@@ -402,6 +441,7 @@ void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColorUI[i] = (GLint)params[i];
+            backend_invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];

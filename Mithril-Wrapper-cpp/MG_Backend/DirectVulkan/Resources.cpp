@@ -227,7 +227,7 @@ void defer_destroy_sampler_entry(SamplerEntry& e) {
 
 void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                           int w, int h, int d, const void* pixels,
-                          int unpack_alignment, GLenum format, GLenum type,
+                          const MGUnpackParams& unpack, GLenum format, GLenum type,
                           bool is_full_upload) {
     Backend* b = backend();
     if (!b->commandBuffer) return;
@@ -238,7 +238,6 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     // vkCmdPipelineBarrier / vkCmdCopyBufferToImage calls below would record
     // into a non-recording buffer (spec UB).
     if (!ensure_command_buffer_recording()) return;
-    if (unpack_alignment <= 0) unpack_alignment = 4;  // GL default UNPACK_ALIGNMENT
 
     // Compute host-side bytes per pixel for this (format, type) pair and
     // honour GL_UNPACK_ALIGNMENT when computing the source row stride. The
@@ -285,14 +284,23 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
         }
     }
 
-    size_t mask = (size_t)unpack_alignment - 1;
+    // Source stride calculation per GL UNPACK_* state.
+    // 对照 MobileGL VkTextureManager.cpp unpack path.
+    int alignment = unpack.alignment > 0 ? unpack.alignment : 4;  // GL default UNPACK_ALIGNMENT
     // staging 装的是展开后的 RGBA 数据（紧密排列）；tight_row 按 dst_bpp 计算。
     // 源行 stride 按 src_bpp 计算并受 GL_UNPACK_ALIGNMENT 约束。
     // 非展开路径下 src_bpp == dst_bpp == bpp，行为与原实现完全一致。
+    size_t mask = (size_t)alignment - 1;
     size_t tight_row = (size_t)w * (size_t)dst_bpp;
-    size_t src_tight_row = (size_t)w * (size_t)src_bpp;
+    int src_row_pixels = (unpack.rowLength > 0) ? unpack.rowLength : w;
+    size_t src_tight_row = (size_t)src_row_pixels * (size_t)src_bpp;
     size_t src_stride = (src_tight_row + mask) & ~mask;
     size_t staging = tight_row * (size_t)h * (size_t)d;
+    size_t image_height_rows = (unpack.imageHeight > 0) ? (size_t)unpack.imageHeight : (size_t)h;
+    size_t image_stride = src_stride * image_height_rows;
+    size_t src_start = (size_t)unpack.skipPixels * (size_t)src_bpp
+                     + (size_t)unpack.skipRows * src_stride
+                     + (size_t)unpack.skipImages * image_stride;
 
     // ---- FIX (Invalid Resource 根因 - per-frame transient staging arena) ----
     // 深度参考 MobileGL 的 transient staging arena 模式：
@@ -398,8 +406,9 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                     alpha_bits = 0x000000FFu; break;
             }
             const int alpha_bytes = src_bpp / 3;  // 每分量字节数: 1/2/4
-            const char* s8 = (const char*)pixels;
+            const char* img_ptr = (const char*)pixels + src_start;
             for (int layer = 0; layer < d; ++layer) {
+                const char* s8 = img_ptr;
                 for (int row = 0; row < h; ++row) {
                     const char* src_row = s8;
                     for (int px = 0; px < w; ++px) {
@@ -411,20 +420,25 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                     }
                     s8 += src_stride;  // 源行按 GL_UNPACK_ALIGNMENT stride
                 }
+                img_ptr += image_stride;
             }
-        } else if (src_stride == tight_row) {
-            // Source rows are already tightly packed — single memcpy.
-            std::memcpy(dst, pixels, staging);
+        } else if (src_stride == tight_row && image_height_rows == (size_t)h) {
+            // Source rows are tightly packed and images are contiguous —
+            // single memcpy from the skip offset.
+            std::memcpy(dst, (const char*)pixels + src_start, staging);
         } else {
-            // Source rows carry GL_UNPACK_ALIGNMENT padding; repack to tight
-            // so VkBufferImageCopy.bufferRowLength == 0 (== w) is valid.
-            const char* s8 = (const char*)pixels;
+            // Source rows carry GL_UNPACK_ALIGNMENT / GL_UNPACK_ROW_LENGTH
+            // padding, or images carry GL_UNPACK_IMAGE_HEIGHT padding; repack
+            // to tight so VkBufferImageCopy.bufferRowLength == 0 (== w) is valid.
+            const char* img_ptr = (const char*)pixels + src_start;
             for (int layer = 0; layer < d; ++layer) {
+                const char* s8 = img_ptr;
                 for (int row = 0; row < h; ++row) {
                     std::memcpy(dst, s8, tight_row);
                     dst += tight_row;
                     s8 += src_stride;
                 }
+                img_ptr += image_stride;
             }
         }
     }
@@ -855,13 +869,13 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
 
 void backend_texture_upload(GLuint name, int level, int x, int y, int z,
                             int w, int h, int d, GLenum format, GLenum type,
-                            const void* pixels, int unpack_alignment,
+                            const void* pixels, const struct MGUnpackParams* unpack,
                             int is_full_upload) {
     auto& tbl = mithril::vk::texture_table();
     auto it = tbl.find(name);
-    if (it == tbl.end() || !pixels) return;
+    if (it == tbl.end() || !pixels || !unpack) return;
     mithril::vk::stage_and_copy_image(it->second, level, x, y, z, w, h, d,
-                                      pixels, unpack_alignment, format, type,
+                                      pixels, *unpack, format, type,
                                       is_full_upload != 0);
 }
 
@@ -942,6 +956,26 @@ VkSampler backend_get_or_create_sampler(GLuint name, GLint min_filter, GLint mag
     if (vkCreateSampler(b->device, &sci, nullptr, &e.sampler) != VK_SUCCESS) return VK_NULL_HANDLE;
     tbl[name] = e;
     return e.sampler;
+}
+
+// Invalidate the cached VkSampler for `name`. Destroys the Vulkan sampler
+// (deferred via disposal queue) and removes the entry from sampler_table().
+// The next backend_get_or_create_sampler call creates a fresh sampler.
+// Vulkan samplers are immutable; param changes require recreation.
+// 对照 MobileGL VkSamplerManager.
+void backend_invalidate_sampler_cache(GLuint name) {
+    mithril::vk::Backend* b = mithril::vk::backend();
+    if (!b->initialized) return;
+    auto& tbl = mithril::vk::sampler_table();
+    auto it = tbl.find(name);
+    if (it == tbl.end()) return;
+    if (it->second.sampler != VK_NULL_HANDLE) {
+        // Deferred destruction: push to disposal queue.
+        mithril::vk::DeferredDestroy d;
+        d.sampler = it->second.sampler;
+        b->disposalQueue[b->currentFrame].push_back(d);
+    }
+    tbl.erase(it);
 }
 
 VkFormat backend_vk_format_for_gl(GLenum internal_format) {

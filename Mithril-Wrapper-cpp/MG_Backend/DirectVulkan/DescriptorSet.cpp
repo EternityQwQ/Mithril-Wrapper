@@ -393,14 +393,14 @@ void bind_program_descriptors(GLuint program) {
             uint32_t sz = db.bufferSize ? db.bufferSize : 16u;
             std::vector<uint8_t> payload(sz, 0);
 
-            // (1) Direct name match: one UBO per loose uniform.
-            auto uit = prog->uniforms.find(db.name);
-            if (uit != prog->uniforms.end() && !uit->second.value.empty()) {
-                size_t bytes = uit->second.value.size() * sizeof(float);
-                std::memcpy(payload.data(), uit->second.value.data(),
-                            std::min(bytes, static_cast<size_t>(sz)));
+            // Primary path: copy from uboBackingStore (written by store_uniform).
+            // 对照 MobileGL DirectVulkan.cpp:171-244 AddBufferVariablesRecursive.
+            auto bsit = prog->uboBackingStore.find(db.binding);
+            if (bsit != prog->uboBackingStore.end() && !bsit->second.empty()) {
+                size_t n = std::min(bsit->second.size(), static_cast<size_t>(sz));
+                std::memcpy(payload.data(), bsit->second.data(), n);
             } else {
-                // (2) Aggregated block ($Global): pack members by name/offset.
+                // Legacy fallback: pack members by name/offset.
                 for (const auto& m : db.members) {
                     auto mit = prog->uniforms.find(m.name);
                     if (mit != prog->uniforms.end() && !mit->second.value.empty()) {
@@ -455,22 +455,44 @@ void bind_program_descriptors(GLuint program) {
             VkSampler samp = VK_NULL_HANDLE;
             if (tex_id) {
                 view = backend_get_texture_view(tex_id);
-                // FIX (Root Cause M - 采样器参数硬编码): 旧代码硬编码 GL_LINEAR/GL_REPEAT，
-                // 完全忽略纹理通过 glTexParameteri 设置的真实 sampler 参数。
-                // Minecraft 像素风纹理（GL_NEAREST）被双线性插值，图集纹理
-                // （GL_CLAMP_TO_EDGE）被 REPEAT → 采样到错误纹素 → 颜色偏红/花屏。
-                // 修复：从 Texture 结构体读取真实 minFilter/magFilter/wrapS/wrapT/wrapR。
-                // 采样器按纹理名缓存（Resources.cpp:793-830），首次绑定读取的参数
-                // 即为最终参数。Minecraft 通常在纹理创建后立即设置参数并不再修改，
-                // 因此无需额外缓存失效逻辑。
-                mithril::Texture* tex = mithril::state_get_texture(tex_id);
-                GLenum minF = tex ? (GLenum)tex->minFilter : GL_NEAREST_MIPMAP_LINEAR;
-                GLenum magF = tex ? (GLenum)tex->magFilter : GL_LINEAR;
-                GLenum wrapS = tex ? (GLenum)tex->wrapS : GL_REPEAT;
-                GLenum wrapT = tex ? (GLenum)tex->wrapT : GL_REPEAT;
-                GLenum wrapR = tex ? (GLenum)tex->wrapR : GL_REPEAT;
+                // GL 3.3 Core: when a sampler object is bound to a unit via
+                // glBindSampler, its params take priority over the texture's
+                // own sampler params. 对照 MobileGL sampler object 优先级.
+                GLuint sampler_obj = 0;
+                if (db.binding < mithril::kMaxTextureUnits) {
+                    sampler_obj = mithril::g_state->samplerBindings[db.binding];
+                }
+                GLenum minF, magF, wrapS, wrapT, wrapR;
+                GLuint sampler_cache_key;
+                if (sampler_obj != 0) {
+                    mithril::Sampler* sObj = mithril::state_get_sampler(sampler_obj);
+                    if (sObj) {
+                        minF = (GLenum)sObj->minFilter;
+                        magF = (GLenum)sObj->magFilter;
+                        wrapS = (GLenum)sObj->wrapS;
+                        wrapT = (GLenum)sObj->wrapT;
+                        wrapR = (GLenum)sObj->wrapR;
+                        sampler_cache_key = sampler_obj;
+                    } else {
+                        mithril::Texture* tex = mithril::state_get_texture(tex_id);
+                        minF = tex ? (GLenum)tex->minFilter : GL_NEAREST_MIPMAP_LINEAR;
+                        magF = tex ? (GLenum)tex->magFilter : GL_LINEAR;
+                        wrapS = tex ? (GLenum)tex->wrapS : GL_REPEAT;
+                        wrapT = tex ? (GLenum)tex->wrapT : GL_REPEAT;
+                        wrapR = tex ? (GLenum)tex->wrapR : GL_REPEAT;
+                        sampler_cache_key = tex_id;
+                    }
+                } else {
+                    mithril::Texture* tex = mithril::state_get_texture(tex_id);
+                    minF = tex ? (GLenum)tex->minFilter : GL_NEAREST_MIPMAP_LINEAR;
+                    magF = tex ? (GLenum)tex->magFilter : GL_LINEAR;
+                    wrapS = tex ? (GLenum)tex->wrapS : GL_REPEAT;
+                    wrapT = tex ? (GLenum)tex->wrapT : GL_REPEAT;
+                    wrapR = tex ? (GLenum)tex->wrapR : GL_REPEAT;
+                    sampler_cache_key = tex_id;
+                }
                 samp = backend_get_or_create_sampler(
-                    tex_id, minF, magF, wrapS, wrapT, wrapR, nullptr);
+                    sampler_cache_key, minF, magF, wrapS, wrapT, wrapR, nullptr);
             }
             // FIX (root cause L): if no texture is bound (or the bound texture
             // has no view/sampler), use the process-wide default 1x1 black

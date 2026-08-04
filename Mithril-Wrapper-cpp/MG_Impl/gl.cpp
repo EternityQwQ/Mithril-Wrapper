@@ -10,6 +10,19 @@
 #include "includes.h"
 #include "Framebuffer.h"
 
+// glClearBuffer* uses GL_COLOR / GL_DEPTH / GL_STENCIL (GL 3.0+ buffer tokens),
+// which are not defined in glcorearb.h. Guard so the file still compiles on
+// SDKs that do define them.
+#ifndef GL_COLOR
+#define GL_COLOR   0x1800
+#endif
+#ifndef GL_DEPTH
+#define GL_DEPTH   0x1801
+#endif
+#ifndef GL_STENCIL
+#define GL_STENCIL 0x1802
+#endif
+
 extern "C" {
 
 /* ---- Clear ---- */
@@ -64,6 +77,160 @@ void glClear(GLbitfield mask) {
     backend_clear_attachments(mask, 0, 0, w, h);
     backend_end_render_pass();
     // 不调用 backend_commit() — 帧提交由 eglSwapBuffers 统一处理。
+}
+
+/* ---- glClearBuffer* (GL 3.0+) ----
+ * Clear a specific buffer to a specific value, without changing the global
+ * clear color/depth/stencil state. Each variant saves the current clear
+ * value, sets the new one, clears, then restores.
+ * 对照 MobileGL ClearBuffer() implementation.
+ */
+
+void glClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value) {
+    MITHRIL_ENSURE_INIT();
+    if (!value) return;
+    (void)drawbuffer;  // backend_clear_attachments clears all color attachments
+
+    VkImageView colors[8] = {VK_NULL_HANDLE};
+    VkImageView depth = VK_NULL_HANDLE;
+    int w = 0, h = 0;
+    int n = mithril::collect_draw_fbo_attachments(colors, &depth, &w, &h);
+
+    GLbitfield mask = 0;
+    if (buffer == GL_COLOR) {
+        GLfloat save[4] = {g_state->clearColor[0], g_state->clearColor[1],
+                           g_state->clearColor[2], g_state->clearColor[3]};
+        backend_set_clear_color(value[0], value[1], value[2], value[3]);
+        g_state->clearColor[0] = value[0]; g_state->clearColor[1] = value[1];
+        g_state->clearColor[2] = value[2]; g_state->clearColor[3] = value[3];
+        mask = GL_COLOR_BUFFER_BIT;
+        backend_set_load_load();
+        backend_begin_render_pass(colors, n, depth, w, h, 1);
+        backend_clear_attachments(mask, 0, 0, w, h);
+        backend_end_render_pass();
+        g_state->clearColor[0] = save[0]; g_state->clearColor[1] = save[1];
+        g_state->clearColor[2] = save[2]; g_state->clearColor[3] = save[3];
+        backend_set_clear_color(save[0], save[1], save[2], save[3]);
+    } else if (buffer == GL_DEPTH) {
+        GLdouble save = g_state->clearDepth;
+        backend_set_clear_depth((double)value[0]);
+        g_state->clearDepth = (GLclampd)value[0];
+        mask = GL_DEPTH_BUFFER_BIT;
+        backend_set_load_load();
+        backend_begin_render_pass(colors, n, depth, w, h, 1);
+        backend_clear_attachments(mask, 0, 0, w, h);
+        backend_end_render_pass();
+        g_state->clearDepth = save;
+        backend_set_clear_depth(save);
+    }
+}
+
+void glClearBufferiv(GLenum buffer, GLint drawbuffer, const GLint* value) {
+    MITHRIL_ENSURE_INIT();
+    if (!value) return;
+    (void)drawbuffer;
+
+    VkImageView colors[8] = {VK_NULL_HANDLE};
+    VkImageView depth = VK_NULL_HANDLE;
+    int w = 0, h = 0;
+    int n = mithril::collect_draw_fbo_attachments(colors, &depth, &w, &h);
+
+    GLbitfield mask = 0;
+    if (buffer == GL_COLOR) {
+        GLfloat save[4] = {g_state->clearColor[0], g_state->clearColor[1],
+                           g_state->clearColor[2], g_state->clearColor[3]};
+        backend_set_clear_color((float)value[0], (float)value[1], (float)value[2], (float)value[3]);
+        g_state->clearColor[0] = (float)value[0]; g_state->clearColor[1] = (float)value[1];
+        g_state->clearColor[2] = (float)value[2]; g_state->clearColor[3] = (float)value[3];
+        mask = GL_COLOR_BUFFER_BIT;
+        backend_set_load_load();
+        backend_begin_render_pass(colors, n, depth, w, h, 1);
+        backend_clear_attachments(mask, 0, 0, w, h);
+        backend_end_render_pass();
+        g_state->clearColor[0] = save[0]; g_state->clearColor[1] = save[1];
+        g_state->clearColor[2] = save[2]; g_state->clearColor[3] = save[3];
+        backend_set_clear_color(save[0], save[1], save[2], save[3]);
+    } else if (buffer == GL_STENCIL) {
+        GLint save = g_state->clearStencil;
+        backend_set_clear_stencil(value[0]);
+        g_state->clearStencil = value[0];
+        mask = GL_STENCIL_BUFFER_BIT;
+        backend_set_load_load();
+        backend_begin_render_pass(colors, n, depth, w, h, 1);
+        backend_clear_attachments(mask, 0, 0, w, h);
+        backend_end_render_pass();
+        g_state->clearStencil = save;
+        backend_set_clear_stencil(save);
+    }
+}
+
+void glClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value) {
+    MITHRIL_ENSURE_INIT();
+    if (!value) return;
+    (void)drawbuffer;
+
+    VkImageView colors[8] = {VK_NULL_HANDLE};
+    VkImageView depth = VK_NULL_HANDLE;
+    int w = 0, h = 0;
+    int n = mithril::collect_draw_fbo_attachments(colors, &depth, &w, &h);
+
+    if (buffer == GL_COLOR) {
+        GLfloat save[4] = {g_state->clearColor[0], g_state->clearColor[1],
+                           g_state->clearColor[2], g_state->clearColor[3]};
+        backend_set_clear_color((float)value[0], (float)value[1], (float)value[2], (float)value[3]);
+        g_state->clearColor[0] = (float)value[0]; g_state->clearColor[1] = (float)value[1];
+        g_state->clearColor[2] = (float)value[2]; g_state->clearColor[3] = (float)value[3];
+        backend_set_load_load();
+        backend_begin_render_pass(colors, n, depth, w, h, 1);
+        backend_clear_attachments(GL_COLOR_BUFFER_BIT, 0, 0, w, h);
+        backend_end_render_pass();
+        g_state->clearColor[0] = save[0]; g_state->clearColor[1] = save[1];
+        g_state->clearColor[2] = save[2]; g_state->clearColor[3] = save[3];
+        backend_set_clear_color(save[0], save[1], save[2], save[3]);
+    }
+}
+
+void glClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth_val, GLint stencil_val) {
+    MITHRIL_ENSURE_INIT();
+    (void)drawbuffer;
+
+    if (buffer != GL_DEPTH_STENCIL) return;
+
+    VkImageView colors[8] = {VK_NULL_HANDLE};
+    VkImageView depthView = VK_NULL_HANDLE;
+    int w = 0, h = 0;
+    int n = mithril::collect_draw_fbo_attachments(colors, &depthView, &w, &h);
+
+    GLclampd saveD = g_state->clearDepth;
+    GLint saveS = g_state->clearStencil;
+    backend_set_clear_depth((double)depth_val);
+    backend_set_clear_stencil(stencil_val);
+    g_state->clearDepth = (GLclampd)depth_val;
+    g_state->clearStencil = stencil_val;
+
+    backend_set_load_load();
+    backend_begin_render_pass(colors, n, depthView, w, h, 1);
+    backend_clear_attachments(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, 0, 0, w, h);
+    backend_end_render_pass();
+
+    g_state->clearDepth = saveD;
+    g_state->clearStencil = saveS;
+    backend_set_clear_depth(saveD);
+    backend_set_clear_stencil(saveS);
+}
+
+void glClearBufferData(GLenum target, GLenum internalformat,
+                       GLenum format, GLenum type, const void* data) {
+    (void)target; (void)internalformat; (void)format; (void)type; (void)data;
+    MITHRIL_LOG_WARN("gl", "glClearBufferData: not implemented (placeholder)");
+}
+
+void glClearBufferSubData(GLenum target, GLenum internalformat,
+                          GLintptr offset, GLsizeiptr size,
+                          GLenum format, GLenum type, const void* data) {
+    (void)target; (void)internalformat; (void)offset; (void)size;
+    (void)format; (void)type; (void)data;
+    MITHRIL_LOG_WARN("gl", "glClearBufferSubData: not implemented (placeholder)");
 }
 
 /* ---- Enable / Disable ----
