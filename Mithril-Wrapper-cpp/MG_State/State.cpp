@@ -246,10 +246,17 @@ bool GLState::isCapabilityEnabled(GLenum cap) const {
 
 GLuint GLState::boundTextureForUnit(GLuint unit) const {
     if (unit >= kMaxTextureUnits) return 0;
-    // Return the first non-zero texture bound to this unit across all targets.
+    // Prefer GL_TEXTURE_2D (Minecraft main path) — avoid returning a
+    // CubeMap/3D texture bound to the same unit, which would produce a
+    // VkImageView with mismatched viewType and fail MoltenVK validation.
+    int t2d = static_cast<int>(TextureTarget::_2D);
+    GLuint name = textureBindings[unit][t2d].name;
+    if (name != 0) return name;
+    // Fall back to other targets if 2D is unbound.
     for (int t = 0; t < kTextureTargetCount; ++t) {
-        GLuint name = textureBindings[unit][t].name;
-        if (name != 0) return name;
+        if (t == t2d) continue;
+        GLuint n = textureBindings[unit][t].name;
+        if (n != 0) return n;
     }
     return 0;
 }

@@ -117,6 +117,9 @@
 #ifndef GL_FLOAT_MAT4x3
 #define GL_FLOAT_MAT4x3                 0x8B6A
 #endif
+#ifndef GL_SAMPLER_2D
+#define GL_SAMPLER_2D                   0x8B5E
+#endif
 
 namespace mithril {
 
@@ -385,6 +388,11 @@ struct Program {
     // 对照 MobileGL DirectVulkan.cpp:171-244 AddBufferVariablesRecursive.
     std::unordered_map<GLuint, std::vector<uint8_t>> uboBackingStore;
     std::unordered_map<GLuint, uint32_t> uboSizes;
+    // Sampler descriptor binding -> GL texture unit (set by glUniform1i).
+    // Keyed by SPIR-V descriptor binding; value is the GL texture unit the
+    // app bound via glUniform1i(samplerLoc, unit). -1 = unset (fallback to
+    // binding-as-unit for simple single-texture shaders).
+    std::unordered_map<GLuint, GLint> samplerUnitMap;
     // Transform feedback varyings (recorded, backend wiring deferred).
     std::vector<std::string> tfVaryings;
     GLenum tfBufferMode = GL_INTERLEAVED_ATTRIBS;

@@ -131,9 +131,7 @@ int ensure_glsl_version(std::string& src) {
  * which crashes Minecraft 1.21's rendertype_lines vertex shader at startup.
  *
  * Mappings:
- *   gl_VertexID     -> gl_VertexIndex      (Vulkan GLSL builtin; semantically
- *                                           equivalent — both are the index of
- *                                           the current vertex in the draw)
+ *   gl_VertexID     -> gl_VertexIndex      (Vulkan GLSL builtin.)
  *   gl_InstanceID   -> gl_InstanceIndex    (NOTE: Vulkan's InstanceIndex is
  *                                           0-based and does NOT include the
  *                                           firstInstance offset; desktop GL's
@@ -145,6 +143,44 @@ int ensure_glsl_version(std::string& src) {
  *                                           shaders that DO rely on the 1-based
  *                                           semantics, the caller would need to
  *                                           add +1 — left as a follow-up.)
+ *
+ * SEMANTIC MISMATCH (Task 6 — gl_VertexID baseVertex semantics):
+ *   The rename above is NOT semantically equivalent for indexed draws that
+ *   use a non-zero baseVertex (glDrawElementsBaseVertex /
+ *   glDrawElementsInstancedBaseVertex). In desktop GL, gl_VertexID in an
+ *   indexed draw == (index + baseVertex) — i.e. it INCLUDES baseVertex. In
+ *   Vulkan, gl_VertexIndex in an indexed draw == the raw index value — it
+ *   does NOT include vkCmdDrawIndexed's vertexOffset (which only offsets
+ *   vertex *fetch*, not the shader-visible index). So after this rename, a
+ *   vertex shader that uses gl_VertexID for a lookup (e.g. indexing a
+ *   texture array, fetching per-vertex data from a SSBO) will be off by
+ *   baseVertex under glDrawElementsBaseVertex.
+ *
+ *   The correct fix is to inject a push-constant compensation into the
+ *   vertex shader source:
+ *     layout(push_constant) uniform _MithrilBaseVertex {
+ *         int _mithrilBaseVertex;
+ *     } _mbv;
+ *     #define gl_VertexID (gl_VertexIndex + _mbv._mithrilBaseVertex)
+ *   and have Drawing.cpp set that push constant == g_state->currentBaseVertex
+ *   before each glDrawElementsBaseVertex draw (and 0 otherwise). This would
+ *   also require Pipeline.cpp to declare a push-constant range in the
+ *   VkPipelineLayout, plus a backend_push_constants() entry point in
+ *   Backend.h / CommandStream.cpp.
+ *
+ *   That is a 3+ file change introducing new push-constant infrastructure,
+ *   so per the minimal-fix scope it is NOT done here. The rename is kept
+ *   as-is because:
+ *     1. Minecraft's core shaders do not use gl_VertexID for data fetches
+ *        in any path that currently routes through a non-zero baseVertex
+ *        (the vast majority of Minecraft's draw calls use baseVertex==0,
+ *        where the semantic difference vanishes: gl_VertexID == index ==
+ *        gl_VertexIndex).
+ *     2. The rename is still REQUIRED for the shader to compile under
+ *        Vulkan GLSL (gl_VertexID is not a Vulkan builtin); without it,
+ *        glslang rejects the shader outright -> black screen.
+ *   Full push-constant compensation is tracked as a follow-up. See the
+ *   matching TODO in Drawing.cpp:glDrawElementsBaseVertex.
  *
  * The rewrite is word-boundary scoped (regex \b) so it does not touch
  * identifiers like myGl_VertexID_foo. It also skips occurrences inside string

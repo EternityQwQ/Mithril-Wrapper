@@ -435,9 +435,20 @@ void bind_program_descriptors(GLuint program) {
                 writes.push_back(w);
             }
         } else if (db.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-            // Sampler binding B maps to GL texture unit B.
             GLuint tex_id = 0;
-            if (db.binding < mithril::kMaxTextureUnits) {
+            // Primary path: use the GL texture unit the app set via
+            // glUniform1i(samplerLoc, unit). samplerUnitMap is keyed by
+            // SPIR-V descriptor binding. -1 = unset.
+            GLint unit = -1;
+            if (prog) {
+                auto sit = prog->samplerUnitMap.find(db.binding);
+                if (sit != prog->samplerUnitMap.end()) unit = sit->second;
+            }
+            if (unit >= 0 && unit < mithril::kMaxTextureUnits) {
+                tex_id = mithril::g_state->boundTextureForUnit(unit);
+            } else if (db.binding < mithril::kMaxTextureUnits) {
+                // Fallback: binding-as-unit (works for simple single-texture
+                // shaders where no synthetic UBO shifts the binding).
                 tex_id = mithril::g_state->boundTextureForUnit(db.binding);
             }
             if (!tex_id) {

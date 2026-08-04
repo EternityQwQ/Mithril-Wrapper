@@ -8,6 +8,32 @@
 // to invoke from a unit-test binary with no VkDevice available.
 #include "FormatMap.h"
 
+// Legacy GL internalFormat enums not declared by our minimal glcorearb.h.
+// Minecraft's font renderer and several legacy mod textures still upload
+// with these as internalFormat; without the mappings below,
+// gl_internal_to_vk returns VK_FORMAT_UNDEFINED and the texture silently
+// falls back to a wrong color format (visible as corrupt/garbled font
+// glyphs). Hex values are from the GL registry (GL_VERSION_1_1 / EXT_sRGB).
+// Guarded so a future glcorearb.h update that adds them won't conflict.
+#ifndef GL_ALPHA8
+#define GL_ALPHA8                       0x803C
+#endif
+#ifndef GL_LUMINANCE8
+#define GL_LUMINANCE8                   0x8040
+#endif
+#ifndef GL_LUMINANCE8_ALPHA8
+#define GL_LUMINANCE8_ALPHA8            0x8045
+#endif
+#ifndef GL_INTENSITY
+#define GL_INTENSITY                    0x8049
+#endif
+#ifndef GL_INTENSITY8
+#define GL_INTENSITY8                   0x804B
+#endif
+#ifndef GL_SLUMINANCE8
+#define GL_SLUMINANCE8                  0x8C47
+#endif
+
 namespace mithril {
 namespace vk {
 
@@ -63,6 +89,43 @@ VkFormat gl_internal_to_vk(GLenum internal) {
         case GL_COMPRESSED_RGB_S3TC_DXT1_EXT: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
         case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT: return VK_FORMAT_BC2_UNORM_BLOCK;
         case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: return VK_FORMAT_BC3_UNORM_BLOCK;
+        // ---- Legacy fixed-function internal formats (Task 5) ----
+        // GL_ALPHA / GL_LUMINANCE / GL_LUMINANCE_ALPHA / GL_INTENSITY are
+        // pre-Core-Profile internal formats. Minecraft's font renderer (and
+        // legacy mod textures) still upload with these. Vulkan has no direct
+        // alpha-only / luminance-only image format, so we map each to the
+        // smallest UNORM VkFormat whose channel count matches the host data,
+        // and rely on a component swizzle set at VkImageView creation time
+        // (Resources.cpp / Texture.cpp glTexImage2D path, keyed off
+        // internalFormat) to replicate the channel(s) into the RGBA slots:
+        //   GL_ALPHA            -> R8_UNORM,  swizzle AAAA (alpha -> RGBA)
+        //   GL_LUMINANCE        -> R8_UNORM,  swizzle RRR1  (red -> RGB, A=1)
+        //   GL_LUMINANCE_ALPHA  -> R8G8_UNORM,swizzle RRRG  (red -> RGB, A=G)
+        //   GL_INTENSITY        -> R8_UNORM,  swizzle RRRR  (red -> RGBA)
+        // The sized variants (GL_ALPHA8 / GL_LUMINANCE8 / GL_LUMINANCE8_ALPHA8
+        // / GL_INTENSITY8) map to the same VkFormat as their unsized
+        // counterparts. GL_SLUMINANCE8 is the sRGB-encoded variant of
+        // LUMINANCE8_ALPHA8; we simplify it to UNORM (no sRGB decode) so the
+        // uploaded bytes map 1:1 — applying the sRGB curve would require a
+        // separate _SRGB VkFormat and a matching swizzle path, which is not
+        // wired up here. For Minecraft's font textures this is correct
+        // (they are uploaded as linear UNORM and sampled via gamma-corrected
+        // blend state in the host shader).
+        // NOTE: this function only returns the VkFormat. The swizzle itself
+        // must be applied where the VkImageView is created — out of scope for
+        // FormatMap.cpp (see Texture.cpp / Resources.cpp). Returning the right
+        // VkFormat here is the necessary first step; without it the texture
+        // creation falls through to VK_FORMAT_UNDEFINED and the image is never
+        // created at all.
+        case GL_ALPHA:                return VK_FORMAT_R8_UNORM;       // 0x1906 (swizzle AAAA)
+        case GL_ALPHA8:               return VK_FORMAT_R8_UNORM;       // 0x803C
+        case GL_LUMINANCE:            return VK_FORMAT_R8_UNORM;       // 0x1909 (swizzle RRR1)
+        case GL_LUMINANCE8:            return VK_FORMAT_R8_UNORM;       // 0x8040
+        case GL_LUMINANCE_ALPHA:       return VK_FORMAT_R8G8_UNORM;    // 0x190A (swizzle RRRG)
+        case GL_LUMINANCE8_ALPHA8:    return VK_FORMAT_R8G8_UNORM;    // 0x8045
+        case GL_SLUMINANCE8:           return VK_FORMAT_R8G8_UNORM;    // 0x8C47 (sRGB -> UNORM simplified)
+        case GL_INTENSITY:             return VK_FORMAT_R8_UNORM;       // 0x8049 (swizzle RRRR)
+        case GL_INTENSITY8:            return VK_FORMAT_R8_UNORM;       // 0x804B
         default:                      return VK_FORMAT_UNDEFINED;
     }
 }
@@ -75,7 +138,8 @@ int host_texel_bytes(GLenum format, GLenum type) {
         case GL_RED:
         case GL_RED_INTEGER:
         case GL_LUMINANCE:
-        case GL_ALPHA:            comp = 1; break;
+        case GL_ALPHA:
+        case GL_INTENSITY:        comp = 1; break;  // Task 5: GL_INTENSITY is 1 byte/texel (replicated to RGBA)
         case GL_RG:
         case GL_RG_INTEGER:
         case GL_LUMINANCE_ALPHA:  comp = 2; break;

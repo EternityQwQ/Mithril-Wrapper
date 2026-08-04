@@ -273,37 +273,59 @@ void glLinkProgram(GLuint program) {
         GLint nextLocation = 0;
         GLuint blockIndex = 0;
         for (const auto& db : bindings) {
-            if (db.type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) continue;
-            if (!db.name.empty()) {
-                p->uniformBlocks[db.name] = blockIndex;
-            }
-            p->uboSizes[db.binding] = db.bufferSize;
-            auto& store = p->uboBackingStore[db.binding];
-            store.assign(db.bufferSize ? db.bufferSize : 0, 0);
-            for (const auto& m : db.members) {
-                if (m.name.empty()) continue;
-                mithril::Uniform u{};
-                u.name = m.name;
-                u.location = nextLocation++;
-                u.blockIndex = (GLint)blockIndex;
-                u.blockBinding = (GLint)db.binding;
-                u.offset = (GLint)m.offset;
-                switch (m.size) {
-                    case 8:  u.type = GL_FLOAT_VEC2; break;
-                    case 12: u.type = GL_FLOAT_VEC3; break;
-                    case 16: u.type = GL_FLOAT_VEC4; break;
-                    case 24: u.type = GL_FLOAT_MAT3; break;
-                    case 32: u.type = GL_FLOAT_MAT2x4; break;
-                    case 48: u.type = GL_FLOAT_MAT4x3; break;
-                    case 64: u.type = GL_FLOAT_MAT4; break;
-                    case 36: u.type = GL_FLOAT_MAT3x4; break;
-                    default: u.type = GL_FLOAT; break;
+            if (db.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                if (!db.name.empty()) {
+                    p->uniformBlocks[db.name] = blockIndex;
                 }
-                u.size = 1;
-                p->uniforms[m.name] = u;
-                p->uniformByLocation[u.location] = m.name;
+                p->uboSizes[db.binding] = db.bufferSize;
+                auto& store = p->uboBackingStore[db.binding];
+                store.assign(db.bufferSize ? db.bufferSize : 0, 0);
+                for (const auto& m : db.members) {
+                    if (m.name.empty()) continue;
+                    mithril::Uniform u{};
+                    u.name = m.name;
+                    u.location = nextLocation++;
+                    u.blockIndex = (GLint)blockIndex;
+                    u.blockBinding = (GLint)db.binding;
+                    u.offset = (GLint)m.offset;
+                    switch (m.size) {
+                        case 8:  u.type = GL_FLOAT_VEC2; break;
+                        case 12: u.type = GL_FLOAT_VEC3; break;
+                        case 16: u.type = GL_FLOAT_VEC4; break;
+                        case 24: u.type = GL_FLOAT_MAT3; break;
+                        case 32: u.type = GL_FLOAT_MAT2x4; break;
+                        case 48: u.type = GL_FLOAT_MAT4x3; break;
+                        case 64: u.type = GL_FLOAT_MAT4; break;
+                        case 36: u.type = GL_FLOAT_MAT3x4; break;
+                        default: u.type = GL_FLOAT; break;
+                    }
+                    u.size = 1;
+                    p->uniforms[m.name] = u;
+                    p->uniformByLocation[u.location] = m.name;
+                }
+                ++blockIndex;
+            } else if (db.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                // Reflect sampler uniforms so glGetUniformLocation("Sampler0")
+                // returns a valid location instead of -1. Without this, every
+                // glUniform1i(samplerLoc, unit) is a no-op → the Vulkan
+                // backend never learns which texture unit feeds each sampler →
+                // multi-texture shaders (e.g. Minecraft) render black.
+                // blockBinding stores the SPIR-V descriptor binding; the GL
+                // texture unit is captured later in glUniform1i via
+                // samplerUnitMap.
+                if (!db.name.empty()) {
+                    mithril::Uniform u{};
+                    u.name = db.name;
+                    u.location = nextLocation++;
+                    u.blockIndex = -1;
+                    u.blockBinding = (GLint)db.binding;
+                    u.type = GL_SAMPLER_2D;
+                    u.size = 1;
+                    p->uniforms[db.name] = u;
+                    p->uniformByLocation[u.location] = db.name;
+                }
+                p->samplerUnitMap[(GLuint)db.binding] = -1;
             }
-            ++blockIndex;
         }
     } catch (const std::exception& e) {
         MITHRIL_LOG_WARN("program", "Uniform reflection failed for program %u: %s",
@@ -579,7 +601,31 @@ void glUniform2f(GLint loc, GLfloat v0, GLfloat v1)                        { GLf
 void glUniform3f(GLint loc, GLfloat v0, GLfloat v1, GLfloat v2)            { GLfloat v[3] = {v0,v1,v2}; store_uniform(loc, v, 1, 3); }
 void glUniform4f(GLint loc, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3){ GLfloat v[4] = {v0,v1,v2,v3}; store_uniform(loc, v, 1, 4); }
 
-void glUniform1i(GLint loc, GLint v0)                                      { store_uniform_int(loc, &v0, 1, 1); }
+void glUniform1i(GLint loc, GLint v0) {
+    store_uniform_int(loc, &v0, 1, 1);
+    // Sampler unit mapping: when the app calls glUniform1i(samplerLoc, unit)
+    // to bind a sampler to a texture unit, record the unit in samplerUnitMap
+    // keyed by the sampler's SPIR-V descriptor binding. The Vulkan backend
+    // reads this map at draw time to wire VkDescriptorImageInfo for the
+    // correct texture unit. Without this, multi-texture shaders (Minecraft)
+    // get samplers pointing at the wrong (or no) texture → black screen.
+    mithril::Program* p = current_program();
+    if (p && loc >= 0) {
+        auto it = p->uniformByLocation.find(loc);
+        if (it != p->uniformByLocation.end()) {
+            auto uit = p->uniforms.find(it->second);
+            if (uit != p->uniforms.end()) {
+                mithril::Uniform& u = uit->second;
+                // Sampler types fall in 0x8B5E..0x8B60 (GL_SAMPLER_2D,
+                // GL_SAMPLER_3D, GL_SAMPLER_CUBE). blockBinding holds the
+                // SPIR-V descriptor binding for reflected samplers (>= 0).
+                if (u.blockBinding >= 0 && u.type >= 0x8B5E && u.type <= 0x8B60) {
+                    p->samplerUnitMap[(GLuint)u.blockBinding] = v0;
+                }
+            }
+        }
+    }
+}
 void glUniform2i(GLint loc, GLint v0, GLint v1)                            { GLint v[2] = {v0,v1}; store_uniform_int(loc, v, 1, 2); }
 void glUniform3i(GLint loc, GLint v0, GLint v1, GLint v2)                  { GLint v[3] = {v0,v1,v2}; store_uniform_int(loc, v, 1, 3); }
 void glUniform4i(GLint loc, GLint v0, GLint v1, GLint v2, GLint v3)        { GLint v[4] = {v0,v1,v2,v3}; store_uniform_int(loc, v, 1, 4); }
@@ -610,15 +656,43 @@ void glUniform4uiv(GLint loc, GLsizei c, const GLuint* v) {
     std::vector<GLint> tmp(v, v + c*4); store_uniform_int(loc, tmp.data(), c, 4);
 }
 
-void glUniformMatrix2fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v)   { (void)t; store_uniform(loc, v, c, 4); }
-void glUniformMatrix3fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v)   { (void)t; store_uniform(loc, v, c, 9); }
-void glUniformMatrix4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v)   { (void)t; store_uniform(loc, v, c, 16); }
-void glUniformMatrix2x3fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 6); }
-void glUniformMatrix3x2fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 6); }
-void glUniformMatrix2x4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 8); }
-void glUniformMatrix4x2fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 8); }
-void glUniformMatrix3x4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 12); }
-void glUniformMatrix4x3fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { (void)t; store_uniform(loc, v, c, 12); }
+// Store a matrix uniform with optional transpose. OpenGL receives matrices
+// in column-major order; when transpose == GL_TRUE the app supplied row-major
+// data and we must transpose each matrix before writing it to the backing
+// store so the Vulkan backend (which always expects column-major) sees the
+// correct layout. `cols`/`rows` describe the original matrix dimensions
+// (matCxR => cols=C, rows=R); the element count per matrix is cols*rows.
+static void store_uniform_matrix(GLint location, GLsizei count, GLboolean transpose,
+                                 const GLfloat* v, int cols, int rows) {
+    int elems = cols * rows;
+    if (transpose == GL_TRUE && v && elems > 0) {
+        std::vector<GLfloat> tmp((size_t)count * elems);
+        for (int m = 0; m < count; ++m) {
+            const GLfloat* src = v + (size_t)m * elems;
+            GLfloat* dst = tmp.data() + (size_t)m * elems;
+            // Column-major transpose: transposed[j*cols + i] = original[i*rows + j].
+            // Works for square (mat2/mat3/mat4) and non-square (mat2x3 etc.) matrices.
+            for (int i = 0; i < cols; ++i) {
+                for (int j = 0; j < rows; ++j) {
+                    dst[j * cols + i] = src[i * rows + j];
+                }
+            }
+        }
+        store_uniform(location, tmp.data(), count, elems);
+    } else {
+        store_uniform(location, v, count, elems);
+    }
+}
+
+void glUniformMatrix2fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v)   { store_uniform_matrix(loc, c, t, v, 2, 2); }
+void glUniformMatrix3fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v)   { store_uniform_matrix(loc, c, t, v, 3, 3); }
+void glUniformMatrix4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v)   { store_uniform_matrix(loc, c, t, v, 4, 4); }
+void glUniformMatrix2x3fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { store_uniform_matrix(loc, c, t, v, 2, 3); }
+void glUniformMatrix3x2fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { store_uniform_matrix(loc, c, t, v, 3, 2); }
+void glUniformMatrix2x4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { store_uniform_matrix(loc, c, t, v, 2, 4); }
+void glUniformMatrix4x2fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { store_uniform_matrix(loc, c, t, v, 4, 2); }
+void glUniformMatrix3x4fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { store_uniform_matrix(loc, c, t, v, 3, 4); }
+void glUniformMatrix4x3fv(GLint loc, GLsizei c, GLboolean t, const GLfloat* v) { store_uniform_matrix(loc, c, t, v, 4, 3); }
 
 GLboolean glIsProgram(GLuint program) {
     // P1-5: validity is O(1) via NameAllocator::valid(). This covers both
