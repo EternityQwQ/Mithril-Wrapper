@@ -107,7 +107,7 @@ extern "C" {
 #define GL_ALWAYS                       0x0207
 #define GL_DEPTH_TEST                   0x0B71
 #define GL_DEPTH_WRITEMASK              0x0B72
-#define GL_DEPTH_FUNC                   0x0B73
+#define GL_DEPTH_FUNC                            0x0B74
 #define GL_DEPTH_RANGE                  0x0B70
 #define GL_DEPTH_CLEAR_VALUE            0x0B73
 
@@ -144,8 +144,8 @@ extern "C" {
 #define GL_MAX                          0x8008
 
 /* Stencil */
-#define GL_STENCIL_WRITEMASK            0x0D98
-#define GL_STENCIL_BACK_WRITEMASK       0x8C80
+#define GL_STENCIL_WRITEMASK                     0x0B98
+#define GL_STENCIL_BACK_WRITEMASK                0x8CA5
 #define GL_STENCIL_FUNC                 0x0B92
 #define GL_STENCIL_VALUE_MASK           0x0B93
 #define GL_STENCIL_REF                  0x0B97
@@ -191,7 +191,7 @@ extern "C" {
 #define GL_TEXTURE_MAG_FILTER           0x2800
 #define GL_TEXTURE_WRAP_S               0x2802
 #define GL_TEXTURE_WRAP_T               0x2803
-#define GL_TEXTURE_WRAP_R               0x2807
+#define GL_TEXTURE_WRAP_R                        0x8072
 #define GL_TEXTURE_BORDER_COLOR         0x1004
 #define GL_TEXTURE_MIN_LOD              0x813A
 #define GL_TEXTURE_MAX_LOD              0x813B
@@ -342,7 +342,7 @@ extern "C" {
 #define GL_DYNAMIC_COPY                 0x88EA
 #define GL_BUFFER_SIZE                  0x8764
 #define GL_BUFFER_USAGE                 0x8765
-#define GL_BUFFER_ACCESS                0x8824
+#define GL_BUFFER_ACCESS                         0x88BB
 
 /* Map */
 #define GL_READ_ONLY                    0x88B8
@@ -434,7 +434,7 @@ extern "C" {
 #define GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS 0x8B4D
 #define GL_MAX_VERTEX_ATTRIBS           0x8869
 #define GL_MAX_VERTEX_UNIFORM_COMPONENTS 0x8B4A
-#define GL_MAX_FRAGMENT_UNIFORM_COMPONENTS 0x8B18
+#define GL_MAX_FRAGMENT_UNIFORM_COMPONENTS       0x8B49
 #define GL_MAX_VIEWPORT_DIMS            0x0D3A
 #define GL_MAX_3D_TEXTURE_SIZE          0x8073
 #define GL_MAX_CUBE_MAP_TEXTURE_SIZE    0x851C
