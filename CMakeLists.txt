@@ -56,6 +56,13 @@ endif()
 # or from the MoltenVK.xcframework/Headers fallback).
 # ---------------------------------------------------------------------------
 if(APPLE)
+    # NOTE: NO_CMAKE_FIND_ROOT_PATH is required here. leetal/ios-cmake sets
+    # CMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY, which re-roots every search path
+    # under the iOS sysroot. MoltenVK is staged at the REPO ROOT by the CI
+    # workflow (MoltenVK-Headers/, MoltenVK.xcframework/...), NOT inside the
+    # sysroot, so without this flag find_path would look for
+    # <sysroot>/.../MoltenVK-Headers and fail with REQUIRED. This mirrors the
+    # NO_CMAKE_FIND_ROOT_PATH already present on the find_library call below.
     find_path(MOLTENVK_INCLUDE_DIR
         NAMES vulkan/vulkan.h
         PATHS
@@ -68,6 +75,7 @@ if(APPLE)
             "${CMAKE_SOURCE_DIR}/Mithril-Wrapper-cpp/3rdparty/MoltenVK/MoltenVK.xcframework/Headers"
             "${CMAKE_SOURCE_DIR}/MoltenVK.xcframework/ios-arm64/Headers"
             "${CMAKE_SOURCE_DIR}/MoltenVK.xcframework/ios-arm64_x86_64-simulator/Headers"
+        NO_CMAKE_FIND_ROOT_PATH
         REQUIRED
     )
     message(STATUS "MoltenVK headers: ${MOLTENVK_INCLUDE_DIR}")
