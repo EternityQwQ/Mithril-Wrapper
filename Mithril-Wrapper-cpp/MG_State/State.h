@@ -362,6 +362,20 @@ struct Attrib {
     GLint       location = -1;
 };
 
+// ---- Uniform / storage block reflection caches ----
+// Populated at link time by the descriptor-set reflection path and read back by
+// DescriptorSet.cpp when binding UBOs / SSBOs. (These were referenced by
+// DescriptorSet.cpp but never committed to the header — added to unblock build.)
+struct UniformBlockInfo {
+    std::string name;            // reflected block name
+    GLuint      bindingPoint = 0;  // GL uniform-block binding point
+    uint32_t    dataSize = 0;      // block byte size (0 = unknown)
+};
+
+struct StorageBlockInfo {
+    GLuint descriptorBinding = 0;  // SSBO descriptor binding (== reflected binding)
+};
+
 // ---- Program ----
 struct Program {
     GLuint    id = 0;
@@ -393,6 +407,14 @@ struct Program {
     // app bound via glUniform1i(samplerLoc, unit). -1 = unset (fallback to
     // binding-as-unit for simple single-texture shaders).
     std::unordered_map<GLuint, GLint> samplerUnitMap;
+    // Descriptor-set reflection caches (read by DescriptorSet.cpp; populated at
+    // link time). Added to unblock build — referenced but never committed.
+    uint32_t    linkVersion = 0;   // bumped on each (re)link; invalidates UBO plans
+    std::unordered_map<GLuint, GLuint> blockIndexForDescriptor;  // descriptor binding -> GL block index
+    std::vector<UniformBlockInfo>      blockInfos;               // per-GL-block reflection info
+    std::unordered_map<GLuint, GLint>  samplerUnitForBinding;   // descriptor binding -> GL texture unit
+    std::vector<StorageBlockInfo>      storageBlockInfos;        // per-SSBO reflection info
+    std::unordered_map<GLuint, GLuint> storageBlockBindings;     // storage block index -> GL binding point
     // Transform feedback varyings (recorded, backend wiring deferred).
     std::vector<std::string> tfVaryings;
     GLenum tfBufferMode = GL_INTERLEAVED_ATTRIBS;
@@ -535,6 +557,7 @@ struct GLState {
     // ---- Texture bindings (per-unit per-target) ----
     BindingSlot textureBindings[kMaxTextureUnits][kTextureTargetCount];
     GLuint      samplerBindings[kMaxTextureUnits] = {};  // sampler object name per unit
+    GLuint      imageTextureUnits[kMaxTextureUnits] = {}; // texture object bound to each unit (for sampler descriptors)
     Texture     defaultTextures[kTextureTargetCount];    // name=0, immortal, one per target
     int         activeTextureUnit = 0;                   // GL_TEXTURE0 relative
     uint64_t    textureBindGeneration = 0;

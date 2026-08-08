@@ -1243,7 +1243,7 @@ void backend_ensure_program_layouts(GLuint program,
 }
 
 void backend_bind_program_descriptors(GLuint program) {
-    mithril::vk::bind_program_descriptors(program);
+    mithril::vk::bind_program_descriptors(program, VK_PIPELINE_BIND_POINT_GRAPHICS);
 }
 
 } // extern "C"

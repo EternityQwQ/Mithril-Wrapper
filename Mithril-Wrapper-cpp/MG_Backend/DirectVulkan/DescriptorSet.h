@@ -44,7 +44,12 @@ void ensure_program_layouts(GLuint program,
  * Must be called after backend_bind_pipeline() and before the draw, with a
  * recording command buffer active.
  */
-void bind_program_descriptors(GLuint program);
+void bind_program_descriptors(GLuint program, VkPipelineBindPoint bindPoint);
+
+// Reset per-bind-point descriptor-set shadow state. Called at command-buffer
+// boundaries (render-pass end, compute submit, device-lost recovery) so the
+// next vkCmdBindDescriptorSets re-binds instead of trusting a stale cache.
+void on_command_buffer_boundary();
 
 } // namespace vk
 } // namespace mithril

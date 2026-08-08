@@ -26,6 +26,11 @@ struct DescriptorBindingMember {
     std::string name;     // struct member name (UBOs only)
     uint32_t offset = 0;  // byte offset within the UBO
     uint32_t size = 0;    // byte size of the member
+    uint32_t columns = 0;       // matrix columns (1 for non-matrices)
+    uint32_t rows = 0;          // matrix rows    (1 for non-matrices)
+    uint32_t arraySize = 0;     // array length   (1 for non-arrays)
+    uint32_t arrayStride = 0;   // bytes between array elements (std140-padded)
+    uint32_t matrixStride = 0;  // bytes between matrix columns (std140-padded)
 };
 
 // One reflected descriptor binding (merged across vertex + fragment stages).
