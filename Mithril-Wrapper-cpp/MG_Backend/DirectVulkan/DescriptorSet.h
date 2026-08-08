@@ -26,6 +26,10 @@ namespace vk {
  *
  *   vs / vs_words : vertex-stage SPIR-V words (may be NULL/0)
  *   fs / fs_words : fragment-stage SPIR-V words (may be NULL/0)
+ *   cs / cs_words : compute-stage SPIR-V words (may be NULL/0)
+ *
+ * A compute program passes NULL for vs/fs and vice versa — the reflection pass
+ * simply skips absent stages, so one entry point serves both pipeline kinds.
  *
  * Safe to call from the link path (single-threaded). On a program with no
  * reflected bindings, pr.pipelineLayout is left VK_NULL_HANDLE and the caller
@@ -33,7 +37,8 @@ namespace vk {
  */
 void ensure_program_layouts(GLuint program,
                             const uint32_t* vs, int vs_words,
-                            const uint32_t* fs, int fs_words);
+                            const uint32_t* fs, int fs_words,
+                            const uint32_t* cs, int cs_words);
 
 /*
  * Allocate a fresh VkDescriptorSet (from the program's pool, reset once per

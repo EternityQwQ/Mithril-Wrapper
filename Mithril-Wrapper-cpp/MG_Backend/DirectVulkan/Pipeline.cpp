@@ -414,7 +414,8 @@ VkPipeline get_or_create_pipeline(GLuint program,
     // Y flip only modifies gl_Position (a builtin), so both SPIR-V variants
     // share the same descriptor layout — reflecting either is correct.
     ensure_program_layouts(program, vertex_spirv, vertex_word_count,
-                           fragment_spirv, fragment_word_count);
+                           fragment_spirv, fragment_word_count,
+                           nullptr, 0);   // graphics program: no compute stage
 
     uint64_t sig = hash_signature(program, attribs, attrib_count, color_formats,
                                   color_count, depth_format, blend_enabled,

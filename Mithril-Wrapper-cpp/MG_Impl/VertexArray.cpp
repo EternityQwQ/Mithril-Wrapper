@@ -132,7 +132,18 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
     if (index >= mithril::kMaxVertexAttribs) return;
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     if (!vao) return;
+    /* The GL spec defines glVertexAttribDivisor(i, d) as shorthand for
+     * glVertexBindingDivisor(binding of attrib i, d). The backend reads the
+     * divisor off the *binding* (Pipeline.cpp attrib_divisor), so writing only
+     * the attribute copy would leave instanced draws stepping per-vertex —
+     * silently wrong geometry rather than a clean failure. Keep both in sync:
+     * the attribute copy still backs glGetVertexAttribiv(..._DIVISOR) and the
+     * MGVertexAttrib fill in Drawing.cpp. */
     vao->attribs[index].divisor = divisor;
+    const GLuint bi = vao->attribs[index].bindingIndex;
+    if (bi < (GLuint)mithril::kMaxVertexBindings) {
+        vao->bindings[bi].divisor = divisor;
+    }
 }
 
 void glVertexAttrib1f(GLuint index, GLfloat x) {

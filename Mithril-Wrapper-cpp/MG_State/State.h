@@ -125,6 +125,8 @@ namespace mithril {
 
 // ---- Constants ----
 constexpr int kMaxVertexAttribs     = 16;
+constexpr int kMaxVertexBindings     = 16;
+constexpr int kMaxSampleMaskWords    = 1;   // GL_MAX_SAMPLE_MASK_WORDS
 constexpr int kMaxColorAttachments  = 8;
 constexpr int kMaxTextureUnits      = 32;
 constexpr int kMaxIndexedBindings   = 36;  // >= GL_MAX_UNIFORM_BUFFER_BINDINGS
@@ -227,15 +229,42 @@ struct VertexAttrib {
     const void* pointer  = nullptr;      // offset when a VBO is bound
     GLuint    boundBuffer = 0;           // GL_ARRAY_BUFFER at bind time
     GLuint    divisor    = 0;
+    GLuint    bindingIndex = 0;          // vertex buffer binding this attrib reads from
+};
+
+// ---- Vertex buffer binding point (per VAO) ----
+// GL 4.3 separate-attribute-format model: an attribute names a *binding index*,
+// and the instance-step divisor lives on the binding, not on the attribute
+// (glVertexAttribDivisor is spec'd as shorthand for setting the divisor of the
+// binding the attribute currently points at). Pipeline.cpp reads
+// bindings[attribs[loc].bindingIndex].divisor to pick
+// VK_VERTEX_INPUT_RATE_INSTANCE — keep that the single source of truth.
+struct VertexBinding {
+    GLuint   buffer  = 0;   // buffer object bound to this binding point
+    GLintptr offset  = 0;   // byte offset of the first element
+    GLsizei  stride  = 0;   // byte stride between elements
+    GLuint   divisor = 0;   // 0 = per-vertex, >0 = per-instance
 };
 
 struct VertexArray {
     GLuint    id = 0;
     VertexAttrib attribs[kMaxVertexAttribs];
+    VertexBinding bindings[kMaxVertexBindings];
     GLuint    elementArrayBuffer = 0;    // GL_ELEMENT_ARRAY_BUFFER — sole source
     uint16_t  attribVersions[kMaxVertexAttribs] = {};
     uint32_t  configVersion = 0;
     bool      markedForDeletion = false;
+
+    // GL default state: attribute i reads from vertex buffer binding i. A plain
+    // in-class initializer cannot express "index of the array slot", so the
+    // identity mapping is established here. Value-init (`VertexArray vao{};`)
+    // still routes through this constructor.
+    VertexArray() {
+        for (int i = 0; i < kMaxVertexAttribs; ++i) {
+            attribs[i].bindingIndex =
+                (GLuint)(i < kMaxVertexBindings ? i : kMaxVertexBindings - 1);
+        }
+    }
 };
 
 // ---- Buffer ----
@@ -394,6 +423,9 @@ struct Program {
     std::vector<uint32_t> vertexSpirv;
     std::vector<uint32_t> vertexSpirvYFlipped;
     std::vector<uint32_t> fragmentSpirv;
+    // Compute stage (GL_COMPUTE_SHADER). Empty for graphics-only programs;
+    // backend_get_or_create_compute_pipeline() bails out on empty.
+    std::vector<uint32_t> computeSpirv;
     // Uniform block binding table (glUniformBlockBinding).
     std::unordered_map<GLuint, GLuint> uniformBlockBindings;
     // UBO backing stores keyed by descriptor binding. store_uniform*() writes
@@ -636,6 +668,15 @@ struct GLState {
     bool    sampleMask = false;
     GLfloat sampleCoverageValue = 1.0f;
     bool    sampleCoverageInvert = false;
+    // GL 4.0 ARB_sample_shading (GL_SAMPLE_SHADING / glMinSampleShading).
+    bool    sampleShadingEnabled = false;
+    GLfloat minSampleShading = 0.0f;
+    // GL 4.0 glSampleMaski. GL_MAX_SAMPLE_MASK_WORDS is 1 here, which also
+    // matches Vulkan's ceil(rasterizationSamples/32) == 1 for <= 32 samples.
+    // Pipeline.cpp hands &sampleMaskValue[0] to VkPipelineMultisampleStateCreateInfo,
+    // so this must live as long as the GLState — it does. Default = all bits set
+    // (no samples masked off), which is the GL default.
+    GLuint  sampleMaskValue[kMaxSampleMaskWords] = { 0xFFFFFFFFu };
     bool    programPointSize = false;
     bool    primitiveRestart = false;
     GLuint  primitiveRestartIndex = 0;

@@ -1239,7 +1239,11 @@ extern "C" {
 void backend_ensure_program_layouts(GLuint program,
                                     const uint32_t* vs, int vs_words,
                                     const uint32_t* fs, int fs_words) {
-    mithril::vk::ensure_program_layouts(program, vs, vs_words, fs, fs_words);
+    // The C ABI in MG_Backend/Backend.h is graphics-only (shared across groups,
+    // not changed here); the compute stage is reflected from
+    // get_or_create_compute_pipeline(), which calls the C++ entry point directly.
+    mithril::vk::ensure_program_layouts(program, vs, vs_words, fs, fs_words,
+                                        nullptr, 0);
 }
 
 void backend_bind_program_descriptors(GLuint program) {
