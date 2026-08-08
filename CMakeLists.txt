@@ -72,10 +72,20 @@ if(APPLE)
     )
     message(STATUS "MoltenVK headers: ${MOLTENVK_INCLUDE_DIR}")
 
-    # Link against the dynamic dylib bundled in the repo.
+    # Link against the MoltenVK static library. The CI workflow downloads the
+    # MoltenVK iOS tarball and stages it at the REPO ROOT as
+    #   MoltenVK.xcframework/ios-arm64/libMoltenVK.a   (static lib)
+    #   MoltenVK-Headers/vulkan/vulkan.h               (headers)
+    # (see .github/workflows/build.yml "Download MoltenVK" step). The legacy
+    # Mithril-Wrapper-cpp/3rdparty/MoltenVK location is kept only as a fallback
+    # for local checkouts that vendor the dylib there. NAMES covers both
+    # libMoltenVK.a (CI) and a bare MoltenVK.framework (local).
     find_library(MOLTENVK_LIBRARY
-        NAMES MoltenVK
-        PATHS "${CMAKE_SOURCE_DIR}/Mithril-Wrapper-cpp/3rdparty/MoltenVK"
+        NAMES MoltenVK libMoltenVK
+        PATHS
+            "${CMAKE_SOURCE_DIR}/MoltenVK.xcframework/ios-arm64"
+            "${CMAKE_SOURCE_DIR}/MoltenVK.xcframework"
+            "${CMAKE_SOURCE_DIR}/Mithril-Wrapper-cpp/3rdparty/MoltenVK"
         NO_CMAKE_FIND_ROOT_PATH
         REQUIRED
     )
