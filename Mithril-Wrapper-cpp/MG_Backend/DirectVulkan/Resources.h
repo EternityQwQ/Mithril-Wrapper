@@ -77,8 +77,19 @@ VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo
 
 // Create + bind a VkBuffer (host-visible/coherent) of the given size. On
 // success fills out the entry. `data` (if non-null) is copied in.
+//
+// `persistent` keeps the memory mapped for the buffer's whole lifetime
+// (glBufferStorage + GL_MAP_PERSISTENT_BIT — see BufferEntry::persistentlyMapped).
+// Defaults to false: the ordinary path maps, uploads and unmaps, so staging
+// buffers and one-shot uploads do not hold a mapping they never use.
+//
+// The default argument is what keeps the existing 4-argument call sites
+// (Device.cpp / Resources.cpp / ImageOps.cpp) linking against the 5-parameter
+// definition in Resources.cpp — the header had not been updated with it, which
+// is exactly the undefined-symbol the iOS link step tripped over.
 bool create_buffer(BufferEntry& out, VkDeviceSize size,
-                   VkBufferUsageFlags usage, const void* data);
+                   VkBufferUsageFlags usage, const void* data,
+                   bool persistent = false);
 
 // Destroy a buffer entry's Vulkan resources (does not erase the table slot).
 // Immediate destruction — only safe when no in-flight command buffer references
