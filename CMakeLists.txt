@@ -164,7 +164,6 @@ set(MITHRIL_SOURCES
     Mithril-Wrapper-cpp/MG_Impl/gl.cpp
     Mithril-Wrapper-cpp/MG_Impl/Getter.cpp
     Mithril-Wrapper-cpp/MG_Impl/Program.cpp
-    Mithril-Wrapper-cpp/MG_Impl/ProgramLayout.cpp
     Mithril-Wrapper-cpp/MG_Impl/Shader.cpp
     Mithril-Wrapper-cpp/MG_Impl/Buffer.cpp
     Mithril-Wrapper-cpp/MG_Impl/VertexArray.cpp
@@ -175,28 +174,11 @@ set(MITHRIL_SOURCES
     Mithril-Wrapper-cpp/MG_Impl/Debug.cpp
     Mithril-Wrapper-cpp/MG_Impl/lookup.cpp
 
-    # GL 4.3/4.4 entry points
-    #   AttribBinding.cpp    ARB_vertex_attrib_binding, ARB_multi_bind,
-    #                        ARB_clear_texture
-    #   ProgramInterface.cpp ARB_program_interface_query
-    Mithril-Wrapper-cpp/MG_Impl/AttribBinding.cpp
-    Mithril-Wrapper-cpp/MG_Impl/ProgramInterface.cpp
-    #   Extras40.cpp         GL 4.0: fp64 uniform, subroutine, tessellation,
-    #                        indexed query, transform-feedback draw
-    #   Extras43.cpp         GL 4.2/4.3/4.6: atomic counter, image load/store,
-    #                        compute, SSBO, texture view, invalidate, polygon offset clamp
-    #   DSA_Buffer.cpp       GL 4.5 DSA：缓冲 / 帧缓冲 / 渲染缓冲 / TF / 查询缓冲
-    #   DSA_Texture.cpp      GL 4.5 DSA：纹理全家
-    #   DSA_Vertex.cpp       GL 4.5 DSA：VAO + create 类 + robustness 安全查询
-    #   SeparateShader.cpp   GL 4.1 ARB_separate_shader_objects + ProgramUniform*
-    #   ViewportArray.cpp    GL 4.1 ARB_viewport_array + fp64 vertex attrib
-    Mithril-Wrapper-cpp/MG_Impl/Extras40.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Extras43.cpp
-    Mithril-Wrapper-cpp/MG_Impl/DSA_Buffer.cpp
-    Mithril-Wrapper-cpp/MG_Impl/DSA_Texture.cpp
-    Mithril-Wrapper-cpp/MG_Impl/DSA_Vertex.cpp
-    Mithril-Wrapper-cpp/MG_Impl/SeparateShader.cpp
-    Mithril-Wrapper-cpp/MG_Impl/ViewportArray.cpp
+    # MITHRIL_SOURCES historically but the source files were never committed to
+    # the repo (and no other translation unit references their symbols). They are
+    # out of scope for the GL 3.3 Core Profile target and caused
+    # "Cannot find source file" at configure time. Removed from the build until
+    # the corresponding GL 4.x features are actually implemented.
 
     # MG_State: GL state machine
     Mithril-Wrapper-cpp/MG_State/State.cpp
