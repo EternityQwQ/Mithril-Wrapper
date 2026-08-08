@@ -1167,11 +1167,13 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
 
 void backend_texture_upload(GLuint name, int level, int x, int y, int z,
                             int w, int h, int d, GLenum format, GLenum type,
-                            const void* pixels, int unpack_alignment,
+                            const void* pixels, const MGUnpackParams* unpack,
                             int is_full_upload) {
     auto& tbl = mithril::vk::texture_table();
     auto it = tbl.find(name);
     if (it == tbl.end() || !pixels) return;
+    const int unpack_alignment = (unpack && unpack->unpackAlignment > 0)
+                                     ? unpack->unpackAlignment : 4;
     mithril::vk::stage_and_copy_image(it->second, level, x, y, z, w, h, d,
                                       pixels, unpack_alignment, format, type,
                                       is_full_upload != 0);
@@ -1205,6 +1207,14 @@ void backend_delete_texture(GLuint name) {
     auto it = tbl.find(name);
     if (it == tbl.end()) return;
     mithril::vk::defer_destroy_texture_entry(it->second);
+    tbl.erase(it);
+}
+
+void backend_invalidate_sampler_cache(GLuint name) {
+    auto& tbl = mithril::vk::sampler_table();
+    auto it = tbl.find(name);
+    if (it == tbl.end()) return;
+    mithril::vk::defer_destroy_sampler_entry(it->second);
     tbl.erase(it);
 }
 

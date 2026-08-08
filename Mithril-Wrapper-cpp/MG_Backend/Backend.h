@@ -285,12 +285,29 @@ void     backend_update_generic_attribs(const float* values, int count);
 VkBuffer backend_get_generic_attrib_buffer(void);
 
 /* ---- Textures ---- */
+
+/*
+ * Unpack (pixel-store) parameters handed to backend_texture_upload. Mirrors the
+ * glPixelStorei UNPACK_* state kept in g_state->pixelStore. The struct form lets
+ * the MG_Impl layer build the params once and pass a stable pointer instead of
+ * a single alignment integer, so the backend can honour
+ * UNPACK_ROW_LENGTH / UNPACK_SKIP_* for sub-image uploads.
+ */
+struct MGUnpackParams {
+    GLint unpackAlignment;
+    GLint unpackRowLength;
+    GLint unpackSkipPixels;
+    GLint unpackSkipRows;
+    GLint unpackImageHeight;
+    GLint unpackSkipImages;
+};
+
 VkImage     backend_get_or_create_texture(GLuint name, int width, int height, int depth,
                                           int levels, GLenum internal_format, GLenum target,
                                           int samples);
 void        backend_texture_upload(GLuint name, int level, int x, int y, int z,
                                    int w, int h, int d, GLenum format, GLenum type,
-                                   const void* pixels, int unpack_alignment,
+                                   const void* pixels, const MGUnpackParams* unpack,
                                    int is_full_upload);
 void        backend_texture_set_params(GLuint name, GLint min_filter, GLint mag_filter,
                                        GLint wrap_s, GLint wrap_t, GLint wrap_r,
@@ -298,6 +315,10 @@ void        backend_texture_set_params(GLuint name, GLint min_filter, GLint mag_
 VkImageView backend_get_texture_view(GLuint name);
 VkImage     backend_get_texture_image(GLuint name);
 void        backend_delete_texture(GLuint name);
+/* Drop any VkSampler cached for `name`. Called from glTexParameter*i* when a
+ * texture's filtering/wrap state changes, so the next sampler fetch rebuilds a
+ * VkSampler reflecting the new params instead of returning the stale cached one. */
+void        backend_invalidate_sampler_cache(GLuint name);
 
 /*
  * Transition the named texture's image into `target_layout` if it is not
@@ -410,6 +431,7 @@ struct MGVertexAttrib {
     int     offset;       /* byte offset within the bound vertex buffer */
     int     enabled;      /* 0/1 */
     GLuint  buffer_name;  /* GL VBO name backing this attrib */
+    int     divisor;      /* instance-step divisor (0 = per-vertex) */
 };
 
 /*
