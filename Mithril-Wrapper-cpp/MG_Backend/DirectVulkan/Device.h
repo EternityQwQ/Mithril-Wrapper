@@ -115,12 +115,81 @@ struct Backend {
     // value seen by every draw within a single frame is constant.
     uint64_t frameGeneration = 0;
 
+    // FIX (GL sync correctness — glFenceSync / glClientWaitSync):
+    // glFenceSync must not report "already signaled" immediately, otherwise
+    // Sodium's persistent mapped-upload ring buffer overwrites a region the GPU
+    // is still reading (corrupt geometry / flicker). We stamp every GPU
+    // submission with a monotonic `frameSerial` and let a GL sync object record
+    // the serial at fence-creation time. glClientWaitSync then checks whether
+    // that serial's submission has actually completed (via the per-slot fence)
+    // before reporting success.
+    // FIX (serial 记账重写) —— 旧实现有四个会让 Sodium 撕裂或死锁的错误，
+    // 对照 MobileGL 上游 VulkanRenderer 的 GetSyncPointSubmitIndex() 思路重做：
+    //
+    //  (a) 旧的 refresh 里写 `lastCompletedSerial = frameSerial`。某个 slot 的
+    //      fence 完成时，它把"当前最大序号"整体判为已完成 —— 而那个最大序号
+    //      往往属于另一个仍在飞行的 slot。Sodium 据此认为 GPU 已读完，提前回收
+    //      持久映射 ring buffer 的区域并覆写 → 几何撕裂/闪烁。
+    //      改法：每个 slot 记住自己那次提交的序号(slotSerial)，fence 亮了只推进
+    //      到"所有仍 pending 的 slot 序号的最小值 - 1"，即严格已完成的水位线。
+    //
+    //  (b) 旧的 serialToFrame[serial & 63] 只有 64 槽，第 65 次提交就把旧映射
+    //      覆盖掉，之后查到的 slot 是错的 → 等错 fence。
+    //      改法：水位线模型不需要 serial→slot 反查表，直接扫描 pending slot。
+    //
+    //  (c) 一帧只 advance 一次，同帧内多个 glFenceSync 拿到同一序号，粒度退化。
+    //      改法：serial 由每次真实 vkQueueSubmit 递增（见 commit_frame）。
+    //
+    //  (d) 详见 Drawing.cpp：glClientWaitSync 忽略 GL_SYNC_FLUSH_COMMANDS_BIT，
+    //      未提交的工作永远等不到 → 死锁。
+    //
+    // 语义：serial N 表示"第 N 次 vkQueueSubmit"。completedSerial 是水位线，
+    // 保证 <= 它的所有提交都已在 GPU 上执行完毕。
+    uint64_t submitSerial = 0;                       // 已发出的提交总数（单调）
+    uint64_t slotSerial[kMaxFramesInFlight] = {};    // 各 slot 最后一次提交的序号
+    bool     serialPending[kMaxFramesInFlight] = {}; // 该 slot 是否仍在飞行
+    uint64_t completedSerial = 0;                    // 已确定完成的水位线
+
     // 默认 16 字节 zero buffer，用于着色器声明但 GL 未 enable 的 vertex attribute
     // binding。Pipeline.cpp 的 get_or_create_pipeline 为这些 location 提供 dummy
     // attribute description 指向此 buffer，让 SPIRV-Cross 为每个 stage_in 字段生成
     // [[attribute(N)]] 限定符，避免 Metal 编译报错。
     VkBuffer         dummyVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory   dummyVertexMemory = VK_NULL_HANDLE;
+
+    /* VK_EXT_primitive_topology_list_restart (root cause AS).
+     *
+     * Primitive restart on a LIST topology (points/lines/triangles) is only
+     * legal when this feature is enabled —
+     * VUID-VkPipelineInputAssemblyStateCreateInfo-topology-06252. Strip and
+     * fan topologies never need it.
+     *
+     * Without the check, a program that leaves GL_PRIMITIVE_RESTART enabled
+     * and then draws GL_TRIANGLES builds an illegal pipeline: creation fails,
+     * get_or_create_pipeline returns VK_NULL_HANDLE, and every such draw is
+     * dropped. MoltenVK does not currently expose this extension, so the
+     * flag is normally false and the restart bit has to be suppressed for
+     * list topologies. */
+    bool             listRestartSupported = false;
+
+    /* multiDrawIndirect core feature — lets one vkCmdDrawIndirect issue
+     * drawCount > 1. Without it the indirect path loops one draw at a time,
+     * which is correct but slower. */
+    bool             multiDrawIndirectSupported = false;
+
+    /* sampleRateShading core feature — required before a pipeline may set
+     * sampleShadingEnable (GL 4.0 ARB_sample_shading). */
+    bool             sampleRateShadingSupported = false;
+
+    /* VK_KHR_dynamic_rendering — 决定录制期走 vkCmdBeginRendering 还是传统
+     * VkRenderPass/VkFramebuffer。MoltenVK 1.2.x 之前不暴露该扩展，iOS 上
+     * 常见缺席，因此必须运行时判定，不能假定为真。 */
+    bool             dynamicRenderingSupported = false;
+
+    /* VK_EXT_extended_dynamic_state — 决定能否调用 vkCmdSetCullMode /
+     * SetFrontFace / SetDepthTestEnable 那一族。缺席时这些状态只能烘进
+     * 静态管线，管线 key 必须把它们算进去。 */
+    bool             extendedDynamicStateSupported = false;
 
     // GPU 故障状态。只有 VK_ERROR_DEVICE_LOST 才设置 deviceLost；
     // OOM 和其他错误不再设置 deviceLost（改为触发 OOM GC 后跳过当前帧）。
@@ -218,6 +287,18 @@ void drain_all_disposal_queues();
 //
 // 所有需要在 GC/drain 路径中调用 vkDeviceWaitIdle 的地方都应使用此函数。
 void safe_device_wait_idle();
+
+// ---- GL sync object backing (glFenceSync / glClientWaitSync) ----
+// Advance the per-submission serial. Called once per vkQueueSubmit in
+// commit_frame(). Records the current frame slot so a sync object stamped with
+// the returned serial can be completed exactly when that slot's fence signals.
+uint64_t backend_frame_serial_advance(int frameSlot);
+// Returns the highest serial whose GPU submission has definitely completed.
+uint64_t backend_last_completed_serial();
+// Block (or, with timeout==0, poll) until the submission bearing `serial` has
+// completed. Returns true if completed, false if still pending (timeout==0) or
+// the wait failed.
+bool     backend_wait_serial(uint64_t serial, uint64_t timeout_ns);
 
 // FIX (显存耗尽根因 - 主动式 GC，深度参考 MobileGL):
 //

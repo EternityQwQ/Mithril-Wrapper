@@ -95,7 +95,7 @@ VkResult try_allocate_memory_with_gc(VkDevice device, const VkMemoryAllocateInfo
 }
 
 bool create_buffer(BufferEntry& out, VkDeviceSize size,
-                   VkBufferUsageFlags usage, const void* data) {
+                   VkBufferUsageFlags usage, const void* data, bool persistent) {
     Backend* b = backend();
     VkBufferCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -134,10 +134,32 @@ bool create_buffer(BufferEntry& out, VkDeviceSize size,
         }
     }
     vkBindBufferMemory(b->device, out.buffer, out.memory, 0);
+    out.persistentlyMapped = false;
+    out.mapped = nullptr;
+    void* dst = nullptr;
     if (data) {
-        void* dst = nullptr;
-        vkMapMemory(b->device, out.memory, 0, size, 0, &dst);
-        if (dst) { std::memcpy(dst, data, (size_t)size); vkUnmapMemory(b->device, out.memory); }
+        // A persistent buffer is permanently mapped so the app can keep writing
+        // through the pointer (Sodium's chunk-upload ring buffer); a non-
+        // persistent buffer is uploaded then unmapped.
+        if (persistent) {
+            if (vkMapMemory(b->device, out.memory, 0, size, 0, &dst) == VK_SUCCESS && dst) {
+                std::memcpy(dst, data, (size_t)size);
+                out.mapped = dst;
+                out.persistentlyMapped = true;
+            }
+        } else {
+            if (vkMapMemory(b->device, out.memory, 0, size, 0, &dst) == VK_SUCCESS && dst) {
+                std::memcpy(dst, data, (size_t)size);
+                vkUnmapMemory(b->device, out.memory);
+            }
+        }
+    } else if (persistent) {
+        // glBufferStorage with a NULL data pointer + MAP_PERSISTENT: keep the
+        // mapping live so the app can write through glMapBufferRange later.
+        if (vkMapMemory(b->device, out.memory, 0, size, 0, &dst) == VK_SUCCESS) {
+            out.mapped = dst;
+            out.persistentlyMapped = true;
+        }
     }
     out.size = size;
     return true;
@@ -227,7 +249,7 @@ void defer_destroy_sampler_entry(SamplerEntry& e) {
 
 void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                           int w, int h, int d, const void* pixels,
-                          const MGUnpackParams& unpack, GLenum format, GLenum type,
+                          int unpack_alignment, GLenum format, GLenum type,
                           bool is_full_upload) {
     Backend* b = backend();
     if (!b->commandBuffer) return;
@@ -238,6 +260,7 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
     // vkCmdPipelineBarrier / vkCmdCopyBufferToImage calls below would record
     // into a non-recording buffer (spec UB).
     if (!ensure_command_buffer_recording()) return;
+    if (unpack_alignment <= 0) unpack_alignment = 4;  // GL default UNPACK_ALIGNMENT
 
     // Compute host-side bytes per pixel for this (format, type) pair and
     // honour GL_UNPACK_ALIGNMENT when computing the source row stride. The
@@ -284,23 +307,14 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
         }
     }
 
-    // Source stride calculation per GL UNPACK_* state.
-    // 对照 MobileGL VkTextureManager.cpp unpack path.
-    int alignment = unpack.alignment > 0 ? unpack.alignment : 4;  // GL default UNPACK_ALIGNMENT
+    size_t mask = (size_t)unpack_alignment - 1;
     // staging 装的是展开后的 RGBA 数据（紧密排列）；tight_row 按 dst_bpp 计算。
     // 源行 stride 按 src_bpp 计算并受 GL_UNPACK_ALIGNMENT 约束。
     // 非展开路径下 src_bpp == dst_bpp == bpp，行为与原实现完全一致。
-    size_t mask = (size_t)alignment - 1;
     size_t tight_row = (size_t)w * (size_t)dst_bpp;
-    int src_row_pixels = (unpack.rowLength > 0) ? unpack.rowLength : w;
-    size_t src_tight_row = (size_t)src_row_pixels * (size_t)src_bpp;
+    size_t src_tight_row = (size_t)w * (size_t)src_bpp;
     size_t src_stride = (src_tight_row + mask) & ~mask;
     size_t staging = tight_row * (size_t)h * (size_t)d;
-    size_t image_height_rows = (unpack.imageHeight > 0) ? (size_t)unpack.imageHeight : (size_t)h;
-    size_t image_stride = src_stride * image_height_rows;
-    size_t src_start = (size_t)unpack.skipPixels * (size_t)src_bpp
-                     + (size_t)unpack.skipRows * src_stride
-                     + (size_t)unpack.skipImages * image_stride;
 
     // ---- FIX (Invalid Resource 根因 - per-frame transient staging arena) ----
     // 深度参考 MobileGL 的 transient staging arena 模式：
@@ -406,9 +420,8 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                     alpha_bits = 0x000000FFu; break;
             }
             const int alpha_bytes = src_bpp / 3;  // 每分量字节数: 1/2/4
-            const char* img_ptr = (const char*)pixels + src_start;
+            const char* s8 = (const char*)pixels;
             for (int layer = 0; layer < d; ++layer) {
-                const char* s8 = img_ptr;
                 for (int row = 0; row < h; ++row) {
                     const char* src_row = s8;
                     for (int px = 0; px < w; ++px) {
@@ -420,25 +433,20 @@ void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                     }
                     s8 += src_stride;  // 源行按 GL_UNPACK_ALIGNMENT stride
                 }
-                img_ptr += image_stride;
             }
-        } else if (src_stride == tight_row && image_height_rows == (size_t)h) {
-            // Source rows are tightly packed and images are contiguous —
-            // single memcpy from the skip offset.
-            std::memcpy(dst, (const char*)pixels + src_start, staging);
+        } else if (src_stride == tight_row) {
+            // Source rows are already tightly packed — single memcpy.
+            std::memcpy(dst, pixels, staging);
         } else {
-            // Source rows carry GL_UNPACK_ALIGNMENT / GL_UNPACK_ROW_LENGTH
-            // padding, or images carry GL_UNPACK_IMAGE_HEIGHT padding; repack
-            // to tight so VkBufferImageCopy.bufferRowLength == 0 (== w) is valid.
-            const char* img_ptr = (const char*)pixels + src_start;
+            // Source rows carry GL_UNPACK_ALIGNMENT padding; repack to tight
+            // so VkBufferImageCopy.bufferRowLength == 0 (== w) is valid.
+            const char* s8 = (const char*)pixels;
             for (int layer = 0; layer < d; ++layer) {
-                const char* s8 = img_ptr;
                 for (int row = 0; row < h; ++row) {
                     std::memcpy(dst, s8, tight_row);
                     dst += tight_row;
                     s8 += src_stride;
                 }
-                img_ptr += image_stride;
             }
         }
     }
@@ -672,6 +680,152 @@ static VkSamplerAddressMode to_vk_wrap(GLenum w) {
     }
 }
 
+// ===========================================================================
+// FIX (P0-1 / P0-3): 运行时格式能力回退
+//
+// FormatMap.cpp 是纯查表层（不碰 VkDevice，可单测），它把
+// GL_DEPTH_COMPONENT24 / GL_DEPTH24_STENCIL8 一律映射为
+// VK_FORMAT_D24_UNORM_S8_UINT。这在 Apple 平台上是错的：
+//
+//   Metal 的 MTLPixelFormatDepth24Unorm_Stencil8 在**所有 iOS/tvOS 设备上
+//   都不可用**，在 Apple Silicon Mac 上同样不可用（只有部分 Intel Mac 的
+//   独显支持）。MoltenVK 因此不为 D24_UNORM_S8_UINT 报告
+//   DEPTH_STENCIL_ATTACHMENT_BIT。
+//
+// 后果：vkCreateImage 失败 → 深度附件为 VK_NULL_HANDLE → 深度测试整体失效
+// 或 renderpass/pipeline 创建失败 → 黑屏。这是 iOS 上最典型的一类死法。
+//
+// 修复：按上游 MobileGL FindSupportedDepthStencilFormat
+// (SwapchainObject.cpp:60-71) 的思路做候选链探测，但比上游更细 ——
+// 上游只处理 swapchain 的那一个深度格式，我们要处理用户通过
+// glTexImage2D / glRenderbufferStorage 传进来的**任意**深度格式，
+// 所以按「是否需要 stencil」分成两条候选链，避免把纯深度请求
+// 升级成 depth-stencil（那会浪费显存并改变 aspectMask）。
+//
+// 结果按 VkFormat 缓存，避免每次建纹理都调
+// vkGetPhysicalDeviceFormatProperties。
+// ===========================================================================
+VkFormat resolve_supported_format(VkFormat requested, VkFormatFeatureFlags requiredFeatures) {
+    if (requested == VK_FORMAT_UNDEFINED) return VK_FORMAT_UNDEFINED;
+
+    // 缓存 key 要含 requiredFeatures：同一格式在「要求可采样」和
+    // 「要求可作深度附件」两种场景下的回退结果可能不同。
+    struct CacheKey {
+        VkFormat fmt;
+        VkFormatFeatureFlags feats;
+        bool operator==(const CacheKey& o) const { return fmt == o.fmt && feats == o.feats; }
+    };
+    struct CacheHash {
+        size_t operator()(const CacheKey& k) const {
+            return (size_t)k.fmt * 1315423911u ^ (size_t)k.feats;
+        }
+    };
+    static std::unordered_map<CacheKey, VkFormat, CacheHash> cache;
+
+    CacheKey key{requested, requiredFeatures};
+    auto cit = cache.find(key);
+    if (cit != cache.end()) return cit->second;
+
+    Backend* b = backend();
+    if (!b || b->physicalDevice == VK_NULL_HANDLE) return requested;
+
+    auto supports = [&](VkFormat f) -> bool {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(b->physicalDevice, f, &p);
+        return (p.optimalTilingFeatures & requiredFeatures) == requiredFeatures;
+    };
+
+    if (supports(requested)) {
+        cache[key] = requested;
+        return requested;
+    }
+
+    // ---- 候选链 ----
+    // 原则：宁可提高精度/多一个 stencil，也不要降级到无法承载语义的格式。
+    // 纯深度请求优先保持纯深度（省显存、aspectMask 不变），实在不行才
+    // 退到 depth-stencil 组合格式。
+    static const VkFormat kDepthStencilChain[] = {
+        VK_FORMAT_D24_UNORM_S8_UINT,   // 桌面 GL 原生语义，Intel Mac 独显可用
+        VK_FORMAT_D32_SFLOAT_S8_UINT,  // Apple 平台的实际主力（精度更高）
+        VK_FORMAT_D16_UNORM_S8_UINT,   // 极少见，兜底
+    };
+    static const VkFormat kDepthOnlyChain[] = {
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_X8_D24_UNORM_PACK32,
+        VK_FORMAT_D16_UNORM,
+        // 纯深度全不可用时，才允许升级成带 stencil 的组合格式。
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+        VK_FORMAT_D24_UNORM_S8_UINT,
+    };
+    static const VkFormat kStencilChain[] = {
+        VK_FORMAT_S8_UINT,
+        VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D32_SFLOAT_S8_UINT,
+    };
+
+    const VkFormat* chain = nullptr;
+    size_t chainLen = 0;
+
+    switch (requested) {
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+            chain = kDepthStencilChain; chainLen = 3; break;
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+            chain = kDepthOnlyChain; chainLen = 5; break;
+        case VK_FORMAT_S8_UINT:
+            chain = kStencilChain; chainLen = 3; break;
+        default:
+            break;
+    }
+
+    VkFormat chosen = VK_FORMAT_UNDEFINED;
+    for (size_t i = 0; i < chainLen; ++i) {
+        if (chain[i] != requested && supports(chain[i])) { chosen = chain[i]; break; }
+    }
+
+    if (chosen == VK_FORMAT_UNDEFINED) {
+        // 非深度格式（例如 BC 压缩纹理在 iOS 上不可用）没有通用替代品。
+        // 返回 UNDEFINED 让调用方决定：纹理路径会退回 RGBA8，
+        // 附件路径会放弃该 usage bit，都比 vkCreateImage 硬失败好。
+        static std::unordered_set<uint32_t> warned;
+        if (warned.insert((uint32_t)requested).second) {
+            MITHRIL_LOG_WARN("vk", "resolve_supported_format: VkFormat %d 不被设备支持"
+                             "（需要 feature 位 0x%x），且无可用替代格式",
+                             (int)requested, (unsigned)requiredFeatures);
+        }
+        cache[key] = VK_FORMAT_UNDEFINED;
+        return VK_FORMAT_UNDEFINED;
+    }
+
+    static std::unordered_set<uint64_t> warnedSub;
+    uint64_t wk = ((uint64_t)requested << 32) | (uint32_t)chosen;
+    if (warnedSub.insert(wk).second) {
+        MITHRIL_LOG_INFO("vk", "深度/模板格式回退：VkFormat %d 不受支持，改用 %d"
+                         "（Apple GPU 普遍不支持 D24_UNORM_S8_UINT，属预期行为）",
+                         (int)requested, (int)chosen);
+    }
+    cache[key] = chosen;
+    return chosen;
+}
+
+bool format_is_depth_stencil(VkFormat fmt) {
+    switch (fmt) {
+        case VK_FORMAT_D16_UNORM:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_S8_UINT:
+        case VK_FORMAT_D16_UNORM_S8_UINT:
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
 } // namespace vk
 } // namespace mithril
 
@@ -706,12 +860,54 @@ VkBuffer backend_get_or_create_buffer(GLuint name, const void* data, size_t size
     // Buffer 不存在或容量不足：orphan 旧的，创建新的
     if (it != tbl.end()) mithril::vk::defer_destroy_buffer_entry(it->second);
     mithril::vk::BufferEntry e;
+    /* GL buffer objects are untyped — the same name can be bound to
+     * GL_ARRAY_BUFFER today and GL_SHADER_STORAGE_BUFFER tomorrow, and GL
+     * never tells us in advance. Vulkan wants every intended use declared at
+     * creation, so every usage GL could possibly ask for goes on here.
+     *
+     * FIX (root cause AT): STORAGE_BUFFER and INDIRECT_BUFFER were missing.
+     * Without INDIRECT_BUFFER the indirect draw path added in the previous
+     * pass violates VUID-vkCmdDrawIndirect-buffer-02709 the moment it is
+     * used; without STORAGE_BUFFER an SSBO binding is illegal the same way.
+     * Both are spec violations that a validation layer rejects outright and
+     * MoltenVK may turn into a dropped draw. */
     if (!mithril::vk::create_buffer(e, size,
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            data)) {
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            data, false)) {
         return VK_NULL_HANDLE;
     }
+    tbl[name] = e;
+    return e.buffer;
+}
+
+/*
+ * Immutable, possibly persistently-mapped storage (GL_ARB_buffer_storage).
+ * Mirrors backend_get_or_create_buffer but keeps the host mapping live when
+ * `persistent` is set, so the app can write through the pointer returned by
+ * glMapBufferRange without re-mapping each frame. Backing memory is always
+ * HOST_VISIBLE | HOST_COHERENT, so a persistent+coherent buffer needs no flush.
+ */
+VkBuffer backend_create_buffer_storage(GLuint name, VkDeviceSize size,
+                                       VkBufferUsageFlags extra_usage,
+                                       bool persistent, bool coherent) {
+    mithril::vk::Backend* b = mithril::vk::backend();
+    if (!b->initialized || name == 0 || size == 0) return VK_NULL_HANDLE;
+    auto& tbl = mithril::vk::buffer_table();
+    auto it = tbl.find(name);
+    if (it != tbl.end()) mithril::vk::defer_destroy_buffer_entry(it->second);
+    mithril::vk::BufferEntry e;
+    VkBufferUsageFlags usage =
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT | extra_usage;
+    if (!mithril::vk::create_buffer(e, size, usage, nullptr, persistent)) {
+        return VK_NULL_HANDLE;
+    }
+    (void)coherent;  // HOST_COHERENT is always requested by create_buffer
     tbl[name] = e;
     return e.buffer;
 }
@@ -733,6 +929,13 @@ VkBuffer backend_get_buffer(GLuint name) {
     return it == tbl.end() ? VK_NULL_HANDLE : it->second.buffer;
 }
 
+void* backend_get_buffer_mapped_pointer(GLuint name) {
+    auto& tbl = mithril::vk::buffer_table();
+    auto it = tbl.find(name);
+    if (it == tbl.end()) return nullptr;
+    return it->second.persistentlyMapped ? it->second.mapped : nullptr;
+}
+
 void backend_delete_buffer(GLuint name) {
     auto& tbl = mithril::vk::buffer_table();
     auto it = tbl.find(name);
@@ -750,6 +953,35 @@ VkBuffer backend_get_zero_buffer(void) {
         backend_get_or_create_buffer(zero_name, zeros, sizeof(zeros));
     }
     return backend_get_buffer(zero_name);
+}
+
+/*
+ * Generic vertex attribute values (root cause AQ).
+ *
+ * One buffer holding kMaxVertexAttribs vec4 slots, so a disabled attribute
+ * array can be bound to `buffer + index * 16` with stride 0 and read back the
+ * constant the application set with glVertexAttrib*().
+ *
+ * This replaces binding the shared ZERO buffer to unenabled slots. That gave
+ * every disabled attribute (0,0,0,0), but GL's documented default is
+ * (0,0,0,1): a shader reading a disabled colour array is supposed to see
+ * opaque black, and with alpha 0 it instead rendered nothing at all.
+ */
+static const GLuint kGenericAttribBufferName = 0x40000001u;
+
+VkBuffer backend_get_generic_attrib_buffer(void) {
+    return backend_get_buffer(kGenericAttribBufferName);
+}
+
+void backend_update_generic_attribs(const float* values, int count) {
+    if (!values || count <= 0) return;
+    const size_t bytes = (size_t)count * 4 * sizeof(float);
+    VkBuffer existing = backend_get_buffer(kGenericAttribBufferName);
+    if (existing == VK_NULL_HANDLE) {
+        backend_get_or_create_buffer(kGenericAttribBufferName, values, bytes);
+        return;
+    }
+    backend_buffer_upload(kGenericAttribBufferName, 0, values, bytes);
 }
 
 VkImage backend_get_or_create_texture(GLuint name, int width, int height, int depth,
@@ -771,6 +1003,35 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
         }
         fmt = VK_FORMAT_R8G8B8A8_UNORM;
     }
+
+    // FIX (P0-1): 查表得到的是「理想格式」，必须再过一遍设备能力。
+    // 深度格式尤其关键 —— Apple GPU 不支持 D24_UNORM_S8_UINT，
+    // 不回退就是 vkCreateImage 失败 → 无深度附件 → 黑屏。
+    {
+        const bool isDepth = mithril::vk::format_is_depth_stencil(fmt);
+        // 深度纹理必须能当深度附件；颜色纹理至少要能被采样（MC 的纹理
+        // 归根到底都是拿来采样的，采样不了就没有意义）。
+        const VkFormatFeatureFlags need =
+            isDepth ? VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
+                    : VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        VkFormat resolved = mithril::vk::resolve_supported_format(fmt, need);
+        if (resolved == VK_FORMAT_UNDEFINED) {
+            // 无替代格式。压缩格式（BC1/2/3 在 iOS 上全不可用）会走到这里。
+            // 退回 RGBA8：画面会丢失压缩纹理的内容，但至少资源能建出来、
+            // 管线不会整条失败。真正的解法是在上层把 BCn 转码成 ASTC，
+            // 那属于纹理转码器的范畴，不在本函数职责内。
+            static std::unordered_set<uint32_t> warnedNoAlt;
+            if (warnedNoAlt.insert((uint32_t)fmt).second) {
+                MITHRIL_LOG_WARN("vk", "internalFormat 0x%x → VkFormat %d 在本设备"
+                                 "完全不受支持且无替代（iOS 无 BC 压缩纹理支持），"
+                                 "退回 RGBA8", internal_format, (int)fmt);
+            }
+            fmt = VK_FORMAT_R8G8B8A8_UNORM;
+        } else {
+            fmt = resolved;
+        }
+    }
+
     auto& tbl = mithril::vk::texture_table();
     auto it = tbl.find(name);
     // FIX (Root Cause AI - glTexImage2D mipmap uses base level dimensions):
@@ -814,12 +1075,49 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
     // 对所有颜色纹理无条件添加此 bit（Vulkan 允许设置未使用的 usage bit，无副作用），
     // 对标 MobileGL VulkanRenderer::CreateTexture 的纹理创建策略。
     // 注意：仅对颜色格式添加；depth/stencil 格式由下方 if 分支单独处理。
-    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-              | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    // Depth/stencil attachments also need to be renderable.
-    if (fmt == VK_FORMAT_D16_UNORM || fmt == VK_FORMAT_D32_SFLOAT ||
-        fmt == VK_FORMAT_D24_UNORM_S8_UINT || fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+    //
+    // FIX (GL 4.2 ARB_shader_image_load_store / GL 4.3 compute):
+    // Iris/Sodium 的 compute 路径会用 glBindImageTexture 把普通 GL 纹理绑定为
+    // storage image。Vulkan 要求该图像创建时带 VK_IMAGE_USAGE_STORAGE_BIT。
+    // 但不能无条件加：压缩格式(BCn)、sRGB、部分 depth 格式不支持 STORAGE，
+    // 无条件添加会让 vkCreateImage 直接失败 → 纹理全丢 → 比黑屏更糟。
+    // 因此按 vkGetPhysicalDeviceFormatProperties 的 optimalTilingFeatures 逐位裁剪。
+    // COLOR_ATTACHMENT_BIT 同理（BC7 之类不可作为颜色附件）。
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(b->physicalDevice, fmt, &fp);
+    const VkFormatFeatureFlags feats = fp.optimalTilingFeatures;
+
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (feats & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+        ici.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)
+        ici.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (feats & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
         ici.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)
+        ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    // FIX (P0-3): feats == 0 的含义被搞反了。
+    //
+    // 原注释写的是「驱动没报告任何 feature（不该发生）」，于是兜底强行加上
+    // SAMPLED | COLOR_ATTACHMENT。但 optimalTilingFeatures == 0 在 Vulkan 里
+    // 有明确语义：**该格式在 optimal tiling 下完全不被支持**。这恰恰是 iOS 上
+    // BC1/BC2/BC3 压缩格式的正常返回值（Apple GPU 只支持 ASTC/ETC/PVRTC）。
+    //
+    // 把「不支持」当成「信息缺失」并强行加 COLOR_ATTACHMENT_BIT，会让
+    // vkCreateImage 直接失败（VUID-VkImageCreateInfo-usage）→ 纹理创建返回
+    // VK_NULL_HANDLE → 后续采样拿到空句柄。比不加 bit 糟糕得多。
+    //
+    // 正确做法：feats == 0 时只保留 TRANSFER 位（传输对任何格式都合法），
+    // 让 vkCreateImage 有机会成功；能不能采样由上面的 resolve_supported_format
+    // 决定 —— 走到这里说明它已经判定过该格式可用，或已回退成 RGBA8。
+    if (feats == 0) {
+        static std::unordered_set<uint32_t> warnedZeroFeat;
+        if (warnedZeroFeat.insert((uint32_t)fmt).second) {
+            MITHRIL_LOG_WARN("vk", "VkFormat %d 的 optimalTilingFeatures 为 0"
+                             "（该格式在本设备不受支持，iOS 上 BC 压缩格式属正常情况）；"
+                             "仅保留 TRANSFER usage", (int)fmt);
+        }
+        ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     }
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -869,13 +1167,13 @@ VkImage backend_get_or_create_texture(GLuint name, int width, int height, int de
 
 void backend_texture_upload(GLuint name, int level, int x, int y, int z,
                             int w, int h, int d, GLenum format, GLenum type,
-                            const void* pixels, const struct MGUnpackParams* unpack,
+                            const void* pixels, int unpack_alignment,
                             int is_full_upload) {
     auto& tbl = mithril::vk::texture_table();
     auto it = tbl.find(name);
-    if (it == tbl.end() || !pixels || !unpack) return;
+    if (it == tbl.end() || !pixels) return;
     mithril::vk::stage_and_copy_image(it->second, level, x, y, z, w, h, d,
-                                      pixels, *unpack, format, type,
+                                      pixels, unpack_alignment, format, type,
                                       is_full_upload != 0);
 }
 
@@ -956,26 +1254,6 @@ VkSampler backend_get_or_create_sampler(GLuint name, GLint min_filter, GLint mag
     if (vkCreateSampler(b->device, &sci, nullptr, &e.sampler) != VK_SUCCESS) return VK_NULL_HANDLE;
     tbl[name] = e;
     return e.sampler;
-}
-
-// Invalidate the cached VkSampler for `name`. Destroys the Vulkan sampler
-// (deferred via disposal queue) and removes the entry from sampler_table().
-// The next backend_get_or_create_sampler call creates a fresh sampler.
-// Vulkan samplers are immutable; param changes require recreation.
-// 对照 MobileGL VkSamplerManager.
-void backend_invalidate_sampler_cache(GLuint name) {
-    mithril::vk::Backend* b = mithril::vk::backend();
-    if (!b->initialized) return;
-    auto& tbl = mithril::vk::sampler_table();
-    auto it = tbl.find(name);
-    if (it == tbl.end()) return;
-    if (it->second.sampler != VK_NULL_HANDLE) {
-        // Deferred destruction: push to disposal queue.
-        mithril::vk::DeferredDestroy d;
-        d.sampler = it->second.sampler;
-        b->disposalQueue[b->currentFrame].push_back(d);
-    }
-    tbl.erase(it);
 }
 
 VkFormat backend_vk_format_for_gl(GLenum internal_format) {

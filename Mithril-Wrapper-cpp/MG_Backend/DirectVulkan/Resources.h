@@ -19,6 +19,10 @@ struct BufferEntry {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize   size = 0;
     void*          mapped = nullptr;   // host pointer if host-visible (persistently mapped)
+    // True when the buffer was created with a permanent map (glBufferStorage +
+    // MAP_PERSISTENT). In that case `mapped` is valid for the buffer's whole
+    // lifetime and glMapBufferRange returns a slice of it directly.
+    bool           persistentlyMapped = false;
 };
 
 struct TextureEntry {
@@ -113,6 +117,26 @@ void transition_image_layout(TextureEntry& tex, VkImageLayout newLayout);
 
 // gl_internal_to_vk / host_texel_bytes / aspect_for_format live in FormatMap.h
 // (pure-logic helpers extracted for unit testing).
+
+// FIX (P0-1): 把 FormatMap 给出的「理想」VkFormat 换成本设备真正支持的格式。
+//
+// FormatMap.cpp 是纯查表层，不能查询 VkPhysicalDevice，因此它对
+// GL_DEPTH_COMPONENT24 / GL_DEPTH24_STENCIL8 一律返回
+// VK_FORMAT_D24_UNORM_S8_UINT —— 而 Apple GPU（所有 iOS 设备 + Apple
+// Silicon Mac）都不支持该格式，直接用会让 vkCreateImage 失败 → 深度附件
+// 缺失 → 黑屏。
+//
+// 本函数按候选链探测 optimalTilingFeatures，返回第一个满足
+// requiredFeatures 的格式；深度/模板语义会被保留（纯深度不会被无谓地
+// 升级成 depth-stencil）。找不到任何替代时返回 VK_FORMAT_UNDEFINED，
+// 由调用方决定降级策略。结果内部缓存，调用开销可忽略。
+//
+// 对照上游 MobileGL FindSupportedDepthStencilFormat
+// (SwapchainObject.cpp:60-71)，但覆盖任意用户格式而非仅 swapchain 深度。
+VkFormat resolve_supported_format(VkFormat requested, VkFormatFeatureFlags requiredFeatures);
+
+// 该 VkFormat 是否属于 depth / stencil / depth-stencil 家族。
+bool format_is_depth_stencil(VkFormat fmt);
 
 } // namespace vk
 } // namespace mithril

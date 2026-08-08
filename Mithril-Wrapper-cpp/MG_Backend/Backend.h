@@ -72,6 +72,27 @@ void backend_set_load_load(void);
 void backend_clear_attachments(GLbitfield mask, int x, int y, int w, int h);
 
 /*
+ * Clear ONE attachment with an explicit value — the backing call for
+ * glClearBuffer{fv,iv,uiv,fi} (root cause AP).
+ *
+ * backend_clear_attachments always clears every colour attachment with the
+ * context-wide glClearColor. That is right for glClear(), but glClearBuffer*
+ * names a single draw buffer and carries its own value, which is how a
+ * deferred renderer wipes just its normal or velocity target between passes.
+ *
+ *   buffer     : GL_COLOR | GL_DEPTH | GL_STENCIL | GL_DEPTH_STENCIL
+ *   drawbuffer : colour attachment index for GL_COLOR, otherwise ignored
+ *   color      : RGBA, used only for GL_COLOR (NULL -> zeros)
+ *   depth      : caller must already have clamped this to [0,1]
+ *                (VUID-VkClearDepthStencilValue-depth-00022)
+ *
+ * No-op unless a render pass is active, matching backend_clear_attachments.
+ */
+void backend_clear_buffer_indexed(GLenum buffer, GLint drawbuffer,
+                                  const float color[4], float depth,
+                                  GLuint stencil);
+
+/*
  * Begin a dynamic-rendering pass against the given attachments.
  *   color_views : array of VkImageView (VK_NULL_HANDLE entries allowed)
  *   color_count : number of color attachments
@@ -207,35 +228,69 @@ void backend_draw_indexed_instanced(int primitive, int count, int index_type,
                                     VkBuffer index_buffer, VkDeviceSize index_offset,
                                     int primcount);
 
+/*
+ * Indirect draws (GL 4.0 ARB_draw_indirect).
+ *
+ * Draw parameters are read from a GPU buffer rather than passed in. GL's
+ * parameter blocks are bit-identical to VkDrawIndirectCommand /
+ * VkDrawIndexedIndirectCommand, so the buffer contents pass through
+ * untranslated.
+ *
+ *   stride == 0 means tightly packed (16 / 20 bytes respectively).
+ *   draw_count > 1 uses multiDrawIndirect where available and loops otherwise.
+ */
+void backend_draw_indirect(int primitive, VkBuffer indirect_buffer,
+                           VkDeviceSize indirect_offset,
+                           int draw_count, int stride);
+void backend_draw_indexed_indirect(int primitive, int index_type,
+                                   VkBuffer index_buffer, VkDeviceSize index_offset,
+                                   VkBuffer indirect_buffer,
+                                   VkDeviceSize indirect_offset,
+                                   int draw_count, int stride);
+
 /* ---- Buffers ---- */
 VkBuffer backend_get_or_create_buffer(GLuint name, const void* data, size_t size);
+/* GL_ARB_buffer_storage — immutable storage, optionally persistently & coherently
+ * mapped. `persistent` keeps the host pointer live for the buffer's lifetime so
+ * glMapBufferRange can return a direct slice of it. `extra_usage` adds Vulkan
+ * usage bits beyond the default set (e.g. for indirect/SSBO already included). */
+VkBuffer backend_create_buffer_storage(GLuint name, VkDeviceSize size,
+                                       VkBufferUsageFlags extra_usage,
+                                       bool persistent, bool coherent);
 void     backend_buffer_upload(GLuint name, GLintptr offset, const void* data, size_t size);
+/* Return the live host pointer of a persistently-mapped buffer (glBufferStorage
+ * + MAP_PERSISTENT), or NULL if the buffer is not persistently mapped. */
+void*    backend_get_buffer_mapped_pointer(GLuint name);
 VkBuffer backend_get_buffer(GLuint name);
 void     backend_delete_buffer(GLuint name);
 
 /* Shared 16-byte zero-filled buffer for unbound vertex attribute slots. */
 VkBuffer backend_get_zero_buffer(void);
 
+/*
+ * Generic vertex attribute values (root cause AQ).
+ *
+ * A single buffer of N vec4 slots backing the constants a shader reads when a
+ * vertex array is DISABLED. Bind slot `i` at offset `i * 16` with stride 0.
+ *
+ * Needed because the zero buffer above hands out (0,0,0,0) while GL specifies
+ * (0,0,0,1) — with alpha 0 a disabled colour array makes geometry vanish
+ * under blending instead of drawing opaque black — and because
+ * glVertexAttrib*() is allowed to change these constants at any time.
+ *
+ * `values` is `count` consecutive vec4s. Returns VK_NULL_HANDLE before the
+ * first update.
+ */
+void     backend_update_generic_attribs(const float* values, int count);
+VkBuffer backend_get_generic_attrib_buffer(void);
+
 /* ---- Textures ---- */
 VkImage     backend_get_or_create_texture(GLuint name, int width, int height, int depth,
                                           int levels, GLenum internal_format, GLenum target,
                                           int samples);
-/* ---- Pixel unpack parameters ----
- * Mirrors the GL UNPACK_* pixel-store state used by glTexImage2D/3D and
- * glTexSubImage2D/3D to compute the source row stride and start offset.
- * Passed through backend_texture_upload to stage_and_copy_image.
- */
-struct MGUnpackParams {
-    int alignment;     /* GL_UNPACK_ALIGNMENT (1/2/4/8) */
-    int rowLength;     /* GL_UNPACK_ROW_LENGTH (0 = use width) */
-    int skipPixels;    /* GL_UNPACK_SKIP_PIXELS */
-    int skipRows;      /* GL_UNPACK_SKIP_ROWS */
-    int imageHeight;   /* GL_UNPACK_IMAGE_HEIGHT (3D; 0 = use height) */
-    int skipImages;    /* GL_UNPACK_SKIP_IMAGES (3D) */
-};
 void        backend_texture_upload(GLuint name, int level, int x, int y, int z,
                                    int w, int h, int d, GLenum format, GLenum type,
-                                   const void* pixels, const struct MGUnpackParams* unpack,
+                                   const void* pixels, int unpack_alignment,
                                    int is_full_upload);
 void        backend_texture_set_params(GLuint name, GLint min_filter, GLint mag_filter,
                                        GLint wrap_s, GLint wrap_t, GLint wrap_r,
@@ -334,12 +389,6 @@ VkSampler backend_get_or_create_sampler(GLuint name, GLint min_filter, GLint mag
                                         GLint wrap_s, GLint wrap_t, GLint wrap_r,
                                         const float* border_color);
 
-/* Invalidate (destroy + remove) the cached VkSampler for the given GL name.
- * Called by glTexParameter* when min/mag/wrap params change. Vulkan samplers
- * are immutable; param changes require recreation.
- * 对照 MobileGL VkSamplerManager. */
-void backend_invalidate_sampler_cache(GLuint name);
-
 /* ---- Format helpers ----
  * Map a GL internal format to the matching VkFormat. Returns VK_FORMAT_UNDEFINED
  * when the format is unsupported. Used by the drawing path to describe pipeline
@@ -361,7 +410,6 @@ struct MGVertexAttrib {
     int     offset;       /* byte offset within the bound vertex buffer */
     int     enabled;      /* 0/1 */
     GLuint  buffer_name;  /* GL VBO name backing this attrib */
-    GLuint  divisor;      /* GL instancing divisor (glVertexAttribDivisor); 0 = per-vertex */
 };
 
 /*
@@ -394,9 +442,65 @@ VkPipeline backend_get_or_create_pipeline(GLuint program,
                                           GLenum gl_primitive_mode,
                                           int is_default_fbo);
 
+/*
+ * Compute counterpart of backend_get_or_create_pipeline. Takes only the
+ * program name: a compute pipeline has no vertex format, no attachments and
+ * no blend state, so there is nothing to key a cache on and nothing for the
+ * caller to supply. The SPIR-V is read from the linked Program.
+ * Returns VK_NULL_HANDLE if the program is not a linked compute program or
+ * pipeline creation fails.
+ */
+VkPipeline backend_get_or_create_compute_pipeline(GLuint program);
+
+/*
+ * Record a compute dispatch on the current command buffer. Ends the active
+ * render pass first (Vulkan forbids vkCmdDispatch inside a render pass),
+ * binds the current program's compute pipeline + descriptor set, then
+ * vkCmdDispatch(groups_x, groups_y, groups_z). No-op if no compute program
+ * is current. Backs glDispatchCompute.
+ */
+void backend_dispatch_compute(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
+
+/*
+ * Indirect form (backs glDispatchComputeIndirect). Identical setup to
+ * backend_dispatch_compute, but the group counts are fetched by the GPU from
+ * `buffer` at `offset` — a {x,y,z} uint32 triple, bit-identical to
+ * VkDispatchIndirectCommand, so nothing needs repacking. The buffer comes
+ * from the GL_DISPATCH_INDIRECT_BUFFER binding.
+ */
+void backend_dispatch_compute_indirect(VkBuffer buffer, VkDeviceSize offset);
+
+/*
+ * Record a global execution/memory barrier (backs glMemoryBarrier). GL states
+ * the ordering guarantee in terms of the barrier bits; Vulkan needs explicit
+ * src/dst access masks, so the bits are widened to a conservative
+ * ALL_COMMANDS -> ALL_COMMANDS VkMemoryBarrier. Ends the active render pass
+ * first. `barriers` is the GL bitfield (GL_SHADER_STORAGE_BARRIER_BIT etc.).
+ */
+void backend_memory_barrier(GLbitfield barriers);
+
 /* Release all Vulkan resources owned by a program (shader modules + pipelines +
  * descriptor set layout / pipeline layout / descriptor pool). */
 void backend_delete_program_resources(GLuint program);
+
+/*
+ * GL sync-object backing (glFenceSync / glClientWaitSync). Implemented in
+ * MG_Backend/DirectVulkan/Device.cpp. Every GPU submission is stamped with a
+ * monotonic serial; a sync object records the serial at fence-creation time and
+ * glClientWaitSync blocks on the owning frame slot's VkFence until that
+ * submission has actually completed. This lets a persistent mapped-buffer ring
+ * (Sodium's chunk uploads) wait for the GPU before recycling a region it may
+ * still be reading.
+ */
+/* 已确定完成的水位线：所有序号 <= 返回值的提交都已在 GPU 上执行完毕。 */
+uint64_t backend_last_completed_serial(void);
+/* 已发出的 vkQueueSubmit 总数。glFenceSync 用 `本值 + 1` 记录"我要等下一次
+ * 提交"，因为 fence 之前的命令还在尚未提交的命令缓冲里。 */
+uint64_t backend_current_submit_serial(void);
+/* 等待某序号完成。timeout_ns == 0 为非阻塞探测，UINT64_MAX 为无限等待。
+ * 注意：若该序号尚未提交，本函数【不会阻塞】而是直接返回 false —— 没有任何
+ * fence 会为一次还没发生的提交亮起。调用方需自行决定是否先 backend_commit()。 */
+bool     backend_wait_serial(uint64_t serial, uint64_t timeout_ns);
 
 /*
  * Reflect the vertex + fragment SPIR-V of `program` (via SPIRV-Cross), merge
@@ -467,6 +571,45 @@ VkImage     backend_swapchain_current_color_image(void* swapchain_state);
 VkFormat    backend_swapchain_color_format(void* swapchain_state);
 VkImage     backend_swapchain_current_depth_image(void* swapchain_state);
 VkFormat    backend_swapchain_depth_format(void* swapchain_state);
+
+/*
+ * FIX (P1 - GL 上限硬编码):
+ * 查询真实的 VkPhysicalDeviceLimits，供 glGetIntegerv 汇报 GL_MAX_* 使用。
+ *
+ * 之前 Getter.cpp 把 GL_MAX_TEXTURE_SIZE 写死成 16384，而 A9/A10 这类老
+ * iOS GPU 的上限只有 8192（由 Metal 2 的 GPUFamily 决定）。上报一个设备做
+ * 不到的值，Sodium/Iris 会照着分配超大纹理或阴影贴图 → vkCreateImage 失败
+ * → 纹理丢失甚至崩溃。宁可少报，绝不能多报。
+ *
+ * 同理 GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS 之前写死 80，却和内部的
+ * kMaxTextureUnits=32 自相矛盾 —— 上层按 80 个单位绑定，后端数组只有 32
+ * 个槽位，越界部分被静默丢弃。
+ *
+ * `which` 取下面的 MITHRIL_LIMIT_* 常量。后端未初始化或该项无对应 Vulkan
+ * 上限时返回 fallback，调用方因此不需要额外判空。
+ */
+#define MITHRIL_LIMIT_MAX_TEXTURE_SIZE            1
+#define MITHRIL_LIMIT_MAX_3D_TEXTURE_SIZE         2
+#define MITHRIL_LIMIT_MAX_CUBE_MAP_TEXTURE_SIZE   3
+#define MITHRIL_LIMIT_MAX_ARRAY_TEXTURE_LAYERS    4
+#define MITHRIL_LIMIT_MAX_RENDERBUFFER_SIZE       5
+#define MITHRIL_LIMIT_MAX_VIEWPORT_WIDTH          6
+#define MITHRIL_LIMIT_MAX_VIEWPORT_HEIGHT         7
+#define MITHRIL_LIMIT_MAX_TEXTURE_IMAGE_UNITS     8   /* per-stage sampled images */
+#define MITHRIL_LIMIT_MAX_COMBINED_TEX_UNITS      9
+#define MITHRIL_LIMIT_MAX_UNIFORM_BLOCK_SIZE      10
+#define MITHRIL_LIMIT_UNIFORM_BUFFER_ALIGNMENT    11
+#define MITHRIL_LIMIT_MAX_UNIFORM_BUFFER_BINDINGS 12
+#define MITHRIL_LIMIT_MAX_COLOR_ATTACHMENTS       13
+#define MITHRIL_LIMIT_MAX_SAMPLES                 14
+#define MITHRIL_LIMIT_MAX_VERTEX_ATTRIBS          15
+#define MITHRIL_LIMIT_MAX_SSBO_BINDINGS           16
+#define MITHRIL_LIMIT_MAX_SSBO_SIZE               17
+#define MITHRIL_LIMIT_MAX_COMPUTE_WG_INVOCATIONS  18
+#define MITHRIL_LIMIT_MAX_COMPUTE_WG_COUNT_X      19
+#define MITHRIL_LIMIT_MAX_COMPUTE_WG_SIZE_X       20
+
+int backend_device_limit(int which, int fallback);
 
 #ifdef __cplusplus
 }

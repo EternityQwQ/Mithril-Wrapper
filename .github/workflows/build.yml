@@ -2,7 +2,14 @@ name: Build Mithril-Wrapper for iOS
 
 on:
   push:
-    branches: [main]
+    # main 之外，同时监听 fix/** 与 feat/** 特性分支。
+    # 之前只监听 main，意味着任何特性分支推上来都不会构建 —— 而 iOS 构建
+    # 恰恰是本项目唯一能验证 MoltenVK/Metal 链接期问题的手段，等合进 main
+    # 才发现编译不过就太晚了。
+    branches:
+      - main
+      - 'fix/**'
+      - 'feat/**'
   pull_request:
     branches: [main]
   workflow_dispatch:

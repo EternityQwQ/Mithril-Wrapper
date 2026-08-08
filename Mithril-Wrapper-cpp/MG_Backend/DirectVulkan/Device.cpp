@@ -20,9 +20,12 @@
 #include "Resources.h"
 #include "CommandStream.h"  // end_render_pass, ensure_command_buffer_recording, render_pass_active
 #include "Pipeline.h"  // clear_all_pipeline_caches() for deviceLost recovery
+#include "UniformArena.h"  // ubo_arena_shutdown() — transient UBO arena teardown
+#include "../../MG_State/State.h"  // kMaxTextureUnits 等容量常量（backend_device_limit 用来夹紧上报值）
 #include "../../MG_Impl/Log.h"
 
 #include <cstring>
+#include <ctime>
 #include <cstdlib>
 #include <vector>
 
@@ -601,13 +604,57 @@ bool init_device() {
     }
     // VK_KHR_dynamic_rendering: lets us create pipelines + record render passes
     // without a VkRenderPass object (simpler than managing compat render passes).
-    if (has_extension(devExtProps, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) {
+    //
+    // 注意这是**硬依赖**，不是可选优化。整个 CommandStream.cpp 只有
+    // vkCmdBeginRendering 一条录制路径，没有传统 VkRenderPass/VkFramebuffer
+    // 的退路。我们请求的是 Vulkan 1.2，而 dynamic_rendering 要到 1.3 才进核心，
+    // 所以在 1.2 上它必须以扩展形式存在。
+    //
+    // 缺席时 vkGetDeviceProcAddr("vkCmdBeginRendering") 返回 nullptr，
+    // CommandStream.cpp:826 的 `if (fn)` 会安静地跳过 —— pass 被标记成
+    // active，draw 照常录制，但没有任何附件被绑定，最终什么都画不出来。
+    // 那是最难排查的一类故障：没有报错、没有验证层警告，只有一块黑屏。
+    //
+    // 与其那样，不如在这里直接失败并说清原因。MoltenVK 从 1.1.0 起支持该
+    // 扩展（对应 iOS 14+ / macOS 11+），低于此版本的环境本来也跑不动 MC。
+    const bool hasDynamicRendering =
+        has_extension(devExtProps, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    if (hasDynamicRendering) {
         devExts.push_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
+    } else {
+        MITHRIL_LOG_ERROR("vk",
+            "设备不支持 VK_KHR_dynamic_rendering（%s，Vulkan %u.%u.%u）。"
+            "本渲染器的命令录制完全依赖该扩展，且当前请求的是 Vulkan 1.2"
+            "（dynamic_rendering 要到 1.3 才进核心），没有 VkRenderPass 退路。"
+            "请升级 MoltenVK 到 1.1.0 或更高版本（iOS 14+ / macOS 11+）。",
+            b->props.deviceName,
+            VK_VERSION_MAJOR(b->props.apiVersion),
+            VK_VERSION_MINOR(b->props.apiVersion),
+            VK_VERSION_PATCH(b->props.apiVersion));
+        return false;
     }
     // VK_EXT_extended_dynamic_state: vkCmdSetCullMode/FrontFace/DepthTestEnable/
     // DepthWriteEnable/DepthCompareOp etc. without rebuilding pipelines.
-    if (has_extension(devExtProps, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)) {
+    //
+    // 同样是硬依赖。CommandStream.cpp 的 backend_set_cull_mode /
+    // set_front_face / set_depth_test 是**直接调用** vkCmdSetCullMode 那一族，
+    // 而不是通过 vkGetDeviceProcAddr 取指针后判空。在 Vulkan 1.2 上这些符号
+    // 由 loader 解析：扩展没启用时它们是空指针，直接调用 = 段错误崩溃，
+    // 比黑屏还糟。而且 Pipeline.cpp:633 已经把 cullMode 设成 NONE 并声明为
+    // 动态状态，管线里根本没有静态的剔除配置可回退。
+    //
+    // MoltenVK 从 1.1.0 起支持，与 dynamic_rendering 的门槛一致。
+    const bool hasExtDynState =
+        has_extension(devExtProps, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    if (hasExtDynState) {
         devExts.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+    } else {
+        MITHRIL_LOG_ERROR("vk",
+            "设备不支持 VK_EXT_extended_dynamic_state（%s）。"
+            "剔除模式/正面朝向/深度测试全部通过 vkCmdSet* 动态下发，"
+            "缺少该扩展会导致直接调用空函数指针而崩溃。"
+            "请升级 MoltenVK 到 1.1.0 或更高版本。", b->props.deviceName);
+        return false;
     }
     // FIX (root cause AE - GL_UNSIGNED_BYTE 索引支持):
     // VK_EXT_index_type_uint8 提供 VK_INDEX_TYPE_UINT8，让 GL_UNSIGNED_BYTE
@@ -639,6 +686,21 @@ bool init_device() {
     // creation that carries VkPipelineRenderingCreateInfo and rejects the
     // dynamic-state vkCmdSet* calls. (MoltenVK is lenient but the spec
     // requires the features to be enabled.)
+    /* FIX (P0 —— 设备创建失败，整个渲染器起不来):
+     *
+     * 这两个 feature 结构体原先是**无条件**挂进 pNext 且写死 VK_TRUE 的，
+     * 而上面对应的两个扩展却是 has_extension() 条件启用。二者不一致：
+     * 一旦设备不暴露 VK_KHR_dynamic_rendering 或 VK_EXT_extended_dynamic_state
+     * （MoltenVK 1.1.x 及更早、iOS 13/14 时代的设备就是这样），扩展没进
+     * devExts，但请求该 feature 的结构体仍在链上 → vkCreateDevice 按规范返回
+     * VK_ERROR_FEATURE_NOT_PRESENT → init_device 直接 return false → 起不来。
+     *
+     * 同文件里 index_type_uint8、list_restart 以及那 24 个核心 feature 全都
+     * 正确做了 gate，唯独最关键的这两个破了例。
+     *
+     * 改法：只有扩展确实可用时才把对应 feature 结构体链进去。链头从固定的
+     * dynRenderFeat 改为动态的 featureChainHead，两个结构体都可能缺席。
+     */
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT extDynStateFeat{};
     extDynStateFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
     extDynStateFeat.extendedDynamicState = VK_TRUE;
@@ -646,12 +708,22 @@ bool init_device() {
     VkPhysicalDeviceDynamicRenderingFeaturesKHR dynRenderFeat{};
     dynRenderFeat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
     dynRenderFeat.dynamicRendering = VK_TRUE;
-    dynRenderFeat.pNext = &extDynStateFeat;
 
-    // Track the tail of the feature pNext chain so additional feature structs
-    // (portability-subset, index_type_uint8, primitive_topology_list_restart)
-    // can be appended in any order without hardcoding the previous link.
-    VkBaseOutStructure* chainTail = (VkBaseOutStructure*)&extDynStateFeat;
+    void*                featureChainHead = nullptr;
+    VkBaseOutStructure*  chainTail        = nullptr;
+    auto append_feature = [&](void* s) {
+        VkBaseOutStructure* n = (VkBaseOutStructure*)s;
+        n->pNext = nullptr;
+        if (!featureChainHead) { featureChainHead = s; chainTail = n; }
+        else                   { chainTail->pNext = n; chainTail = n; }
+    };
+    if (hasDynamicRendering) append_feature(&dynRenderFeat);
+    if (hasExtDynState)      append_feature(&extDynStateFeat);
+
+    // 记录下来供录制期分支使用：没有扩展就不能调 vkCmdSetCullMode 那一族，
+    // 也不能用 vkCmdBeginRendering，必须走静态管线状态 / 传统 RenderPass。
+    b->dynamicRenderingSupported   = hasDynamicRendering;
+    b->extendedDynamicStateSupported = hasExtDynState;
 
     // FIX (root cause Q): When VK_KHR_portability_subset is enabled (it is, on
     // MoltenVK — Device.cpp:197-199), the Vulkan spec REQUIRES
@@ -677,8 +749,11 @@ bool init_device() {
         // Chain portability-subset at the END of the feature chain
         // (after extended-dynamic-state). The order does not matter for
         // correctness; we just need all feature structs in the pNext chain.
-        chainTail->pNext = (VkBaseOutStructure*)&portSubsetFeat;
-        chainTail = (VkBaseOutStructure*)&portSubsetFeat;
+        //
+        // FIX: 必须走 append_feature，不能直接写 chainTail->pNext。
+        // dynamic_rendering / extended_dynamic_state 现在是条件链入的，
+        // 两者都缺席时 chainTail == nullptr，直接解引用就是空指针崩溃。
+        append_feature(&portSubsetFeat);
     }
 
     // FIX (root cause AE - GL_UNSIGNED_BYTE 索引支持):
@@ -690,8 +765,7 @@ bool init_device() {
     indexTypeUint8Feat.indexTypeUint8 = VK_TRUE;
     indexTypeUint8Feat.pNext = nullptr;
     if (has_extension(devExtProps, VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME)) {
-        chainTail->pNext = (VkBaseOutStructure*)&indexTypeUint8Feat;
-        chainTail = (VkBaseOutStructure*)&indexTypeUint8Feat;
+        append_feature(&indexTypeUint8Feat);
     }
 
     // FIX (root cause AF - Primitive Restart):
@@ -704,8 +778,19 @@ bool init_device() {
     primTopoListRestartFeat.primitiveTopologyListRestart = VK_TRUE;
     primTopoListRestartFeat.pNext = nullptr;
     if (has_extension(devExtProps, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
-        chainTail->pNext = (VkBaseOutStructure*)&primTopoListRestartFeat;
-        chainTail = (VkBaseOutStructure*)&primTopoListRestartFeat;
+        append_feature(&primTopoListRestartFeat);
+        b->listRestartSupported = true;
+    } else {
+        // FIX (root cause AS): remember that we do NOT have it. Pipeline.cpp
+        // must then suppress primitiveRestartEnable on list topologies —
+        // VUID-VkPipelineInputAssemblyStateCreateInfo-topology-06252 makes
+        // that combination illegal, and an illegal pipeline is not created at
+        // all, so every affected draw silently disappears. MoltenVK does not
+        // currently expose this extension, making this the normal path.
+        b->listRestartSupported = false;
+        MITHRIL_LOG_INFO("vk",
+                         "VK_EXT_primitive_topology_list_restart unavailable; "
+                         "primitive restart will be suppressed on list topologies");
     }
 
     // ---- Core VkPhysicalDeviceFeatures ----
@@ -745,10 +830,23 @@ bool init_device() {
     enabled.multiViewport                 = supported.multiViewport;
     enabled.imageCubeArray                = supported.imageCubeArray;
     enabled.alphaToOne                    = supported.alphaToOne;
+    // GL 4.0 ARB_sample_shading: required before a pipeline may set
+    // sampleShadingEnable. Without it, glMinSampleShading would build an
+    // illegal pipeline rather than a slower one.
+    enabled.sampleRateShading             = supported.sampleRateShading;
+    // Remember whether one vkCmdDrawIndirect may issue drawCount > 1; the
+    // indirect draw path falls back to a loop when it may not.
+    b->multiDrawIndirectSupported = supported.multiDrawIndirect == VK_TRUE;
+    b->sampleRateShadingSupported = supported.sampleRateShading == VK_TRUE;
 
     VkDeviceCreateInfo devCI{};
     devCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    devCI.pNext = &dynRenderFeat;
+    // FIX (P0-2): 链头必须是动态构建的 featureChainHead，而不是写死的
+    // dynRenderFeat。dynamic_rendering 扩展在老 MoltenVK / iOS 上可能缺席，
+    // 此时把它的 feature 结构体强行链入会让 vkCreateDevice 直接返回
+    // VK_ERROR_FEATURE_NOT_PRESENT，整个设备创建失败 → 渲染器起不来。
+    // featureChainHead 可能为 nullptr（所有可选 feature 都缺席），这是合法的。
+    devCI.pNext = featureChainHead;
     devCI.queueCreateInfoCount = 1;
     devCI.pQueueCreateInfos = &queueCI;
     devCI.enabledExtensionCount = (uint32_t)devExts.size();
@@ -908,6 +1006,98 @@ bool init_device() {
     return true;
 }
 
+// ---- GL sync object backing (glFenceSync / glClientWaitSync) ----
+
+// 单调时钟（纳秒）。用于在多个 fence 上串行等待时收敛剩余超时，
+// 避免"每个 fence 各等 timeout"导致总等待时间成倍放大。
+static uint64_t now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+// 重算已完成水位线。
+//
+// 水位线 = (所有仍在飞行的 slot 的序号中的最小值) - 1；若没有任何 slot 在飞行，
+// 则等于已发出的最大序号 submitSerial。
+//
+// 这样才是"严格已完成"：只要还有一个更早的提交没回来，就不能把更晚的序号判为
+// 完成。旧实现正是在这里出错（见 Device.h 的 FIX 注释 (a)）。
+static void refresh_completed_serials() {
+    Backend* b = backend();
+    if (!b->initialized) return;
+
+    // 先轮询每个 pending slot 的 fence（非阻塞）。
+    for (int s = 0; s < kMaxFramesInFlight; ++s) {
+        if (!b->serialPending[s]) continue;
+        if (vkGetFenceStatus(b->device, b->frameFences[s]) == VK_SUCCESS) {
+            b->serialPending[s] = false;
+        }
+    }
+
+    // 再取仍在飞行的最小序号，算出水位线。
+    uint64_t oldestInFlight = UINT64_MAX;
+    for (int s = 0; s < kMaxFramesInFlight; ++s) {
+        if (b->serialPending[s] && b->slotSerial[s] < oldestInFlight) {
+            oldestInFlight = b->slotSerial[s];
+        }
+    }
+    const uint64_t watermark = (oldestInFlight == UINT64_MAX)
+                             ? b->submitSerial          // 全部回收完
+                             : oldestInFlight - 1;      // 最早未完成的前一个
+    if (watermark > b->completedSerial) b->completedSerial = watermark;
+}
+
+// 每次真实 vkQueueSubmit 后调用：领取一个新序号并挂到该 slot 上。
+uint64_t backend_frame_serial_advance(int frameSlot) {
+    Backend* b = backend();
+    const uint64_t s = ++b->submitSerial;
+    if (frameSlot >= 0 && frameSlot < kMaxFramesInFlight) {
+        b->slotSerial[frameSlot]   = s;
+        b->serialPending[frameSlot] = true;
+    }
+    return s;
+}
+
+uint64_t backend_last_completed_serial() {
+    refresh_completed_serials();
+    return backend()->completedSerial;
+}
+
+// 已发出的提交总数。glFenceSync 用它判断"我这个 fence 要等的是哪一次提交"。
+uint64_t backend_current_submit_serial() {
+    return backend()->submitSerial;
+}
+
+bool backend_wait_serial(uint64_t serial, uint64_t timeout_ns) {
+    Backend* b = backend();
+    if (!b->initialized) return true;
+    refresh_completed_serials();
+    if (serial <= b->completedSerial) return true;
+
+    // 该序号尚未提交（fence 建在一次提交之前，而那次提交还没发生）。
+    // 这里不能阻塞 —— 没有任何 fence 会为它亮起。返回未完成，由调用方
+    // (glClientWaitSync) 依据 GL_SYNC_FLUSH_COMMANDS_BIT 决定是否先 flush。
+    if (serial > b->submitSerial) return false;
+
+    // 等待所有序号 <= serial 且仍在飞行的 slot。可能不止一个。
+    // 逐个 vkWaitForFences，并按剩余时间收敛 timeout，避免总时长翻倍。
+    uint64_t remaining = timeout_ns;
+    for (int s = 0; s < kMaxFramesInFlight; ++s) {
+        if (!b->serialPending[s] || b->slotSerial[s] > serial) continue;
+        const uint64_t t0 = now_ns();
+        VkResult r = vkWaitForFences(b->device, 1, &b->frameFences[s], VK_TRUE, remaining);
+        if (r != VK_SUCCESS) return false;   // VK_TIMEOUT / device lost
+        b->serialPending[s] = false;
+        if (remaining != UINT64_MAX) {
+            const uint64_t spent = now_ns() - t0;
+            remaining = (spent >= remaining) ? 0 : (remaining - spent);
+        }
+    }
+    refresh_completed_serials();
+    return serial <= b->completedSerial;
+}
+
 void shutdown_device() {
     Backend* b = backend();
     if (!b->initialized) return;
@@ -935,6 +1125,11 @@ void shutdown_device() {
         b->frameStagingOffset[i] = 0;
     }
     b->frameStagingReady = false;
+    // Destroy the per-frame transient UNIFORM arena. Must run before
+    // vkDestroyDevice (it unmaps/frees VkDeviceMemory and destroys VkBuffers
+    // through b->device) and is safe here because of the vkDeviceWaitIdle at
+    // the top of this function.
+    ubo_arena_shutdown();
     if (b->device) { vkDestroyDevice(b->device, nullptr); b->device = VK_NULL_HANDLE; }
     if (b->instance) { vkDestroyInstance(b->instance, nullptr); b->instance = VK_NULL_HANDLE; }
     b->initialized = false;
@@ -979,6 +1174,82 @@ uint64_t backend_vram_bytes(void) {
         }
     }
     return total;
+}
+
+// FIX (P1): 用真实的 VkPhysicalDeviceLimits 回答 GL_MAX_*，不再硬编码。
+// 详见 Backend.h 中 MITHRIL_LIMIT_* 的说明。
+int backend_device_limit(int which, int fallback) {
+    mithril::vk::Backend* b = mithril::vk::backend();
+    if (!b || !b->initialized) return fallback;
+    const VkPhysicalDeviceLimits& L = b->props.limits;
+
+    // Vulkan 的上限是 uint32_t，GL 侧是 GLint。某些实现会把「无限制」报成
+    // 0xFFFFFFFF，直接转 int 会变成 -1，Sodium 拿到负的 GL_MAX_* 会算出
+    // 负的数组大小。统一夹到 INT32_MAX。
+    auto clamp_i = [](uint32_t v) -> int {
+        return v > (uint32_t)0x7FFFFFFF ? 0x7FFFFFFF : (int)v;
+    };
+
+    switch (which) {
+        case MITHRIL_LIMIT_MAX_TEXTURE_SIZE:          return clamp_i(L.maxImageDimension2D);
+        case MITHRIL_LIMIT_MAX_3D_TEXTURE_SIZE:       return clamp_i(L.maxImageDimension3D);
+        case MITHRIL_LIMIT_MAX_CUBE_MAP_TEXTURE_SIZE: return clamp_i(L.maxImageDimensionCube);
+        case MITHRIL_LIMIT_MAX_ARRAY_TEXTURE_LAYERS:  return clamp_i(L.maxImageArrayLayers);
+        case MITHRIL_LIMIT_MAX_RENDERBUFFER_SIZE:     return clamp_i(L.maxFramebufferWidth < L.maxFramebufferHeight
+                                                                     ? L.maxFramebufferWidth : L.maxFramebufferHeight);
+        case MITHRIL_LIMIT_MAX_VIEWPORT_WIDTH:        return clamp_i(L.maxViewportDimensions[0]);
+        case MITHRIL_LIMIT_MAX_VIEWPORT_HEIGHT:       return clamp_i(L.maxViewportDimensions[1]);
+
+        // 每级着色器可见的采样器数量。必须同时受内部 kMaxTextureUnits 数组
+        // 容量约束 —— 报得比数组大，超出的绑定会被静默丢弃。
+        case MITHRIL_LIMIT_MAX_TEXTURE_IMAGE_UNITS: {
+            int v = clamp_i(L.maxPerStageDescriptorSampledImages);
+            return v < mithril::kMaxTextureUnits ? v : mithril::kMaxTextureUnits;
+        }
+        case MITHRIL_LIMIT_MAX_COMBINED_TEX_UNITS: {
+            int v = clamp_i(L.maxDescriptorSetSampledImages);
+            return v < mithril::kMaxTextureUnits ? v : mithril::kMaxTextureUnits;
+        }
+
+        case MITHRIL_LIMIT_MAX_UNIFORM_BLOCK_SIZE:    return clamp_i(L.maxUniformBufferRange);
+        case MITHRIL_LIMIT_UNIFORM_BUFFER_ALIGNMENT:
+            return clamp_i((uint32_t)L.minUniformBufferOffsetAlignment);
+        case MITHRIL_LIMIT_MAX_UNIFORM_BUFFER_BINDINGS: {
+            int v = clamp_i(L.maxDescriptorSetUniformBuffers);
+            return v < mithril::kMaxIndexedBindings ? v : mithril::kMaxIndexedBindings;
+        }
+        case MITHRIL_LIMIT_MAX_COLOR_ATTACHMENTS: {
+            int v = clamp_i(L.maxColorAttachments);
+            return v < mithril::kMaxColorAttachments ? v : mithril::kMaxColorAttachments;
+        }
+
+        // GL_MAX_SAMPLES：取 color+depth 都支持的最高 sample count。
+        // 只看 framebufferColorSampleCounts 会在 depth 不支持 4x 时上报过高。
+        case MITHRIL_LIMIT_MAX_SAMPLES: {
+            VkSampleCountFlags f = L.framebufferColorSampleCounts
+                                 & L.framebufferDepthSampleCounts;
+            if (f & VK_SAMPLE_COUNT_16_BIT) return 16;
+            if (f & VK_SAMPLE_COUNT_8_BIT)  return 8;
+            if (f & VK_SAMPLE_COUNT_4_BIT)  return 4;
+            if (f & VK_SAMPLE_COUNT_2_BIT)  return 2;
+            return 1;
+        }
+
+        case MITHRIL_LIMIT_MAX_VERTEX_ATTRIBS: {
+            int v = clamp_i(L.maxVertexInputAttributes);
+            return v < mithril::kMaxVertexAttribs ? v : mithril::kMaxVertexAttribs;
+        }
+        case MITHRIL_LIMIT_MAX_SSBO_BINDINGS: {
+            int v = clamp_i(L.maxDescriptorSetStorageBuffers);
+            return v < mithril::kMaxIndexedBindings ? v : mithril::kMaxIndexedBindings;
+        }
+        case MITHRIL_LIMIT_MAX_SSBO_SIZE:             return clamp_i(L.maxStorageBufferRange);
+        case MITHRIL_LIMIT_MAX_COMPUTE_WG_INVOCATIONS:
+            return clamp_i(L.maxComputeWorkGroupInvocations);
+        case MITHRIL_LIMIT_MAX_COMPUTE_WG_COUNT_X:    return clamp_i(L.maxComputeWorkGroupCount[0]);
+        case MITHRIL_LIMIT_MAX_COMPUTE_WG_SIZE_X:     return clamp_i(L.maxComputeWorkGroupSize[0]);
+        default:                                      return fallback;
+    }
 }
 
 } // extern "C"

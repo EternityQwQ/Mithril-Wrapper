@@ -120,8 +120,31 @@ VkFormat attrib_type_to_vk_format(GLenum type, int size, bool normalized, bool i
         case GL_FLOAT:          switch (size) { case 1: return VK_FORMAT_R32_SFLOAT;   case 2: return VK_FORMAT_R32G32_SFLOAT;   case 3: return VK_FORMAT_R32G32B32_SFLOAT;   case 4: return VK_FORMAT_R32G32B32A32_SFLOAT; }
         // FIX (根因 V): Half3 不存在于 MTLVertexFormat → 用 Half4
         case GL_HALF_FLOAT:     switch (size) { case 1: return VK_FORMAT_R16_SFLOAT;   case 2: return VK_FORMAT_R16G16_SFLOAT;   case 3: return VK_FORMAT_R16G16B16A16_SFLOAT;   case 4: return VK_FORMAT_R16G16B16A16_SFLOAT; }
-        // GL_DOUBLE：不动
-        case GL_DOUBLE:         switch (size) { case 1: return VK_FORMAT_R64_SFLOAT;   case 2: return VK_FORMAT_R64G64_SFLOAT;  case 3: return VK_FORMAT_R64G64B64_SFLOAT;  case 4: return VK_FORMAT_R64G64B64A64_SFLOAT; }
+        // ---- 已知限制 (P1)：GL_DOUBLE 顶点属性在 Apple 平台无法真正支持 ----
+        //
+        // Metal **完全没有** 64 位顶点格式：MTLVertexFormat 里没有 Double，
+        // MSL 也不支持 double 类型。MoltenVK 无法映射 VK_FORMAT_R64*_SFLOAT，
+        // vkCreateGraphicsPipelines 会失败 → 用到该属性的 draw 全部消失。
+        //
+        // 单纯把枚举换成 R32 是**错的**：缓冲区里每个分量占 8 字节，按 4 字节
+        // 去取只会读到 double 的低半边，得到彻底的垃圾几何。要正确支持必须在
+        // CPU 侧（或用 compute shader）把整条顶点流 double→float 重打包 ——
+        // 这正是上游 MobileGL RepackVertexStream (VulkanRenderer.cpp:602-666)
+        // 做的事，而本项目目前没有顶点流重打包基础设施。
+        //
+        // 现状判断：Minecraft / Sodium / Iris 的顶点格式只用 float / byte /
+        // short / packed-2101010，从不使用 GL_DOUBLE 属性，因此这条路径在
+        // 目标工作负载下不会被触发。保留 R64 映射（而不是伪装成 R32）是刻意
+        // 选择：让它在管线创建时明确失败并留下日志，好过静默渲染出垃圾。
+        //
+        // TODO: 若将来要支持使用 double 属性的通用 GL 应用，需要先实现顶点流
+        // 重打包，再把这里改成 R32 并在重打包层做转换。
+        case GL_DOUBLE:
+            MITHRIL_LOG_WARN("vk", "顶点属性使用 GL_DOUBLE（size=%d）——Metal 无 64 位"
+                             "顶点格式，该管线将创建失败。需要顶点流重打包才能支持。",
+                             size);
+            switch (size) { case 1: return VK_FORMAT_R64_SFLOAT;   case 2: return VK_FORMAT_R64G64_SFLOAT;  case 3: return VK_FORMAT_R64G64B64_SFLOAT;  case 4: return VK_FORMAT_R64G64B64A64_SFLOAT; }
+            break;
         case GL_UNSIGNED_BYTE:
             // FIX (根因 V): UChar3 normalized/unnormalized 均不存在 → 用 UChar4
             if (normalized) switch (size) { case 1: return VK_FORMAT_R8_UNORM;  case 2: return VK_FORMAT_R8G8_UNORM;  case 3: return VK_FORMAT_R8G8B8A8_UNORM;  case 4: return VK_FORMAT_R8G8B8A8_UNORM; }
@@ -138,10 +161,23 @@ VkFormat attrib_type_to_vk_format(GLenum type, int size, bool normalized, bool i
             // FIX (根因 V): Short3 normalized/unnormalized 均不存在 → 用 Short4
             if (normalized) switch (size) { case 1: return VK_FORMAT_R16_SNORM; case 2: return VK_FORMAT_R16G16_SNORM; case 3: return VK_FORMAT_R16G16B16A16_SNORM; case 4: return VK_FORMAT_R16G16B16A16_SNORM; }
             else            switch (size) { case 1: return VK_FORMAT_R16_SINT;  case 2: return VK_FORMAT_R16G16_SINT;  case 3: return VK_FORMAT_R16G16B16A16_SINT;  case 4: return VK_FORMAT_R16G16B16A16_SINT; }
-        // 打包格式 A2B10G10R10 本身是 4 分量，无需转换
+        // 打包格式 A2B10G10R10 本身是 4 分量，无需转换。
+        //
+        // FIX (根因 AM — 打包法线符号丢失):
+        // GL_INT_2_10_10_10_REV 的三个 10-bit 分量是 *有符号补码*，
+        // GL_UNSIGNED_INT_2_10_10_10_REV 才是无符号。旧代码把两者一律映射到
+        // UNORM/UINT，等于把补码位模式当无符号读：
+        //
+        //   法线 (0,-1,0) 打包后按 SNORM 应解出 (0,-1.000,0)，
+        //   按 UNORM 解出 (0,+0.501,0)  —— 符号翻转
+        //   法线 (0,+1,0) 应为 +1.000，UNORM 下只有 +0.500 —— 亮度减半
+        //
+        // Sodium 正是用 GL_INT_2_10_10_10_REV 存方块/实体法线，5 个基准方向里
+        // 4 个会翻转：方块底面被当作顶面照亮，向光面反而变黑。
+        // 详见 verify/packed_norm.c 的逐位验证。
         case GL_INT_2_10_10_10_REV:
-            if (normalized) return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-            return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+            if (normalized) return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+            return VK_FORMAT_A2B10G10R10_SINT_PACK32;
         case GL_UNSIGNED_INT_2_10_10_10_REV:
             if (normalized) return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
             return VK_FORMAT_A2B10G10R10_UINT_PACK32;
@@ -162,16 +198,6 @@ VkCompareOp gl_compare_to_vk(GLenum f) {
         case GL_GEQUAL:   return VK_COMPARE_OP_GREATER_OR_EQUAL;
         case GL_ALWAYS:   return VK_COMPARE_OP_ALWAYS;
         default:          return VK_COMPARE_OP_LESS;
-    }
-}
-
-// GL polygon mode to Vulkan polygon mode. 对照 MobileGL 动态状态.
-VkPolygonMode gl_polygon_to_vk(GLenum mode) {
-    switch (mode) {
-        case GL_LINE:   return VK_POLYGON_MODE_LINE;
-        case GL_POINT:  return VK_POLYGON_MODE_POINT;
-        case GL_FILL:
-        default:        return VK_POLYGON_MODE_FILL;
     }
 }
 
@@ -202,6 +228,34 @@ bool format_supports_color_attachment_blend(VkFormat fmt) {
     return ok;
 }
 
+/* ---- 实例化步进率（GL 4.3 两层顶点模型）----
+ *
+ * GL 的 divisor 挂在「顶点数据源」这一层上：glVertexAttribDivisor 和
+ * glVertexBindingDivisor 写的都是 VertexBinding::divisor（见 MG_State/State.h）。
+ * Vulkan 的对应物是 VkVertexInputBindingDescription::inputRate，同样是 per
+ * binding —— 两者严格对得上。
+ *
+ * 之前这里是 `bd.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;` 硬编码，divisor 被
+ * 整个丢掉。后果不是画得略有偏差，而是实例化属性按顶点步进：本该每个实例读一
+ * 次的数据变成每个顶点读一次，几何直接崩。Sodium 的实例化区块路径和 Iris 的粒
+ * 子都踩这条。
+ *
+ * 为什么直接读 g_state 而不是从 MGVertexAttrib 拿：MGVertexAttrib 里没有
+ * divisor 字段，而 MG_Backend/Backend.h 是跨组共享的 C ABI，本次不动它。
+ * primitiveRestart（root cause AF）已经用同样的方式直读 g_state，此处沿用，
+ * 并且 hash_signature 与下面建管线的代码调用同一个函数，缓存键不会漏。
+ */
+uint32_t attrib_divisor(int location) {
+    if (!mithril::g_state) return 0;
+    if (location < 0 || location >= mithril::kMaxVertexAttribs) return 0;
+    mithril::VertexArray* vao = mithril::state_get_vao(mithril::g_state->currentVAO);
+    if (!vao) vao = mithril::state_get_vao(0);
+    if (!vao) return 0;
+    const GLuint bi = vao->attribs[location].bindingIndex;
+    if (bi >= (GLuint)mithril::kMaxVertexBindings) return 0;
+    return (uint32_t)vao->bindings[bi].divisor;
+}
+
 // FNV-1a 64-bit hash over the pipeline signature.
 uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attrib_count,
                         const VkFormat* color_formats, int color_count,
@@ -229,7 +283,11 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
         // 必须参与缓存键哈希。否则不同 offset 的 VAO 复用同一管线 → 属性从错误
         // 字节偏移读取 → 顶点数据错位 → 红屏/花屏。
         mix(&attribs[i].offset, sizeof(attribs[i].offset));
-        mix(&attribs[i].divisor, sizeof(attribs[i].divisor));
+        // divisor 决定 inputRate，同样被烘焙进管线，必须进缓存键 —— 否则
+        // 同一份格式在实例化与非实例化之间切换会复用旧管线（与 root cause L
+        // 的 offset 同理）。
+        const uint32_t div = attrib_divisor(attribs[i].location);
+        mix(&div, sizeof(div));
     }
     mix(&color_count, sizeof(color_count));
     for (int i = 0; i < color_count; ++i) mix(&color_formats[i], sizeof(color_formats[i]));
@@ -381,17 +439,45 @@ VkPipeline get_or_create_pipeline(GLuint program,
     // ---- Vertex input state ----
     std::vector<VkVertexInputBindingDescription> bindDescs;
     std::vector<VkVertexInputAttributeDescription> attrDescs;
-    // Group attributes by their backing buffer name (one binding per VBO).
-    // Simplified: one binding per attribute (binding index == location).
+    /* 一个属性一个 binding（binding 号 == location）。
+     *
+     * 这是 GL 两层模型的一种退化投影，不是 bug：GL 允许多个属性共用一个
+     * binding，投影到这里就是多个 Vulkan binding 绑同一个 VkBuffer、各自用
+     * VkVertexInputAttributeDescription::offset 定位成员。kMaxVertexAttribs 是
+     * 16，永远不会超过 maxVertexInputBindings，所以功能上是等价的。
+     *
+     * 之所以没改成「按 binding 分组」的真两层：分组的收益要靠 binding offset
+     * 才能兑现（把 glBindVertexBuffer 的 offset 交给 pOffsets，而不是加进属性
+     * offset），而 Drawing.cpp 目前恒传 offset 0（root cause H 的修法），
+     * MGVertexAttrib 也没有字段把「binding 基址」和「成员内偏移」这两个数分开
+     * 送过来。拆开需要动 MG_Backend/Backend.h 的 C ABI，那是跨组共享的。
+     * 详见交付说明里的遗留项。
+     */
     for (int i = 0; i < attrib_count; ++i) {
         const MGVertexAttrib& a = attribs[i];
         if (!a.enabled) continue;
         VkVertexInputBindingDescription bd{};
         bd.binding = (uint32_t)a.location;
         bd.stride = a.stride > 0 ? (uint32_t)a.stride : 0;
-        // GL instancing: divisor > 0 means per-instance advancement.
-        // 对照 MobileGL 顶点绑定按 divisor 分组.
-        bd.inputRate = (a.divisor > 0) ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+
+        /* divisor > 0 = 按实例步进。divisor > 1 需要
+         * VK_EXT_vertex_attribute_divisor，Device.cpp 目前没启用，只能按 1 处
+         * 理并报警 —— 静默画错比慢一点糟糕得多。实测 Sodium / Iris 用的都是
+         * divisor == 1，走的是下面这条无需扩展的路径。 */
+        const uint32_t divisor = attrib_divisor(a.location);
+        bd.inputRate = divisor ? VK_VERTEX_INPUT_RATE_INSTANCE
+                               : VK_VERTEX_INPUT_RATE_VERTEX;
+        if (divisor > 1) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                MITHRIL_LOG_WARN("vk",
+                    "vertex attrib %d has divisor %u; VK_EXT_vertex_attribute_divisor "
+                    "is not enabled, treating it as 1 (instance data will repeat "
+                    "every instance instead of every %u)",
+                    a.location, divisor, divisor);
+            }
+        }
         bindDescs.push_back(bd);
 
         VkVertexInputAttributeDescription ad{};
@@ -399,6 +485,40 @@ VkPipeline get_or_create_pipeline(GLuint program,
         ad.binding = (uint32_t)a.location;
         ad.format = attrib_type_to_vk_format(a.type, a.size, a.normalized != 0, a.integer != 0);
         ad.offset = (uint32_t)a.offset;
+
+        // FIX (P1): 校验该 VkFormat 真的能当顶点属性用。
+        //
+        // Vulkan 要求顶点属性格式的 bufferFeatures 含
+        // VERTEX_BUFFER_BIT。MoltenVK 对 MTLVertexFormat 里不存在的格式
+        // （R64 全家、部分 3 分量组合）不报告这个位。上面的映射表已经手工
+        // 规避了已知的坑，但设备之间差异很大（A11 之前 / Apple Silicon /
+        // Intel Mac 各不相同），漏一个就是整条管线创建失败、该 program 的
+        // 所有 draw 静默消失 —— 这种故障极难从现象反推原因。
+        //
+        // 这里做一次运行时兜底：真遇到不支持的格式就打日志点名，让问题在
+        // 日志里可见，而不是变成一块莫名其妙的黑屏。结果按格式缓存，
+        // 不影响热路径（管线创建本来就不在每帧路径上）。
+        {
+            static std::unordered_map<uint32_t, bool> vtxFmtOk;
+            auto vit = vtxFmtOk.find((uint32_t)ad.format);
+            bool ok;
+            if (vit != vtxFmtOk.end()) {
+                ok = vit->second;
+            } else {
+                VkFormatProperties fp{};
+                vkGetPhysicalDeviceFormatProperties(b->physicalDevice, ad.format, &fp);
+                ok = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+                vtxFmtOk[(uint32_t)ad.format] = ok;
+                if (!ok) {
+                    MITHRIL_LOG_WARN("vk",
+                        "顶点属性 location=%d 的 VkFormat %d（GL type=0x%x size=%d）"
+                        "不被本设备接受为顶点格式（缺 VERTEX_BUFFER_BIT）；"
+                        "管线创建很可能失败，该 program 的 draw 会全部丢失。",
+                        a.location, (int)ad.format, a.type, a.size);
+                }
+            }
+        }
+
         attrDescs.push_back(ad);
     }
 
@@ -459,6 +579,43 @@ VkPipeline get_or_create_pipeline(GLuint program,
                               mithril::g_state->primitiveRestartFixedIndex))
             ? VK_TRUE : VK_FALSE;
 
+    /* FIX (root cause AS - list topology restart is conditional):
+     *
+     * Enabling the extension above is only half of it. When the device does
+     * NOT have VK_EXT_primitive_topology_list_restart — which is the case on
+     * MoltenVK today — combining primitiveRestartEnable with a LIST topology
+     * violates VUID-VkPipelineInputAssemblyStateCreateInfo-topology-06252.
+     * vkCreateGraphicsPipelines then fails, the signature lands in
+     * failedSignatures, and every draw with that combination is dropped for
+     * the rest of the session. An app that enables GL_PRIMITIVE_RESTART once
+     * and later draws GL_TRIANGLES loses those draws entirely.
+     *
+     * Restart is meaningful on strips and fans; on a list each primitive is
+     * already self-delimiting, so suppressing the bit there costs nothing
+     * real. MobileGL throws instead — appropriate for a debug build, but here
+     * dropping a corrupt-geometry edge case beats losing the draw outright.
+     */
+    if (ia.primitiveRestartEnable == VK_TRUE) {
+        const bool isList =
+            ia.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ||
+            ia.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+            ia.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+            ia.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY ||
+            ia.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY ||
+            ia.topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
+        if (isList && !b->listRestartSupported) {
+            ia.primitiveRestartEnable = VK_FALSE;
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                MITHRIL_LOG_WARN("vk",
+                                 "primitive restart requested on a list topology but "
+                                 "VK_EXT_primitive_topology_list_restart is unavailable; "
+                                 "suppressing the restart bit so the pipeline can be created");
+            }
+        }
+    }
+
     // ---- Viewport / scissor (dynamic) ----
     VkPipelineViewportStateCreateInfo vp{};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -470,21 +627,35 @@ VkPipeline get_or_create_pipeline(GLuint program,
     // ---- Rasterizer ----
     VkPipelineRasterizationStateCreateInfo rs{};
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    // Dynamic state: read from g_state instead of hardcoding.
-    // 对照 MobileGL VulkanRenderer.cpp dynamic rasterizer state.
-    rs.depthClampEnable = (mithril::g_state && mithril::g_state->depthClamp) ? VK_TRUE : VK_FALSE;
+    rs.depthClampEnable = VK_FALSE;
     rs.rasterizerDiscardEnable = VK_FALSE;
-    rs.polygonMode = gl_polygon_to_vk(mithril::g_state ? (GLenum)mithril::g_state->polygonModeFront : GL_FILL);
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
     rs.cullMode = VK_CULL_MODE_NONE;        // dynamic via vkCmdSetCullMode
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // dynamic
-    rs.depthBiasEnable = (mithril::g_state && mithril::g_state->polygonOffsetFill) ? VK_TRUE : VK_FALSE;
-    rs.lineWidth = mithril::g_state ? mithril::g_state->lineWidth : 1.0f;
+    rs.depthBiasEnable = VK_FALSE;
+    rs.lineWidth = 1.0f;
 
     // ---- Multisample ----
     VkPipelineMultisampleStateCreateInfo ms{};
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     ms.minSampleShading = 1.0f;
+    /* GL 4.0 ARB_sample_shading. Only meaningful once the attachment is
+     * actually multisampled — requesting sampleShadingEnable at
+     * VK_SAMPLE_COUNT_1_BIT is legal but pointless, and needs the
+     * sampleRateShading device feature to be enabled. */
+    if (mithril::g_state && mithril::g_state->sampleShadingEnabled &&
+        b->sampleRateShadingSupported &&
+        ms.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {
+        ms.sampleShadingEnable = VK_TRUE;
+        ms.minSampleShading = mithril::g_state->minSampleShading;
+    }
+    /* GL 4.0 glSampleMaski / GL_SAMPLE_MASK. VkPipelineMultisampleStateCreateInfo
+     * takes the mask by pointer, so it must outlive this call — the state
+     * lives in GLState, which does. */
+    if (mithril::g_state && mithril::g_state->sampleMask) {
+        ms.pSampleMask = (const VkSampleMask*)mithril::g_state->sampleMaskValue;
+    }
 
     // ---- Depth / stencil ----
     VkPipelineDepthStencilStateCreateInfo ds{};
@@ -493,7 +664,7 @@ VkPipeline get_or_create_pipeline(GLuint program,
     ds.depthWriteEnable = VK_TRUE;
     ds.depthCompareOp = VK_COMPARE_OP_LESS;  // dynamic
     ds.depthBoundsTestEnable = VK_FALSE;
-    ds.stencilTestEnable = (mithril::g_state && mithril::g_state->stencilTest) ? VK_TRUE : VK_FALSE;
+    ds.stencilTestEnable = VK_FALSE;
 
     // ---- Color blend ----
     // FIX (root cause I+J): use independent alpha blend factors (blend_src_alpha/
@@ -575,7 +746,6 @@ VkPipeline get_or_create_pipeline(GLuint program,
         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
         VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-        VK_DYNAMIC_STATE_DEPTH_BIAS,   // factor/units via backend_set_depth_bias
     };
     VkPipelineDynamicStateCreateInfo dyn{};
     dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
@@ -713,6 +883,65 @@ VkPipeline get_or_create_pipeline(GLuint program,
     return pipeline;
 }
 
+VkPipeline get_or_create_compute_pipeline(GLuint program,
+                                          const uint32_t* compute_spirv,
+                                          int compute_word_count) {
+    Backend* b = backend();
+    if (!b->initialized || program == 0) return VK_NULL_HANDLE;
+    if (!compute_spirv || compute_word_count <= 0) return VK_NULL_HANDLE;
+
+    auto& tbl = program_table();
+    ProgramResources& pr = tbl[program];
+
+    // One program == one compute pipeline. Unlike the graphics path there is
+    // no signature to key on (no vertex format, no attachments, no blend), so
+    // the cached handle is returned directly. delete_program_resources()
+    // clears it on relink.
+    if (pr.computePipeline != VK_NULL_HANDLE) return pr.computePipeline;
+
+    if (pr.computeModule == VK_NULL_HANDLE) {
+        pr.computeModule = create_module(compute_spirv, compute_word_count);
+    }
+    if (pr.computeModule == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+
+    // Reflect the compute SPIR-V into the same per-program descriptor layout
+    // machinery the graphics path uses, so bind_program_descriptors() can
+    // write UBOs / samplers / SSBOs / storage images for this program.
+    ensure_program_layouts(program, nullptr, 0, nullptr, 0,
+                           compute_spirv, compute_word_count);
+
+    VkPipelineShaderStageCreateInfo stage{};
+    stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = pr.computeModule;
+    stage.pName  = "main";
+
+    VkComputePipelineCreateInfo ci{};
+    ci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    ci.stage  = stage;
+    // A shader with no reflected bindings gets the process-wide empty layout,
+    // exactly as get_or_create_pipeline does.
+    ci.layout = pr.pipelineLayout ? pr.pipelineLayout : empty_pipeline_layout();
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkResult r = vkCreateComputePipelines(b->device, VK_NULL_HANDLE, 1, &ci,
+                                          nullptr, &pipeline);
+    if (r != VK_SUCCESS || pipeline == VK_NULL_HANDLE) {
+        // Rate-limited, same rationale as the graphics failure path: a broken
+        // compute shader dispatched every frame must not flood the log.
+        static int computeFailCount = 0;
+        computeFailCount++;
+        if (computeFailCount <= 3 || computeFailCount % 100 == 0) {
+            MITHRIL_LOG_WARN("vk", "vkCreateComputePipelines failed (rc=%d, "
+                              "program=%u, words=%d, fail #%d)",
+                              (int)r, program, compute_word_count, computeFailCount);
+        }
+        return VK_NULL_HANDLE;
+    }
+    pr.computePipeline = pipeline;
+    return pipeline;
+}
+
 // FIX (红屏根因 - deviceLost 恢复后清除负缓存):
 // deviceLost 期间 vkCreateGraphicsPipelines 可能因设备状态异常而失败。
 // 如果这些失败被加入 failedSignatures 负缓存，即使设备恢复后着色器
@@ -742,6 +971,12 @@ void clear_all_pipeline_caches() {
             }
         }
         pr.pipelines.clear();
+        // 计算管线同理：deviceLost 后必须重建，否则 dispatch 会引用损坏的
+        // 着色器缓存。置空后 get_or_create_compute_pipeline 会重新创建。
+        if (pr.computePipeline) {
+            vkDestroyPipeline(b->device, pr.computePipeline, nullptr);
+            pr.computePipeline = VK_NULL_HANDLE;
+        }
     }
     MITHRIL_LOG_INFO("vk", "clear_all_pipeline_caches: cleared all "
                       "failedSignatures + destroyed all cached pipelines "
@@ -766,9 +1001,11 @@ void delete_program_resources(GLuint program) {
         if (kv.second) vkDestroyPipeline(b->device, kv.second, nullptr);
     }
     pr.pipelines.clear();
+    if (pr.computePipeline)     { vkDestroyPipeline(b->device, pr.computePipeline, nullptr);         pr.computePipeline = VK_NULL_HANDLE; }
     if (pr.vertexModule)        { vkDestroyShaderModule(b->device, pr.vertexModule, nullptr);        pr.vertexModule = VK_NULL_HANDLE; }
     if (pr.vertexModuleFlipped) { vkDestroyShaderModule(b->device, pr.vertexModuleFlipped, nullptr); pr.vertexModuleFlipped = VK_NULL_HANDLE; }
     if (pr.fragmentModule)      { vkDestroyShaderModule(b->device, pr.fragmentModule, nullptr);      pr.fragmentModule = VK_NULL_HANDLE; }
+    if (pr.computeModule)       { vkDestroyShaderModule(b->device, pr.computeModule, nullptr);       pr.computeModule = VK_NULL_HANDLE; }
     // Descriptor resources built by ensure_program_layouts. Pools must be
     // destroyed before the set layout they were created from (Vulkan ordering);
     // destroying a pool implicitly frees all sets allocated from it, so the
@@ -783,6 +1020,10 @@ void delete_program_resources(GLuint program) {
             pr.descriptorPools[i] = VK_NULL_HANDLE;
         }
     }
+    // The descriptor bind shadow in DescriptorSet.cpp may still name a set (and
+    // the pipeline layout) we just destroyed. Comparing a recycled handle
+    // against it could make a later draw skip a bind it needs, so drop it.
+    on_command_buffer_boundary();
     if (pr.pipelineLayout)      { vkDestroyPipelineLayout(b->device, pr.pipelineLayout, nullptr);      pr.pipelineLayout = VK_NULL_HANDLE; }
     if (pr.descriptorSetLayout) { vkDestroyDescriptorSetLayout(b->device, pr.descriptorSetLayout, nullptr); pr.descriptorSetLayout = VK_NULL_HANDLE; }
     pr.bindings.clear();
@@ -818,6 +1059,17 @@ VkPipeline backend_get_or_create_pipeline(GLuint program,
                                                color_write_mask,
                                                gl_primitive_mode,
                                                is_default_fbo);
+}
+
+// Unlike the graphics wrapper, the caller does not hand over the SPIR-V: a
+// dispatch only knows the currently-bound GL program, and the compute stage
+// has no per-draw variants (no Y-flip, no vertex format) to choose between.
+// Fetch it straight from the linked program.
+VkPipeline backend_get_or_create_compute_pipeline(GLuint program) {
+    mithril::Program* p = mithril::state_get_program(program);
+    if (!p || !p->linked || p->computeSpirv.empty()) return VK_NULL_HANDLE;
+    return mithril::vk::get_or_create_compute_pipeline(
+        program, p->computeSpirv.data(), (int)p->computeSpirv.size());
 }
 
 void backend_delete_program_resources(GLuint program) {
