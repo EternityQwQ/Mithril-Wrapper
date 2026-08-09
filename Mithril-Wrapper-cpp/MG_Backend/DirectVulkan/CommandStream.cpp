@@ -295,6 +295,56 @@ void record_layout_barrier(VkCommandBuffer cb, VkImage image, VkFormat format,
 bool render_pass_active() { return encoder().passActive; }
 
 /*
+ * ---- Root cause AI (CRITICAL, SIGSEGV inside MVKRenderSubpass) ----
+ * Last line of defence before any vkCmdDraw* is recorded.
+ *
+ * A draw is only legal inside a render-pass instance and with a graphics
+ * pipeline bound. Violating either is undefined behaviour, and MoltenVK's
+ * reaction is not a dropped draw but a null dereference: MVKCommandEncoder
+ * lazily opens the Metal render pass on the first draw, and with no active
+ * render pass its _renderPass is null, so
+ *
+ *   MVKRenderSubpass::populateMTLRenderPassDescriptor()
+ *     MVKPixelFormats* pixFmts = _renderPass->getPixelFormats();
+ *
+ * faults on its very first member access. That is the observed iPhone X
+ * crash (SIGSEGV at populateMTLRenderPassDescriptor+0x3c).
+ *
+ * The GL layer already refuses to draw when prepare_draw() fails
+ * (Drawing.cpp), which is the real fix. This check is deliberately
+ * redundant: it keeps a single missed guard — in existing paths such as the
+ * indirect draws, or in any path added later — from turning a recoverable
+ * pipeline failure into a process abort. The cost is two predictable
+ * branches per draw.
+ */
+bool draw_recording_allowed(const char* who) {
+    EncoderState& e = encoder();
+    if (!e.passActive) {
+        static uint32_t warned = 0;
+        if (warned < 8) {
+            ++warned;
+            MITHRIL_LOG_WARN("vk", "%s: no active render pass — draw dropped "
+                                   "(recording it would crash MoltenVK). This "
+                                   "means a pipeline/pass setup step failed "
+                                   "earlier; see prior warnings.", who);
+        }
+        return false;
+    }
+    if (e.boundPipeline == VK_NULL_HANDLE) {
+        static uint32_t warned = 0;
+        if (warned < 8) {
+            ++warned;
+            MITHRIL_LOG_WARN("vk", "%s: no graphics pipeline bound — draw "
+                                   "dropped (undefined behaviour otherwise). "
+                                   "Pipeline creation most likely failed; see "
+                                   "prior warnings.", who);
+        }
+        return false;
+    }
+    return true;
+}
+
+/*
  * Root cause Z: returns the active render pass's framebuffer height (the
  * attachment extent set in begin_render_pass and clamped to the swapchain /
  * actual drawable dimensions). Used by backend_set_viewport /
@@ -473,6 +523,11 @@ bool ensure_command_buffer_recording() {
      * existed in the previous buffer and skip a vkCmdBindDescriptorSets it
      * genuinely needs. */
     on_command_buffer_boundary();
+
+    /* Root cause AI: pipeline bindings are command-buffer scoped. A reset +
+     * re-begun buffer has no pipeline bound, so the tracking handle must be
+     * cleared here or backend_draw_* would wrongly believe one is live. */
+    encoder().boundPipeline = VK_NULL_HANDLE;
 
     return true;
 }
@@ -1669,10 +1724,23 @@ void backend_drain_and_detach_swapchain(void) {
     mithril::vk::drain_and_detach_swapchain();
 }
 
+/*
+ * Bind a graphics pipeline and track it (root cause AI).
+ *
+ * The tracking handle is what lets backend_draw_* refuse to record a draw
+ * with no pipeline bound — recording one is undefined behaviour and makes
+ * MoltenVK dereference a null MVKRenderPass (SIGSEGV in
+ * MVKRenderSubpass::populateMTLRenderPassDescriptor). A null `pipeline` here
+ * means creation failed upstream, so nothing is bound and the handle is
+ * cleared rather than left pointing at a stale pipeline from an earlier draw.
+ */
 void backend_bind_pipeline(VkPipeline pipeline) {
     mithril::vk::Backend* b = mithril::vk::backend();
     if (b->commandBuffer && pipeline) {
         vkCmdBindPipeline(b->commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        mithril::vk::encoder().boundPipeline = pipeline;
+    } else {
+        mithril::vk::encoder().boundPipeline = VK_NULL_HANDLE;
     }
 }
 
@@ -1933,6 +2001,7 @@ void backend_draw_arrays(int primitive, int first, int count) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
+    if (!mithril::vk::draw_recording_allowed("backend_draw_arrays")) return;
     // Root cause AG (CRITICAL): pass firstInstance from g_state. glDrawArrays
     // itself has no baseInstance, but glDrawArraysInstancedBaseInstance /
     // glDrawArraysInstancedBaseVertexBaseInstance (rare) set
@@ -1952,6 +2021,7 @@ void backend_draw_indexed(int primitive, int count, int index_type,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !index_buffer) return;
+    if (!mithril::vk::draw_recording_allowed("backend_draw_indexed")) return;
     // FIX (root cause AE, CRITICAL): GL_UNSIGNED_BYTE index support.
     // Drawing.cpp maps GL_UNSIGNED_BYTE → 2 (index_type_to_int), but the
     // previous code only handled 0 (UINT16) and 1 (UINT32), treating
@@ -1989,6 +2059,7 @@ void backend_draw_arrays_instanced(int primitive, int first, int count, int prim
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer) return;
+    if (!mithril::vk::draw_recording_allowed("backend_draw_arrays_instanced")) return;
     // Root cause AG (CRITICAL): pass firstInstance from g_state (see
     // backend_draw_arrays for rationale). glDrawArraysInstancedBaseInstance
     // sets g_state->currentBaseInstance before falling through to the
@@ -2005,6 +2076,7 @@ void backend_draw_indexed_instanced(int primitive, int count, int index_type,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !index_buffer) return;
+    if (!mithril::vk::draw_recording_allowed("backend_draw_indexed_instanced")) return;
     // FIX (root cause AE, CRITICAL): GL_UNSIGNED_BYTE index support — see
     // backend_draw_indexed for the full rationale.
     VkIndexType t;
@@ -2049,6 +2121,7 @@ void backend_draw_indirect(int primitive, VkBuffer indirect_buffer,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !indirect_buffer || draw_count <= 0) return;
+    if (!mithril::vk::draw_recording_allowed("backend_draw_indirect")) return;
     const uint32_t effStride = stride > 0 ? (uint32_t)stride : 16u;  // sizeof(VkDrawIndirectCommand)
     if (draw_count == 1 || b->multiDrawIndirectSupported) {
         vkCmdDrawIndirect(b->commandBuffer, indirect_buffer, indirect_offset,
@@ -2069,6 +2142,7 @@ void backend_draw_indexed_indirect(int primitive, int index_type,
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
     if (!b->commandBuffer || !index_buffer || !indirect_buffer || draw_count <= 0) return;
+    if (!mithril::vk::draw_recording_allowed("backend_draw_indexed_indirect")) return;
     VkIndexType t;
     if (index_type == 1)      t = VK_INDEX_TYPE_UINT32;
     else if (index_type == 2) t = VK_INDEX_TYPE_UINT8_EXT;

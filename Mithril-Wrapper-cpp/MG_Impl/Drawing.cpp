@@ -54,10 +54,43 @@
 
 extern "C" {
 
-static void prepare_draw(GLenum mode) {
+/*
+ * Prepare everything a draw needs: pipeline, render pass, descriptors and
+ * dynamic state.
+ *
+ * RETURNS true only when the render pass is open AND a graphics pipeline is
+ * bound — i.e. only when it is legal to record a vkCmdDraw* afterwards.
+ *
+ * ---- Root cause AI (CRITICAL, SIGSEGV inside MVKRenderSubpass) ----
+ * This used to return void, so every early-out below silently produced a
+ * "bare draw": the caller went straight on to backend_draw_*(), which
+ * recorded a vkCmdDraw into a command buffer that had NO active render pass
+ * and NO bound pipeline. Recording a draw outside a render-pass instance is
+ * undefined behaviour per the Vulkan spec, and MoltenVK reacts by
+ * dereferencing its null MVKRenderPass:
+ *
+ *   MVKCommandEncoder::beginMetalRenderPass()
+ *     -> getSubpass()                              // _renderPass == nullptr
+ *     -> MVKRenderSubpass::populateMTLRenderPassDescriptor()
+ *          MVKPixelFormats* pixFmts = _renderPass->getPixelFormats();  // BOOM
+ *
+ * which is exactly the crash observed on iPhone X / iOS 16.7.15:
+ *   SIGSEGV at libmithril.dylib+0x280d20
+ *   MVKRenderSubpass::populateMTLRenderPassDescriptor(...)+0x3c
+ * (+0x3c is the function's very first member access, i.e. _renderPass.)
+ *
+ * The trigger on that device was a graphics-pipeline creation failure
+ * ("vkCreateGraphicsPipelines transient failure (rc=-3)") caused by the
+ * cross-stage descriptor binding collision fixed in Shader.cpp. That root
+ * cause is gone, but ANY pipeline failure (unsupported shader, OOM, transient
+ * driver error) must degrade to a dropped frame, never to a process abort.
+ * Returning a status here — and re-checking it in the backend, see
+ * backend_draw_* in CommandStream.cpp — makes that guarantee structural.
+ */
+static bool prepare_draw(GLenum mode) {
     // Resolve current program + its SPIR-V.
     mithril::Program* prog = mithril::state_get_program(g_state->currentProgram);
-    if (!prog || !prog->linked) return;
+    if (!prog || !prog->linked) return false;
 
     // Determine whether we are drawing to the default framebuffer (FBO 0) or a
     // user-created FBO. This selects the Y-flipped vs non-flipped vertex SPIR-V
@@ -86,7 +119,7 @@ static void prepare_draw(GLenum mode) {
                               prog->vertexSpirvYFlipped.size(),
                               prog->fragmentSpirv.size(), (int)is_default_fbo);
         }
-        return;
+        return false;
     }
 
     // Resolve current draw FBO attachments (color + depth VkImageViews + size).
@@ -102,7 +135,7 @@ static void prepare_draw(GLenum mode) {
     if (color_count <= 0) {
         bool any_color = false;
         for (int i = 0; i < 8; ++i) if (colors[i] != VK_NULL_HANDLE) { any_color = true; break; }
-        if (!any_color) return;
+        if (!any_color) return false;
     }
 
     // Compute color attachment VkFormats.
@@ -194,7 +227,12 @@ static void prepare_draw(GLenum mode) {
         cwm_bits,
         mode,
         is_default_fbo ? 1 : 0);
-    if (pipeline == VK_NULL_HANDLE) return;
+    // Pipeline creation failed (shader compile error, OOM, transient driver
+    // error). Returning false makes every caller skip its backend_draw_*
+    // call — see the root cause AI comment on this function. Note that the
+    // render pass has NOT been begun at this point (that happens below), so
+    // a draw issued here would be recorded outside any render-pass instance.
+    if (pipeline == VK_NULL_HANDLE) return false;
 
     // FIX (root cause Y, CRITICAL): Register user-FBO attachment tex_ids so
     // begin_render_pass can barrier their images to attachment-optimal and
@@ -348,6 +386,10 @@ static void prepare_draw(GLenum mode) {
     // for this draw. The legacy backend_set_fragment_buffer /
     // backend_set_fragment_texture stubs are no-ops (kept only for the C API
     // contract) — descriptor binding is centralised in DescriptorSet.cpp.
+
+    // Render pass is open and the pipeline + descriptors + dynamic state are
+    // bound: it is now legal for the caller to record a vkCmdDraw*.
+    return true;
 }
 
 static void end_draw(void) {
@@ -400,14 +442,18 @@ static bool validate_draw_call(GLenum mode, GLsizei count) {
 void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     MITHRIL_ENSURE_INIT();
     if (!validate_draw_call(mode, count)) return;
-    prepare_draw(mode);
+    // Root cause AI: a false return means no render pass was begun and no
+    // pipeline was bound — issuing the draw anyway would record a vkCmdDraw
+    // outside a render-pass instance and crash inside MoltenVK. Bail out
+    // without calling end_draw(): there is no pass to end.
+    if (!prepare_draw(mode)) return;
     backend_draw_arrays((int)mode, (int)first, (int)count);
     end_draw();
 }
 
 void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
     MITHRIL_ENSURE_INIT();
-    prepare_draw(mode);
+    if (!prepare_draw(mode)) return;  // root cause AI — see glDrawArrays
     backend_draw_arrays_instanced((int)mode, (int)first, (int)count, (int)primcount);
     end_draw();
 }
@@ -419,7 +465,10 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
     // 完成后重置为 0。backend_draw_arrays_instanced 从 g_state 读取后传给
     // vkCmdDraw 的 firstInstance。深度对照 MobileGL drawParams.baseInstance。
     g_state->currentBaseInstance = baseinstance;
-    prepare_draw(mode);
+    // Root cause AI — see glDrawArrays. currentBaseInstance MUST be reset on
+    // the early-out path too, otherwise it leaks into the next draw (which
+    // expects firstInstance == 0) and misaddresses its instance data.
+    if (!prepare_draw(mode)) { g_state->currentBaseInstance = 0; return; }
     backend_draw_arrays_instanced((int)mode, (int)first, (int)count, (int)primcount);
     g_state->currentBaseInstance = 0;
     end_draw();
@@ -428,7 +477,7 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
 void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
     MITHRIL_ENSURE_INIT();
     if (!validate_draw_call(mode, count)) return;
-    prepare_draw(mode);
+    if (!prepare_draw(mode)) return;  // root cause AI — see glDrawArrays
     // If a VBO is bound for GL_ELEMENT_ARRAY_BUFFER, indices is an offset into it.
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
@@ -488,7 +537,7 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type,
 void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
                              const void* indices, GLsizei primcount) {
     MITHRIL_ENSURE_INIT();
-    prepare_draw(mode);
+    if (!prepare_draw(mode)) return;  // root cause AI — see glDrawArrays
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
     VkBuffer ib = backend_get_buffer(ib_name);
