@@ -1187,6 +1187,51 @@ void bind_program_descriptors(GLuint program, VkPipelineBindPoint bindPoint) {
         }
 
         for (auto& w : writes) w.dstSet = set;
+
+        // ---- Descriptor completeness guard (root cause AK-2: PageFault) ----
+        // VS/FS binding 分离后（inject_opaque_bindings），FS 有独立的
+        // sampler binding（如 65）。如果该 binding 的 descriptor 因
+        // view==NULL && default_texture 初始化失败而跳过写入，descriptor set
+        // 里该 binding 保持未初始化 → MoltenVK 用随机地址 → GPU PageFault。
+        // 补齐：检查 pr.bindings 里每个 COMBINED_IMAGE_SAMPLER binding 是否
+        // 都有 write，没有的用 default texture 补齐。UBO 不补齐（UBO 路径
+        // 在 arena upload 失败时 return 跳过整个 bind，不会产生半写入的 set）。
+        {
+            DefaultTexture& dt = default_texture();
+            for (const auto& db : pr.bindings) {
+                if (db.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
+                bool found = false;
+                for (const auto& w : writes) {
+                    if (w.dstBinding == db.binding) { found = true; break; }
+                }
+                if (found) continue;
+                // 该 sampler binding 没有被写入，用 default texture 补齐
+                if (dt.view != VK_NULL_HANDLE && dt.sampler != VK_NULL_HANDLE) {
+                    imgInfos.push_back({});
+                    VkDescriptorImageInfo& ii = imgInfos.back();
+                    ii.sampler = dt.sampler;
+                    ii.imageView = dt.view;
+                    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    VkWriteDescriptorSet w{};
+                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w.dstSet = set;
+                    w.dstBinding = db.binding;
+                    w.dstArrayElement = 0;
+                    w.descriptorCount = 1;
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    w.pImageInfo = &ii;
+                    writes.push_back(w);
+                    // 补齐的 descriptor 也要参与 signature，否则缓存复用
+                    // 会跳过补齐写入
+                    sig = fnv1a_u64(((uint64_t)db.binding << 32) |
+                                   (uint64_t)VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sig);
+                    sig = fnv1a_u64(handle_bits(dt.sampler), sig);
+                    sig = fnv1a_u64(handle_bits(dt.view), sig);
+                    sig = fnv1a_u64((uint64_t)VkImageLayout(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL), sig);
+                }
+            }
+        }
+
         if (!writes.empty()) {
             vkUpdateDescriptorSets(b->device, static_cast<uint32_t>(writes.size()),
                                    writes.data(), 0, nullptr);
