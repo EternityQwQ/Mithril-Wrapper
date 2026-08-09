@@ -83,21 +83,26 @@ int get_glsl_version(const std::string& src) {
 
 /*
  * Ensure the GLSL source has a version usable by the Vulkan client. Vulkan
- * GLSL requires #version 330 minimum (GL_KHR_vulkan_glsl). Minecraft's
- * blit_screen uses #version 150, so we upgrade anything below 330 to 330
- * (core profile). If no #version line is present, prepend #version 330.
+ * GLSL requires #version 330 minimum (GL_KHR_vulkan_glsl). 但本渲染器在
+ * GLSL 源码层面注入 layout(binding=N) 来分离 VS/FS 的 descriptor binding
+ * （见 inject_opaque_bindings），而 layout(binding=) 要到 #version 420 才
+ * 进核心（GL_ARB_shading_language_420pack）。所以统一升到 420 core：
+ *  - 满足 Vulkan GLSL 最低要求（330）
+ *  - 让 layout(binding=) 合法（420）
+ * Minecraft 的 blit_screen 用 #version 150，升到 420 只是放宽版本声明，不
+ * 改变任何已写代码的语义。如果源码没有 #version，前置 #version 420 core。
  *
  * Returns the resolved GLSL version number.
  */
 int ensure_glsl_version(std::string& src) {
     int ver = get_glsl_version(src);
     if (ver == -1) {
-        ver = 330;
-        src.insert(0, "#version 330 core\n");
+        ver = 420;
+        src.insert(0, "#version 420 core\n");
         return ver;
     }
-    if (ver < 330) {
-        // Replace the existing #version line with #version 330 core. The
+    if (ver < 420) {
+        // Replace the existing #version line with #version 420 core. The
         // 'core' profile is required for Vulkan GLSL; 'compatibility' would
         // pull in deprecated fixed-function symbols that Vulkan rejects.
         size_t pos = src.find("#version");
@@ -105,8 +110,8 @@ int ensure_glsl_version(std::string& src) {
         if (line_end == std::string::npos) line_end = src.length();
         // Preserve any trailing profile token that was on the line by
         // replacing the whole line with the upgraded version + core.
-        src.replace(pos, line_end - pos, "#version 330 core");
-        ver = 330;
+        src.replace(pos, line_end - pos, "#version 420 core");
+        ver = 420;
     } else {
         // Ensure a profile token is present; Vulkan GLSL requires core.
         size_t pos = src.find("#version");
@@ -483,6 +488,147 @@ static void wrap_loose_uniforms(std::string& source) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-stage explicit binding injection for opaque uniforms and UBO blocks.
+//
+// 背景（root cause AK — Sampler0Smplr undeclared + 找不到 uniform）：
+//   glsl_to_spirv 每个 stage 单独编译，VS/FS 各自建独立 TProgram，从不调
+//   program->mapIO()，glslang 的跨 stage 共享 binding 槽位机制没启用。
+//   setAutoMapBindings(true) 让每个 stage 的 binding 都从 0 重新分配，
+//   结果 VS 和 FS 的 mithril_GlobalBlock 都拿到 binding 0、Sampler0 都拿到
+//   binding 1。merge_bindings() 按 (set,binding,type) 去重，把 FS 的条目
+//   折叠进 VS 的条目 → FS 的 ColorModulator/Sampler0 从 uniform 表消失，
+//   MoltenVK 给 FS 生成的 MSL 引用了 Sampler0Smplr 但 descriptor 没提供 →
+//   "use of undeclared identifier 'Sampler0Smplr'"。
+//
+//   setShiftBinding(EResTexture, base) 本意给 FS 的 sampler 加偏移避开冲突，
+//   但实测（glslang probe）对 auto-mapped combined sampler 完全不生效——
+//   binding 仍是 0。setShiftBinding 只作用于带显式 layout(binding=) 的变量。
+//
+//   MobileGL 的正确做法是单 TProgram + mapIO() 让 glslang 全局分配 binding。
+//   但 Mithril 的 glsl_to_spirv 是单 stage 接口 + 三级 fallback，改成跨 stage
+//   编译会破坏缓存和 fallback，风险大。
+//
+//   本 pass 采用更直接的等价方案：在 GLSL 源码层面给每个 opaque uniform
+//   (sampler*/image*) 和 UBO block 注入显式 layout(binding=N)，N = stage_base
+//   + 出现顺序计数器。VS 用 base 0，FS 用 base 64，compute 用 base 128。
+//   这样 SPIR-V 里的 OpDecorate Binding 就是正确的，VS/FS 永不冲突，MoltenVK
+//   生成的 MSL 引用各自独立的 sampler 符号。setShiftBinding 保留无害。
+//
+//   注入规则：
+//     1. UBO block: `uniform <Name> { ... } <inst>;` → 前置 layout(binding=N)
+//     2. opaque uniform: `uniform sampler2D S;` → 前置 layout(binding=N)
+//     3. 已有 layout(binding=) 的不重复注入（幂等）
+//     4. 跳过注释内的声明
+//   binding 号在同一 stage 内全局递增（UBO 和 sampler 共享计数器），保证唯一。
+// ---------------------------------------------------------------------------
+// 前向声明：binding_base_for_stage 定义在下方 glsl_to_spirv 附近，这里先用。
+unsigned binding_base_for_stage(EShLanguage stage);
+
+void inject_opaque_bindings(std::string& source, GLenum gl_stage) {
+    EShLanguage stage = to_esh_stage(gl_stage);
+    if (stage == EShLangCount) return;
+    unsigned binding = binding_base_for_stage(stage);
+
+    // ---- Pass 1: UBO blocks (named + anonymous) ----
+    // 匹配 `uniform <Word> {` —— 命中 named block (mithril_GlobalBlock) 和
+    // anonymous block (uniform { ... })。用找到 '{' 来确认是 block 而非
+    // 普通 uniform 变量。
+    static const std::regex block_re(
+        R"((^[ \t]*)uniform\s+(?:layout\s*\([^)]*\)\s*)?(\w+)?\s*\{)",
+        std::regex::multiline | std::regex::optimize);
+    {
+        auto cur = source.cbegin();
+        std::smatch m;
+        std::string out;
+        out.reserve(source.size() + 64);
+        size_t last = 0;
+        while (std::regex_search(cur, source.cend(), m, block_re)) {
+            size_t pos = m.position(0) + (cur - source.cbegin());
+            // 检查该位置是否在注释内
+            if (is_in_comment(source, pos)) {
+                out.append(source, last, pos - last);
+                out += m[0].str();
+                last = pos + m[0].length();
+                cur = m.suffix().first;
+                continue;
+            }
+            // 检查是否已有 layout(binding=) —— 幂等
+            std::string full_match = m[0].str();
+            if (full_match.find("layout(") != std::string::npos &&
+                full_match.find("binding=") != std::string::npos) {
+                out.append(source, last, pos - last);
+                out += m[0].str();
+                last = pos + m[0].length();
+                cur = m.suffix().first;
+                continue;
+            }
+            std::string indent = m[1].str();
+            std::string blockname = m[2].matched ? m[2].str() : std::string();
+            out.append(source, last, pos - last);
+            out += indent;
+            out += "layout(binding=";
+            out += std::to_string(binding++);
+            out += ") uniform ";
+            if (!blockname.empty()) { out += blockname; out += ' '; }
+            out += "{";
+            last = pos + m[0].length();
+            cur = m.suffix().first;
+        }
+        out.append(source, last, std::string::npos);
+        source.swap(out);
+    }
+
+    // ---- Pass 2: opaque uniforms (sampler*/image*) ----
+    // 匹配 `uniform <sampler|image...> <name>[<array>];`。is_opaque_glsl_type
+    // 复用上面的判定。跳过已有 layout(binding=) 的声明。
+    static const std::regex opaque_re(
+        R"((^[ \t]*)uniform\s+(?:layout\s*\([^)]*\)\s*)?(\w+)\s+(\w+)\s*((?:\[[^\]]*\])*)\s*;)",
+        std::regex::multiline | std::regex::optimize);
+    {
+        auto cur = source.cbegin();
+        std::smatch m;
+        std::string out;
+        out.reserve(source.size() + 64);
+        size_t last = 0;
+        while (std::regex_search(cur, source.cend(), m, opaque_re)) {
+            size_t pos = m.position(0) + (cur - source.cbegin());
+            std::string vartype = m[2].str();
+            if (!is_opaque_glsl_type(vartype)) {
+                cur = m.suffix().first;
+                continue;
+            }
+            if (is_in_comment(source, pos)) {
+                cur = m.suffix().first;
+                continue;
+            }
+            std::string full_match = m[0].str();
+            if (full_match.find("layout(") != std::string::npos &&
+                full_match.find("binding=") != std::string::npos) {
+                cur = m.suffix().first;
+                continue;
+            }
+            std::string indent = m[1].str();
+            std::string varname = m[3].str();
+            std::string arr = m[4].matched ? m[4].str() : std::string();
+            out.append(source, last, pos - last);
+            out += indent;
+            out += "layout(binding=";
+            out += std::to_string(binding++);
+            out += ") uniform ";
+            out += vartype;
+            out += ' ';
+            out += varname;
+            out += arr;
+            out += ';';
+            last = pos + m[0].length();
+            cur = m.suffix().first;
+        }
+        out.append(source, last, std::string::npos);
+        source.swap(out);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Position fixup injection (GL -> Vulkan NDC adjustment).
 //
 // Deep reference: MobileGL ProgramFactory::InsertPositionFixup
@@ -601,6 +747,12 @@ unsigned binding_base_for_stage(EShLanguage stage) {
 // a shader that only survives the second or third attempt would otherwise slip
 // back to colliding bindings — and would do it silently, since nothing fails
 // until MoltenVK rejects the generated MSL several frames later.
+//
+// NOTE: setShiftBinding 经 glslang probe 验证对 auto-mapped combined sampler
+// (uniform sampler2D Sampler0; 无显式 layout) 完全不生效——binding 仍是 0。
+// 真正的 binding 分离由 inject_opaque_bindings 在 GLSL 源码层面注入
+// layout(binding=N) 实现。本函数保留调用（对带显式 layout(binding=) 的变量
+// 仍有效，且与 inject_opaque_bindings 幂等不冲突），作为辅助而非主力。
 void apply_stage_binding_shift(glslang::TShader& sh, EShLanguage stage) {
     const unsigned base = binding_base_for_stage(stage);
     if (base == 0) return;  // vertex already starts at 0
@@ -657,6 +809,14 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
                           e.what());
         source = source_unwrapped;
     }
+
+    // Per-stage explicit binding injection (root cause AK fix).
+    // 必须在 wrap_loose_uniforms 之后（UBO block 已生成）执行，给每个
+    // UBO block 和 opaque uniform 注入 layout(binding=N)，N 按 stage base
+    // 偏移，避免 VS/FS binding 冲突导致 Sampler0Smplr undeclared。
+    // 对 source_unwrapped 也注入，保证 fallback 路径同样正确。
+    inject_opaque_bindings(source, gl_stage);
+    inject_opaque_bindings(source_unwrapped, gl_stage);
 
     glslang::TShader shader(stage);
     const char* s = source.c_str();

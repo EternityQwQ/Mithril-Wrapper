@@ -325,6 +325,13 @@ void glLinkProgram(GLuint program) {
                     p->uniformByLocation[u.location] = db.name;
                 }
                 p->samplerUnitMap[(GLuint)db.binding] = -1;
+                // 同步初始化 samplerUnitForBinding（DescriptorSet.cpp 读这个 map）。
+                // 之前只写 samplerUnitMap 不写 samplerUnitForBinding，靠
+                // `unit = db.binding` 的 legacy fallback 碰巧工作（binding 0~31
+                // == texture unit 0~31）。现在 inject_opaque_bindings 给 FS 的
+                // sampler binding 加了 64 偏移，fallback 会取 texture unit 65 越界。
+                // 在 link 时用 -1 初始化，glUniform1i 时再写入真实 unit。
+                p->samplerUnitForBinding[(GLuint)db.binding] = -1;
             }
         }
     } catch (const std::exception& e) {
@@ -621,6 +628,8 @@ void glUniform1i(GLint loc, GLint v0) {
                 // SPIR-V descriptor binding for reflected samplers (>= 0).
                 if (u.blockBinding >= 0 && u.type >= 0x8B5E && u.type <= 0x8B60) {
                     p->samplerUnitMap[(GLuint)u.blockBinding] = v0;
+                    // 同步 samplerUnitForBinding（DescriptorSet.cpp 实际读的 map）。
+                    p->samplerUnitForBinding[(GLuint)u.blockBinding] = v0;
                 }
             }
         }
