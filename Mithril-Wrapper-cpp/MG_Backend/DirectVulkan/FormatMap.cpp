@@ -89,6 +89,59 @@ VkFormat gl_internal_to_vk(GLenum internal) {
         case GL_COMPRESSED_RGB_S3TC_DXT1_EXT: return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
         case GL_COMPRESSED_RGBA_S3TC_DXT3_EXT: return VK_FORMAT_BC2_UNORM_BLOCK;
         case GL_COMPRESSED_RGBA_S3TC_DXT5_EXT: return VK_FORMAT_BC3_UNORM_BLOCK;
+        // ---- BC4/BC5/BC6H/BC7 (GL_ARB_texture_compression_bptc / RGTC) ----
+        // 注：Apple GPU 不原生支持 BCn，vkCreateImage 会失败并走错误路径。
+        // 保留映射是为了让格式至少被识别（而非 VK_FORMAT_UNDEFINED 静默丢纹理），
+        // 真正的 BCn 软解需后续实现。ASTC/ETC2（见下）才是 Apple 原生支持的。
+        case 0x8DBB: return VK_FORMAT_BC4_UNORM_BLOCK;  // GL_COMPRESSED_RED_RGTC1
+        case 0x8DBC: return VK_FORMAT_BC4_SNORM_BLOCK;  // GL_COMPRESSED_SIGNED_RED_RGTC1
+        case 0x8DBD: return VK_FORMAT_BC5_UNORM_BLOCK;  // GL_COMPRESSED_RG_RGTC2
+        case 0x8DBE: return VK_FORMAT_BC5_SNORM_BLOCK;  // GL_COMPRESSED_SIGNED_RG_RGTC2
+        case 0x8E8C: return VK_FORMAT_BC6H_UFLOAT_BLOCK; // GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT
+        case 0x8E8D: return VK_FORMAT_BC6H_SFLOAT_BLOCK; // GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT
+        case 0x8E8E: return VK_FORMAT_BC7_UNORM_BLOCK;   // GL_COMPRESSED_RGBA_BPTC_UNORM
+        case 0x8E8F: return VK_FORMAT_BC7_SRGB_BLOCK;    // GL_COMPRESSED_SRGB_ALPHA_BPTC_UNORM
+        // ---- ASTC (Apple GPU 原生支持，移动平台资源包常用) ----
+        // GL_COMPRESSED_RGBA_ASTC_*_KHR (0x93B1..0x93C0) + sRGB (0x93D1..0x93E0)
+        case 0x93B1: return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+        case 0x93B2: return VK_FORMAT_ASTC_5x4_UNORM_BLOCK;
+        case 0x93B3: return VK_FORMAT_ASTC_5x5_UNORM_BLOCK;
+        case 0x93B4: return VK_FORMAT_ASTC_6x5_UNORM_BLOCK;
+        case 0x93B5: return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        case 0x93B6: return VK_FORMAT_ASTC_8x5_UNORM_BLOCK;
+        case 0x93B7: return VK_FORMAT_ASTC_8x6_UNORM_BLOCK;
+        case 0x93B8: return VK_FORMAT_ASTC_8x8_UNORM_BLOCK;
+        case 0x93B9: return VK_FORMAT_ASTC_10x5_UNORM_BLOCK;
+        case 0x93BA: return VK_FORMAT_ASTC_10x6_UNORM_BLOCK;
+        case 0x93BB: return VK_FORMAT_ASTC_10x8_UNORM_BLOCK;
+        case 0x93BC: return VK_FORMAT_ASTC_10x10_UNORM_BLOCK;
+        case 0x93BD: return VK_FORMAT_ASTC_12x10_UNORM_BLOCK;
+        case 0x93BE: return VK_FORMAT_ASTC_12x12_UNORM_BLOCK;
+        case 0x93D1: return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+        case 0x93D2: return VK_FORMAT_ASTC_5x4_SRGB_BLOCK;
+        case 0x93D3: return VK_FORMAT_ASTC_5x5_SRGB_BLOCK;
+        case 0x93D4: return VK_FORMAT_ASTC_6x5_SRGB_BLOCK;
+        case 0x93D5: return VK_FORMAT_ASTC_6x6_SRGB_BLOCK;
+        case 0x93D6: return VK_FORMAT_ASTC_8x5_SRGB_BLOCK;
+        case 0x93D7: return VK_FORMAT_ASTC_8x6_SRGB_BLOCK;
+        case 0x93D8: return VK_FORMAT_ASTC_8x8_SRGB_BLOCK;
+        case 0x93D9: return VK_FORMAT_ASTC_10x5_SRGB_BLOCK;
+        case 0x93DA: return VK_FORMAT_ASTC_10x6_SRGB_BLOCK;
+        case 0x93DB: return VK_FORMAT_ASTC_10x8_SRGB_BLOCK;
+        case 0x93DC: return VK_FORMAT_ASTC_10x10_SRGB_BLOCK;
+        case 0x93DD: return VK_FORMAT_ASTC_12x10_SRGB_BLOCK;
+        case 0x93DE: return VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+        // ---- ETC2 / EAC (Apple GPU 原生支持，GLES 资源包常用) ----
+        case 0x9270: return VK_FORMAT_EAC_R11_UNORM_BLOCK;       // GL_COMPRESSED_R11_EAC
+        case 0x9271: return VK_FORMAT_EAC_R11_SNORM_BLOCK;       // GL_COMPRESSED_SIGNED_R11_EAC
+        case 0x9272: return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;    // GL_COMPRESSED_RG11_EAC
+        case 0x9273: return VK_FORMAT_EAC_R11G11_SNORM_BLOCK;    // GL_COMPRESSED_SIGNED_RG11_EAC
+        case 0x9274: return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;   // GL_COMPRESSED_RGB8_ETC2
+        case 0x9275: return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;    // GL_COMPRESSED_SRGB8_ETC2
+        case 0x9276: return VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK; // GL_COMPRESSED_RGB8_PUNCH_THROUGH_ALPHA1_ETC2
+        case 0x9277: return VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK;  // GL_COMPRESSED_SRGB8_PUNCH_THROUGH_ALPHA1_ETC2
+        case 0x9278: return VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK; // GL_COMPRESSED_RGBA8_ETC2_EAC
+        case 0x9279: return VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK;  // GL_COMPRESSED_SRGB8_ALPHA8_ETC2_EAC
         // ---- Legacy fixed-function internal formats (Task 5) ----
         // GL_ALPHA / GL_LUMINANCE / GL_LUMINANCE_ALPHA / GL_INTENSITY are
         // pre-Core-Profile internal formats. Minecraft's font renderer (and

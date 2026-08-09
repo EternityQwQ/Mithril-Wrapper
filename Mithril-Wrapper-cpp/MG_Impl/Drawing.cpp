@@ -603,21 +603,242 @@ void glDrawElementsBaseVertexBaseInstance(GLenum mode, GLsizei count, GLenum typ
     g_state->currentBaseInstance = 0;
 }
 
+/* =========================================================================
+ * MultiDraw — MobileGL 风格高性能模拟
+ *
+ * 参照 MobileGL VulkanRenderer::MultiDrawArrays / MultiDrawElements
+ * (VulkanRenderer.cpp:6814 / 6844)：求 sub-draw 顶点范围并集 → 一次
+ * SetupDraw（pipeline + render pass + descriptors + dynamic state + vertex
+ * buffers）→ 循环 vkCmdDraw / vkCmdDrawIndexed → 一次 end_render_pass。
+ *
+ * 旧实现逐 sub-draw 调 glDrawArrays/glDrawElements，每次都重做 prepare_draw
+ * + end_draw（pipeline 查找 + render pass 开 + 关 + descriptor 重绑）。
+ * 对 Sodium 的数千 chunk draw，这把状态设置开销放大 drawcount 倍。
+ *
+ * 本实现把 prepare_draw/end_draw 提到循环外，drawcount 次 draw 共享同一
+ * render-pass 实例与 pipeline 绑定，仅 vkCmdDraw 的 first/count 参数变化。
+ * 这与 MobileGL 的"一次 SetupDraw + 循环 vkCmdDraw"完全等价。
+ *
+ * 不采用"打包成 indirect buffer + vkCmdDrawIndirect"路径的原因：
+ *   1. MobileGL 自己也不打包（它循环 vkCmdDraw），GL spec 允许该等价。
+ *   2. 打包需要把 CPU 端 first[]/count[] 拷进 GPU buffer，对纯 CPU 路径
+ *      反而多一次上传 + 同步开销；真正的 GPU-side MultiDraw 由
+ *      glMultiDraw*Indirect（见下）覆盖，那条路径数据本就在 GPU buffer。
+ * ========================================================================= */
 void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GLsizei drawcount) {
     MITHRIL_ENSURE_INIT();
     if (!first || !count || drawcount <= 0) return;
+    if (!prepare_draw(mode)) return;  // root cause AI — 一次 SetupDraw
     for (GLsizei i = 0; i < drawcount; ++i) {
-        if (count[i] > 0) glDrawArrays(mode, first[i], count[i]);
+        if (count[i] > 0) backend_draw_arrays((int)mode, (int)first[i], (int)count[i]);
     }
+    end_draw();  // 一次 end_render_pass
 }
 
 void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
                          const void* const* indices, GLsizei drawcount) {
     MITHRIL_ENSURE_INIT();
     if (!count || !indices || drawcount <= 0) return;
-    for (GLsizei i = 0; i < drawcount; ++i) {
-        if (count[i] > 0) glDrawElements(mode, count[i], type, indices[i]);
+    // 解析索引缓冲一次（所有 sub-draw 共享同一 GL_ELEMENT_ARRAY_BUFFER，
+    // 仅 offset 不同）。客户端指针路径逐 sub-draw staging。
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
+    VkBuffer ib = backend_get_buffer(ib_name);
+    int idx_type = index_type_to_int(type);
+    size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
+    if (!prepare_draw(mode)) return;  // root cause AI — 一次 SetupDraw
+    if (ib != VK_NULL_HANDLE) {
+        // VBO 路径：indices[i] 是 offset，零拷贝
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            if (count[i] > 0)
+                backend_draw_indexed((int)mode, (int)count[i], idx_type, ib,
+                                     (VkDeviceSize)(intptr_t)indices[i]);
+        }
+    } else {
+        // 客户端指针路径：逐 sub-draw staging 进 transient buffer
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            if (count[i] > 0 && indices[i]) {
+                GLuint transient = (GLuint)(uintptr_t)indices[i];
+                VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
+                                                               indices[i], (size_t)count[i] * elem);
+                if (staged != VK_NULL_HANDLE)
+                    backend_draw_indexed((int)mode, (int)count[i], idx_type, staged, 0);
+            }
+        }
     }
+    end_draw();
+}
+
+void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum type,
+                                   const void* const* indices, GLsizei drawcount,
+                                   const GLint* basevertex) {
+    MITHRIL_ENSURE_INIT();
+    if (!count || !indices || drawcount <= 0) return;
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
+    VkBuffer ib = backend_get_buffer(ib_name);
+    int idx_type = index_type_to_int(type);
+    size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
+    if (!prepare_draw(mode)) return;
+    if (ib != VK_NULL_HANDLE && basevertex) {
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            if (count[i] > 0) {
+                g_state->currentBaseVertex = basevertex[i];
+                backend_draw_indexed((int)mode, (int)count[i], idx_type, ib,
+                                     (VkDeviceSize)(intptr_t)indices[i]);
+            }
+        }
+        g_state->currentBaseVertex = 0;
+    } else if (basevertex) {
+        for (GLsizei i = 0; i < drawcount; ++i) {
+            if (count[i] > 0 && indices[i]) {
+                g_state->currentBaseVertex = basevertex[i];
+                GLuint transient = (GLuint)(uintptr_t)indices[i];
+                VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
+                                                               indices[i], (size_t)count[i] * elem);
+                if (staged != VK_NULL_HANDLE)
+                    backend_draw_indexed((int)mode, (int)count[i], idx_type, staged, 0);
+            }
+        }
+        g_state->currentBaseVertex = 0;
+    }
+    end_draw();
+}
+
+/* =========================================================================
+ * Indirect draw (GL 4.0 ARB_draw_indirect + GL 4.3 ARB_multi_draw_indirect)
+ *
+ * 参数块在 GPU buffer（GL_DRAW_INDIRECT_BUFFER）中，bit-identical 于
+ * VkDrawIndirectCommand / VkDrawIndexedIndirectCommand，直接传给
+ * vkCmdDrawIndirect / vkCmdDrawIndexedIndirect，完全 GPU-side，无 CPU 回读。
+ * 这是 Sodium 批量 chunk draw 的关键路径。
+ *
+ * 单个 glDrawArraysIndirect / glDrawElementsIndirect 复用 multi-draw 路径
+ * （draw_count=1），与 MobileGL DirectVulkan::DrawElementsIndirect
+ * (DirectVulkan.cpp:584) 的做法一致。
+ * ========================================================================= */
+void glDrawArraysIndirect(GLenum mode, const void* indirect) {
+    MITHRIL_ENSURE_INIT();
+    GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
+    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    if (indirect_buf == VK_NULL_HANDLE) return;
+    if (!prepare_draw(mode)) return;  // root cause AI
+    backend_draw_indirect((int)mode, indirect_buf,
+                          (VkDeviceSize)(intptr_t)indirect, 1, 0);
+    end_draw();
+}
+
+void glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
+    MITHRIL_ENSURE_INIT();
+    GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
+    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    if (indirect_buf == VK_NULL_HANDLE) return;
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
+    VkBuffer ib = backend_get_buffer(ib_name);
+    if (ib == VK_NULL_HANDLE) return;
+    if (!prepare_draw(mode)) return;
+    backend_draw_indexed_indirect((int)mode, index_type_to_int(type), ib, 0,
+                                  indirect_buf, (VkDeviceSize)(intptr_t)indirect,
+                                  1, 0);
+    end_draw();
+}
+
+void glMultiDrawArraysIndirect(GLenum mode, const void* indirect,
+                               GLsizei drawcount, GLsizei stride) {
+    MITHRIL_ENSURE_INIT();
+    if (drawcount <= 0) return;
+    GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
+    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    if (indirect_buf == VK_NULL_HANDLE) return;
+    if (!prepare_draw(mode)) return;
+    int s = stride ? stride : 16;  // sizeof(VkDrawIndirectCommand)
+    backend_draw_indirect((int)mode, indirect_buf,
+                          (VkDeviceSize)(intptr_t)indirect, drawcount, s);
+    end_draw();
+}
+
+void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect,
+                                 GLsizei drawcount, GLsizei stride) {
+    MITHRIL_ENSURE_INIT();
+    if (drawcount <= 0) return;
+    GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
+    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    if (indirect_buf == VK_NULL_HANDLE) return;
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
+    VkBuffer ib = backend_get_buffer(ib_name);
+    if (ib == VK_NULL_HANDLE) return;
+    if (!prepare_draw(mode)) return;
+    int s = stride ? stride : 20;  // sizeof(VkDrawIndexedIndirectCommand)
+    backend_draw_indexed_indirect((int)mode, index_type_to_int(type), ib, 0,
+                                  indirect_buf, (VkDeviceSize)(intptr_t)indirect,
+                                  drawcount, s);
+    end_draw();
+}
+
+/* =========================================================================
+ * Compute dispatch (GL 4.3 ARB_compute_shader)
+ *
+ * backend_dispatch_compute 已就绪：结束活动 render pass（Vulkan 禁止
+ * render pass 内 vkCmdDispatch）+ 绑定 compute pipeline + descriptor set +
+ * vkCmdDispatch。Iris 的 compute culling / shadow setup / 命令构建 shader
+ * 由此调度。
+ * ========================================================================= */
+#ifndef GL_DISPATCH_INDIRECT_BUFFER
+#define GL_DISPATCH_INDIRECT_BUFFER 0x90EE
+#endif
+
+void glDispatchCompute(GLuint groups_x, GLuint groups_y, GLuint groups_z) {
+    MITHRIL_ENSURE_INIT();
+    backend_dispatch_compute(groups_x, groups_y, groups_z);
+}
+
+void glDispatchComputeIndirect(GLintptr indirect) {
+    MITHRIL_ENSURE_INIT();
+    GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DispatchIndirect].name;
+    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    if (indirect_buf == VK_NULL_HANDLE) return;
+    backend_dispatch_compute_indirect(indirect_buf, (VkDeviceSize)indirect);
+}
+
+/* =========================================================================
+ * Memory barrier (GL 4.2 ARB_shader_image_load_store)
+ *
+ * backend_memory_barrier 已就绪：结束活动 render pass + 记录保守的
+ * ALL_COMMANDS -> ALL_COMMANDS VkMemoryBarrier。Iris 在 compute 写完
+ * image/SSBO 后必须调用，否则后续 draw 看不到 compute 的写入。
+ * ========================================================================= */
+#ifndef GL_ALL_BARRIER_BITS
+#define GL_ALL_BARRIER_BITS 0xFFFFFFFF
+#endif
+#ifndef GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT
+#define GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT  0x00000001
+#define GL_ELEMENT_ARRAY_BARRIER_BIT        0x00000002
+#define GL_UNIFORM_BARRIER_BIT              0x00000004
+#define GL_TEXTURE_FETCH_BARRIER_BIT        0x00000008
+#define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT  0x00000020
+#define GL_COMMAND_BARRIER_BIT              0x00000040
+#define GL_PIXEL_BUFFER_BARRIER_BIT         0x00000080
+#define GL_TEXTURE_UPDATE_BARRIER_BIT       0x00000100
+#define GL_BUFFER_UPDATE_BARRIER_BIT        0x00000200
+#define GL_FRAMEBUFFER_BARRIER_BIT          0x00000400
+#define GL_TRANSFORM_FEEDBACK_BARRIER_BIT   0x00000800
+#define GL_ATOMIC_COUNTER_BARRIER_BIT       0x00001000
+#define GL_SHADER_STORAGE_BARRIER_BIT       0x00002000
+#define GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT 0x00004000
+#endif
+
+void glMemoryBarrier(GLbitfield barriers) {
+    MITHRIL_ENSURE_INIT();
+    backend_memory_barrier(barriers);
+}
+
+void glTextureBarrier(void) {
+    MITHRIL_ENSURE_INIT();
+    // GL 4.5 ARB_texture_barrier: 确保 framebuffer 读取看到之前 draw 的写入。
+    // 保守实现为完整 memory barrier。
+    backend_memory_barrier(GL_FRAMEBUFFER_BARRIER_BIT);
 }
 
 /* ---- Sync objects (P1-16 FIX) ---- */

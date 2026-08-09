@@ -440,9 +440,59 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                        GLbitfield mask, GLenum filter) {
     MITHRIL_ENSURE_INIT();
 
-    // Only colour blits are implemented (depth/stencil blits are rare in MC
-    // Java's modern pipeline and require NEAREST filtering + aspect masks).
-    if (!(mask & GL_COLOR_BUFFER_BIT)) return;
+    // FIX (Iris 阴影贴图必需): depth/stencil blit 支持。Iris 的阴影贴图
+    // cascade copy、深度 pre-pass 重建依赖 glBlitFramebuffer(...,
+    // GL_DEPTH_BUFFER_BIT, GL_NEAREST)。原实现直接 return → 拿到未初始化的
+    // depth buffer → 阴影完全错乱或消失。
+    //
+    // GL spec: depth/stencil blit 强制 GL_NEAREST（忽略 filter 参数）。
+    // backend_blit_images 通过 aspect_for_format(format) 自动选择
+    // VK_IMAGE_ASPECT_DEPTH_BIT / STENCIL_BIT，所以只需传入 depth 格式即可。
+    if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) {
+        backend_end_render_pass();
+        backend_commit();
+
+        VkImage dsrc = VK_NULL_HANDLE, ddst = VK_NULL_HANDLE;
+        VkFormat dsrc_fmt = VK_FORMAT_UNDEFINED, ddst_fmt = VK_FORMAT_UNDEFINED;
+        int ddst_h = 0;
+        bool d_dst_default = (g_state->currentDrawFBO == 0);
+
+        if (g_state->currentReadFBO == 0) {
+            dsrc = g_state->eglDefaultDepthImage;
+            dsrc_fmt = g_state->eglDefaultDepthFormat;
+        } else {
+            mithril::Framebuffer* sf = mithril::state_get_framebuffer(g_state->currentReadFBO);
+            if (sf && sf->depth.texture) {
+                dsrc = backend_get_texture_image(sf->depth.texture);
+                mithril::Texture* t = mithril::state_get_texture(sf->depth.texture);
+                if (t) dsrc_fmt = backend_vk_format_for_gl((GLenum)t->internalFormat);
+            }
+        }
+        if (d_dst_default) {
+            ddst = g_state->eglDefaultDepthImage;
+            ddst_fmt = g_state->eglDefaultDepthFormat;
+            ddst_h = g_state->eglDefaultHeight;
+        } else {
+            mithril::Framebuffer* df = mithril::state_get_framebuffer(g_state->currentDrawFBO);
+            if (df && df->depth.texture) {
+                ddst = backend_get_texture_image(df->depth.texture);
+                mithril::Texture* t = mithril::state_get_texture(df->depth.texture);
+                if (t) { ddst_fmt = backend_vk_format_for_gl((GLenum)t->internalFormat); ddst_h = t->height; }
+            }
+        }
+        if (dsrc != VK_NULL_HANDLE && ddst != VK_NULL_HANDLE &&
+            dsrc_fmt != VK_FORMAT_UNDEFINED && ddst_fmt != VK_FORMAT_UNDEFINED) {
+            backend_blit_images(dsrc, dsrc_fmt, ddst, ddst_fmt,
+                                srcX0, srcY0, srcX1, srcY1,
+                                dstX0, dstY0, dstX1, dstY1,
+                                mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT),
+                                GL_NEAREST, d_dst_default ? 1 : 0, ddst_h);
+        }
+        // 若同时有 color bit，继续走下面的 color 路径；否则返回。
+        if (!(mask & GL_COLOR_BUFFER_BIT)) return;
+        // color 路径需要重新 end_render_pass/commit（上面已做，但 color 路径
+        // 自身也会做；为保持原流程不变，这里不重复，直接进入 color 解析）。
+    }
 
     // Flush any pending rendering into the source/destination so the blit
     // sees the latest pixels and subsequent draws see the blit's result.

@@ -6,7 +6,7 @@
 #
 #   apt-get install -y libvulkan-dev glslang-dev spirv-cross
 set -u
-ROOT="$(cd "$(dirname "$0")/../Mithril-Wrapper/Mithril-Wrapper-cpp" && pwd)"
+ROOT="$(cd "$(dirname "$0")/../Mithril-Wrapper-cpp" && pwd)"
 CXX=${CXX:-g++}
 
 FLAGS=(-std=c++17 -fsyntax-only

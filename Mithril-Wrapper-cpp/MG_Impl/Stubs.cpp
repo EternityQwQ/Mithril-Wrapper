@@ -480,6 +480,14 @@ void glEndQuery(GLenum target) {
         if (q.active && q.target == qt) {
             q.active = false;
             q.ended = true;
+            // FIX (Iris occlusion culling 黑屏): 真实实现需要 vkCreateQueryPool
+            // + vkCmdBeginQuery/EndQuery + vkGetQueryPoolResults。当前为保守
+            // stub：标记结果可用并返回非零值（"有样本通过"），让 Iris 的
+            // occlusion culling 认为被测几何可见，不会把整个场景 cull 掉。
+            // 返回 0 会导致 Iris 认为"什么都没通过 occlusion 测试"→ 黑屏。
+            // TODO: 接入真实 VkQueryPool 实现精确 occlusion culling。
+            q.resultCached = true;
+            q.cachedResult = 1;
             break;
         }
     }
@@ -529,6 +537,56 @@ void glQueryCounter(GLuint id, GLenum target) {
     if (!q) { mithril::state_set_error(GL_INVALID_OPERATION); return; }
     q->target = mithril::QueryTarget::Timestamp;
     q->ended = true;
+    // 保守 stub：时间戳查询立即可用，返回非零（见 glEndQuery 同类修复）。
+    q->resultCached = true;
+    q->cachedResult = 1;
+}
+
+/* =========================================================================
+ * Image texture binding (GL 4.2 ARB_shader_image_load_store)
+ *
+ * glBindImageTexture 把一个纹理对象绑定到一个 image unit。shader 中的
+ * image2D / imageBuffer uniform 通过 glUniform1i 指向 unit，DescriptorSet.cpp
+ * 在 draw 时从 g_state->imageTextureUnits[unit] 取纹理 view 写入 storage
+ * image 描述符。Iris 用此机制写 culling 输出（indirection/visibility buffer）。
+ *
+ * 本实现仅记录 unit→texture 绑定（backend 已就绪），access/format/layered
+ * 等参数由纹理本身的 format 隐式决定（MoltenVK storage image 要求
+ * VK_IMAGE_LAYOUT_GENERAL，由 backend 在绑定描述符时声明）。
+ * ========================================================================= */
+#ifndef GL_READ_ONLY
+#define GL_READ_ONLY  0x88B8
+#define GL_WRITE_ONLY 0x88B9
+#define GL_READ_WRITE 0x88BA
+#endif
+
+void glBindImageTexture(GLuint unit, GLuint texture, GLint level,
+                        GLboolean layered, GLint layer, GLenum access,
+                        GLenum format) {
+    MITHRIL_ENSURE_INIT();
+    (void)level; (void)layered; (void)layer; (void)access; (void)format;
+    if (unit >= mithril::kMaxTextureUnits) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    g_state->imageTextureUnits[unit] = texture;
+}
+
+/* =========================================================================
+ * Shader storage block binding (GL 4.3 ARB_shader_storage_buffer_object)
+ *
+ * glShaderStorageBlockBinding 把 program 的一个 SSBO block 重定向到指定
+ * GL binding point。DescriptorSet.cpp 在 draw 时从
+ * prog->storageBlockBindings[blockIndex] 查找重定向的 point，再从
+ * g_state->indexedBufferBindings[ShaderStorage][point] 取实际 VkBuffer。
+ * Sodium/Iris 用此机制显式重定向 SSBO binding。
+ * ========================================================================= */
+void glShaderStorageBlockBinding(GLuint program, GLuint storageBlockIndex,
+                                 GLuint storageBlockBinding) {
+    MITHRIL_ENSURE_INIT();
+    mithril::Program* prog = mithril::state_get_program(program);
+    if (!prog) { mithril::state_set_error(GL_INVALID_OPERATION); return; }
+    prog->storageBlockBindings[storageBlockIndex] = storageBlockBinding;
 }
 
 /* =========================================================================
