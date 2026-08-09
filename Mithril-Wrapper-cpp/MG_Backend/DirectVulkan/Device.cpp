@@ -383,6 +383,24 @@ bool init_device() {
     Backend* b = backend();
     if (b->initialized) return true;
 
+    // Not initialised, yet an instance is already sitting in the backend: a
+    // previous call got as far as vkCreateInstance and then bailed out further
+    // down (an extension check, no graphics queue family, ...). Every one of
+    // those exits returns false without unwinding, and the function below
+    // starts over from vkCreateInstance, so the old handle would simply be
+    // overwritten. A leaked VkInstance is not a few bytes here — MoltenVK hangs
+    // the Metal device, the physical-device objects and its whole queue
+    // machinery off it, and none of that is reclaimed until the process exits.
+    // Release it before rebuilding.
+    if (b->instance != VK_NULL_HANDLE) {
+        MITHRIL_LOG_WARN("vk", "init_device() retrying after an earlier partial "
+                               "failure; destroying the leftover VkInstance first");
+        vkDestroyInstance(b->instance, nullptr);
+        b->instance = VK_NULL_HANDLE;
+        b->physicalDevice = VK_NULL_HANDLE;
+        b->createMetalSurfaceEXT = nullptr;
+    }
+
     // ---- MoltenVK runtime configuration (root cause T) ----
     // Set critical MoltenVK environment variables BEFORE vkCreateInstance.
     // MoltenVK reads these once during instance creation; setting them after

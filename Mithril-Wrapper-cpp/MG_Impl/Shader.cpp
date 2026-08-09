@@ -540,6 +540,77 @@ struct Cache {
 };
 Cache& cache() { static Cache c; return c; }
 
+// ---------------------------------------------------------------------------
+// Per-stage descriptor binding spaces.
+//
+// setAutoMapBindings() numbers bindings per TShader, always restarting at 0.
+// Every GL stage is compiled as its own TShader here — there is no single
+// TProgram spanning both stages before SPIR-V generation — so glslang has no
+// way to coordinate the two, and does not try to. A Minecraft program such as
+// rendertype_text comes out of the compiler like this:
+//
+//   vertex:    mithril_GlobalBlock -> set 0, binding 0   (ModelViewMat, ProjMat)
+//              Sampler2            -> set 0, binding 1   (lightmap)
+//   fragment:  mithril_GlobalBlock -> set 0, binding 0   (ColorModulator, Fog*)
+//              Sampler0            -> set 0, binding 1   (glyph atlas)
+//
+// Both stages claim (set 0, binding 0) and (set 0, binding 1) for entirely
+// different resources. merge_bindings() keys a descriptor on
+// (set, binding, type) and so reads each colliding pair as ONE descriptor: the
+// fragment entries are dropped and only their stageMask is OR-ed into the
+// vertex entry. Everything downstream inherits the damage:
+//
+//   * Program.cpp builds the uniform table from the merged list, so every
+//     fragment-only uniform disappears. That is precisely what the device log
+//     shows — ColorModulator / FogStart / FogEnd / FogColor / Sampler0 all
+//     report "could not find uniform named ...", while not one vertex uniform
+//     does. glUniform1i(Sampler0, 0) is then never issued, so the backend
+//     never learns which texture unit feeds the sampler.
+//   * The surviving descriptor carries the vertex block's size and member
+//     offsets, so the fragment stage reads matrix bytes where a colour belongs.
+//   * The sampler descriptor resolves to the vertex stage's texture (Sampler2)
+//     while the fragment shader samples it as Sampler0.
+//   * MoltenVK is handed a single binding that the two stages disagree about,
+//     and the MSL it generates for the fragment stage uses a sampler it never
+//     declared:  error: use of undeclared identifier 'Sampler0Smplr'
+//     — which fails pipeline creation outright (rc=-3 in the device log).
+//
+// Giving each stage its own range makes the collision arithmetically
+// impossible. glslang exposes exactly this through setShiftBinding(), the same
+// mechanism HLSL uses to separate register spaces: the shift becomes the
+// starting point for auto-assignment and is also added to any explicit
+// layout(binding=) a shader declares, so both kinds of shader stay separated.
+//
+// The span is 64 while kMaxTextureUnits is 32, so a stage would have to declare
+// 32 samplers AND 32 buffers before it could reach the next stage's range.
+// Vulkan places no requirement on binding numbers being dense, and descriptor
+// pool sizes are computed from descriptor COUNTS rather than from the largest
+// binding, so the sparse layout costs nothing.
+constexpr unsigned kBindingSpacePerStage = 64;
+
+unsigned binding_base_for_stage(EShLanguage stage) {
+    switch (stage) {
+        case EShLangVertex:   return 0u * kBindingSpacePerStage;
+        case EShLangFragment: return 1u * kBindingSpacePerStage;
+        case EShLangCompute:  return 2u * kBindingSpacePerStage;
+        default:              return 3u * kBindingSpacePerStage;
+    }
+}
+
+// Must run on every TShader before parse(), the two fallback shaders included:
+// a shader that only survives the second or third attempt would otherwise slip
+// back to colliding bindings — and would do it silently, since nothing fails
+// until MoltenVK rejects the generated MSL several frames later.
+void apply_stage_binding_shift(glslang::TShader& sh, EShLanguage stage) {
+    const unsigned base = binding_base_for_stage(stage);
+    if (base == 0) return;  // vertex already starts at 0
+    sh.setShiftBinding(glslang::EResUbo,     base);
+    sh.setShiftBinding(glslang::EResTexture, base);  // combined image samplers
+    sh.setShiftBinding(glslang::EResSampler, base);
+    sh.setShiftBinding(glslang::EResImage,   base);
+    sh.setShiftBinding(glslang::EResSsbo,    base);
+}
+
 bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
                    std::vector<uint32_t>& spirv, std::string& info,
                    const std::unordered_map<std::string, GLuint>* attrib_bindings,
@@ -614,6 +685,12 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
     shader.setAutoMapLocations(true);
     shader.setAutoMapBindings(true);
 
+    // Keep this stage's descriptor bindings out of every other stage's range.
+    // Auto-assignment restarts at 0 for each TShader, so without the shift the
+    // vertex and fragment stages hand identical (set, binding) pairs to two
+    // unrelated resources and merge_bindings() folds them into one.
+    apply_stage_binding_shift(shader, stage);
+
     // Inject the Mithril backend identification macros so host shaders can
     // branch on the backend (mirrors MobileGlues' MG_MOBILEGLUES injection).
     // MG_MITHRIL_VERSION encodes major/minor/patch as MMMNNPPP decimal.
@@ -656,6 +733,7 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
             shader2.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_5);
             shader2.setAutoMapLocations(true);
             shader2.setAutoMapBindings(true);
+            apply_stage_binding_shift(shader2, stage);
             shader2.setPreamble(
                 "#define MG_MITHRIL 1\n"
                 "#define MG_MITHRIL_VERSION 1000000\n"
@@ -696,6 +774,7 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
                 shader3.setEnvInputVulkanRulesRelaxed();  // key: accept GL legacy constructs
                 shader3.setAutoMapLocations(true);
                 shader3.setAutoMapBindings(true);
+                apply_stage_binding_shift(shader3, stage);
                 shader3.setPreamble(
                     "#define MG_MITHRIL 1\n"
                     "#define MG_MITHRIL_VERSION 1000000\n"
