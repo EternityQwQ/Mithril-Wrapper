@@ -1179,6 +1179,107 @@ void backend_texture_upload(GLuint name, int level, int x, int y, int z,
                                       is_full_upload != 0);
 }
 
+/* Compressed texture upload. Compressed data is copied verbatim — no pixel
+ * unpack/RGB-expand. The VkBufferImageCopy uses bufferRowLength=0 (tightly
+ * packed) and imageExtent = (w,h,d). For block-compressed formats Vulkan
+ * interprets the buffer as a sequence of compressed blocks, so a direct
+ * memcpy is correct. */
+void backend_texture_upload_compressed(GLuint name, int level, int x, int y, int z,
+                                       int w, int h, int d,
+                                       GLenum internalFormat,
+                                       GLsizei dataLen, const void* pixels,
+                                       int is_full_upload) {
+    using namespace mithril::vk;
+    auto& tbl = texture_table();
+    auto it = tbl.find(name);
+    if (it == tbl.end() || !pixels || dataLen <= 0) return;
+    TextureEntry& tex = it->second;
+    Backend* b = backend();
+    if (!b->commandBuffer) return;
+    if (!ensure_command_buffer_recording()) return;
+
+    // Transition image to TRANSFER_DST_OPTIMAL if needed.
+    if (tex.currentLayout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        transition_image_layout(tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    }
+
+    // Allocate staging buffer and copy compressed data verbatim.
+    // Uses the same per-frame transient staging arena as stage_and_copy_image
+    // to avoid per-texture vkCreateBuffer/vkAllocateMemory.
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceSize stagingOffset = 0;
+    void* stagingMapped = nullptr;
+    VkDeviceSize allocSize = dataLen;
+    if (b->frameStagingReady) {
+        VkDeviceSize alignedOffset = (b->frameStagingOffset[b->currentFrame] + 255) & ~255;
+        if (alignedOffset + allocSize <= Backend::kFrameStagingSize) {
+            stagingBuffer = b->frameStagingBuffer[b->currentFrame];
+            stagingOffset = alignedOffset;
+            stagingMapped = b->frameStagingMapped[b->currentFrame];
+            b->frameStagingOffset[b->currentFrame] = alignedOffset + allocSize;
+        }
+    }
+    if (stagingBuffer == VK_NULL_HANDLE) {
+        // Fallback: temporary staging buffer with deferred destroy.
+        // Reuses the same pattern as stage_and_copy_image's overflow path.
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = allocSize;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(b->device, &bci, nullptr, &stagingBuffer) != VK_SUCCESS) return;
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(b->device, stagingBuffer, &mr);
+        // Reuse the existing find_memory_type helper (queries b->memProps).
+        uint32_t memType = find_memory_type(mr.memoryTypeBits,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        if (memType == 0xFFFFFFFFu) {
+            vkDestroyBuffer(b->device, stagingBuffer, nullptr);
+            return;
+        }
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = mr.size;
+        mai.memoryTypeIndex = memType;
+        VkDeviceMemory tmpMem = VK_NULL_HANDLE;
+        // FIX (OOM 主动 GC): use GC-aware allocator consistent with create_buffer.
+        if (try_allocate_memory_with_gc(b->device, &mai, nullptr, &tmpMem) != VK_SUCCESS) {
+            vkDestroyBuffer(b->device, stagingBuffer, nullptr);
+            return;
+        }
+        vkBindBufferMemory(b->device, stagingBuffer, tmpMem, 0);
+        vkMapMemory(b->device, tmpMem, 0, allocSize, 0, &stagingMapped);
+        stagingOffset = 0;
+        // Defer destroy until GPU finishes (same struct as stage_and_copy_image).
+        DeferredDestroy ds{};
+        ds.buffer = stagingBuffer;
+        ds.memory = tmpMem;
+        b->disposalQueue[b->currentFrame].push_back(ds);
+    }
+    std::memcpy(static_cast<uint8_t*>(stagingMapped) + stagingOffset, pixels, dataLen);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = stagingOffset;
+    region.bufferRowLength = 0;  // tightly packed
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = level;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {x, y, z};
+    region.imageExtent = {(uint32_t)w, (uint32_t)h, (uint32_t)d};
+
+    vkCmdCopyBufferToImage(b->commandBuffer, stagingBuffer, tex.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Transition to SHADER_READ_ONLY if this was a full upload (typical for
+    // glCompressedTexImage2D). Partial uploads (SubImage) leave it in
+    // TRANSFER_DST_OPTIMAL so subsequent uploads don't re-transition.
+    if (is_full_upload) {
+        transition_image_layout(tex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+}
+
 void backend_texture_set_params(GLuint name, GLint min_filter, GLint mag_filter,
                                 GLint wrap_s, GLint wrap_t, GLint wrap_r,
                                 const float* border_color) {

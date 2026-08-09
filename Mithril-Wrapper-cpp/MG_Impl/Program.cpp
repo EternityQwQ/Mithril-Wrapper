@@ -542,8 +542,73 @@ GLuint glGetUniformBlockIndex(GLuint program, const GLchar* uniformBlockName) {
 void glGetActiveUniformBlockiv(GLuint program, GLuint uniformBlockIndex,
                                GLenum pname, GLint* params) {
     MITHRIL_ENSURE_INIT();
-    (void)program; (void)uniformBlockIndex; (void)pname;
-    if (params) *params = 0;
+    if (!params) return;
+    mithril::Program* p = mithril::state_get_program(program);
+    if (!p) { *params = 0; return; }
+    // uniformBlockIndex is the binding value we stored (see uniformBlocks map).
+    // Find the block by binding value and answer common queries.
+    switch (pname) {
+        case GL_UNIFORM_BLOCK_BINDING:
+            *params = (GLint)uniformBlockIndex;
+            break;
+        case GL_UNIFORM_BLOCK_DATA_SIZE: {
+            // Sum member sizes for this binding. Members are stored in
+            // p->uniforms with blockBinding == uniformBlockIndex.
+            auto type_size = [](GLenum type, GLint arrSize) -> GLint {
+                GLint base = 4;
+                switch (type) {
+                    case GL_FLOAT: base = 4; break;
+                    case GL_FLOAT_VEC2: base = 8; break;
+                    case GL_FLOAT_VEC3: base = 12; break;
+                    case GL_FLOAT_VEC4: base = 16; break;
+                    case GL_INT: case GL_UNSIGNED_INT: case GL_BOOL: base = 4; break;
+                    case GL_INT_VEC2: case GL_UNSIGNED_INT_VEC2: case GL_BOOL_VEC2: base = 8; break;
+                    case GL_INT_VEC3: case GL_UNSIGNED_INT_VEC3: case GL_BOOL_VEC3: base = 12; break;
+                    case GL_INT_VEC4: case GL_UNSIGNED_INT_VEC4: case GL_BOOL_VEC4: base = 16; break;
+                    case GL_FLOAT_MAT2: base = 16; break;
+                    case GL_FLOAT_MAT3: base = 36; break;
+                    case GL_FLOAT_MAT4: base = 64; break;
+                    default: base = 16; break;  // conservative
+                }
+                return base * std::max(1, arrSize);
+            };
+            GLint total = 0;
+            for (const auto& kv : p->uniforms) {
+                if (kv.second.blockBinding == (GLint)uniformBlockIndex) {
+                    total += std::max(kv.second.arrayStride,
+                                      type_size(kv.second.type, kv.second.size));
+                }
+            }
+            *params = total;
+            break;
+        }
+        case GL_UNIFORM_BLOCK_NAME_LENGTH: {
+            // Find block name by binding.
+            std::string name;
+            for (const auto& kv : p->uniformBlocks) {
+                if (kv.second == uniformBlockIndex) { name = kv.first; break; }
+            }
+            *params = (GLint)name.length() + 1;  // include null terminator
+            break;
+        }
+        case GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS: {
+            GLint count = 0;
+            for (const auto& kv : p->uniforms) {
+                if (kv.second.blockBinding == (GLint)uniformBlockIndex) ++count;
+            }
+            *params = count;
+            break;
+        }
+        case GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER:
+            *params = GL_TRUE;  // conservative: assume VS references it
+            break;
+        case GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER:
+            *params = GL_TRUE;  // conservative: assume FS references it
+            break;
+        default:
+            *params = 0;
+            break;
+    }
 }
 
 void glUniformBlockBinding(GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding) {

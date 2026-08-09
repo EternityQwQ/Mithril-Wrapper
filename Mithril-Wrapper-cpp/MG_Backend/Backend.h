@@ -309,6 +309,17 @@ void        backend_texture_upload(GLuint name, int level, int x, int y, int z,
                                    int w, int h, int d, GLenum format, GLenum type,
                                    const void* pixels, const MGUnpackParams* unpack,
                                    int is_full_upload);
+/* Compressed texture upload. dataLen is the byte size of the compressed
+ * payload. internalFormat is the GL compressed format enum (e.g.
+ * GL_COMPRESSED_RGBA8_ETC2_EAC). The VkFormat is resolved via
+ * backend_vk_format_for_gl in Resources.cpp. No pixel unpack/expand is
+ * performed — compressed data is copied verbatim to the staging buffer and
+ * vkCmdCopyBufferToImage copies it block-by-block. */
+void        backend_texture_upload_compressed(GLuint name, int level, int x, int y, int z,
+                                              int w, int h, int d,
+                                              GLenum internalFormat,
+                                              GLsizei dataLen, const void* pixels,
+                                              int is_full_upload);
 void        backend_texture_set_params(GLuint name, GLint min_filter, GLint mag_filter,
                                        GLint wrap_s, GLint wrap_t, GLint wrap_r,
                                        const float* border_color);

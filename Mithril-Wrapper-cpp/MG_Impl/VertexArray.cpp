@@ -146,6 +146,111 @@ void glVertexAttribDivisor(GLuint index, GLuint divisor) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GL 4.3 Separate Attribute Format API (GL_ARB_vertex_attrib_binding).
+//
+// 深度参考 MobileGL VertexArrayState 的 GL 4.3 路径：attribute 只声明
+// (format, relativeOffset)，不绑定 buffer；buffer 绑定到 binding index，
+// binding 持有 (buffer, offset, stride, divisor)。Pipeline.cpp 已读
+// bindings[attribs[loc].bindingIndex] 获取 stride/divisor/buffer。
+//
+// 经典 glVertexAttribPointer 等价于：
+//   glVertexAttribFormat(loc, size, type, norm, 0);
+//   glVertexAttribBinding(loc, loc);
+//   glBindVertexBuffer(loc, buffer, pointer, stride);
+//   glVertexAttribDivisor(loc, divisor);
+//
+// 这些入口让走 GL 4.3 API 的 mod（如 Iris 部分路径）能正常工作。
+// ---------------------------------------------------------------------------
+
+void glBindVertexBuffer(GLuint bindingindex, GLuint buffer, GLintptr offset, GLsizei stride) {
+    MITHRIL_ENSURE_INIT();
+    if (bindingindex >= (GLuint)mithril::kMaxVertexBindings) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (!vao) return;
+    mithril::VertexBinding& vb = vao->bindings[bindingindex];
+    vb.buffer = buffer;
+    vb.offset = offset;
+    vb.stride = stride;
+    // bump configVersion so pipeline re-evaluates vertex input state
+    vao->configVersion++;
+}
+
+void glVertexAttribBinding(GLuint attribindex, GLuint bindingindex) {
+    MITHRIL_ENSURE_INIT();
+    if (attribindex >= (GLuint)mithril::kMaxVertexAttribs ||
+        bindingindex >= (GLuint)mithril::kMaxVertexBindings) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (!vao) return;
+    vao->attribs[attribindex].bindingIndex = bindingindex;
+    vao->attribVersions[attribindex]++;
+    vao->configVersion++;
+}
+
+void glVertexAttribFormat(GLuint attribindex, GLint size, GLenum type,
+                          GLboolean normalized, GLuint relativeoffset) {
+    MITHRIL_ENSURE_INIT();
+    if (attribindex >= (GLuint)mithril::kMaxVertexAttribs) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (!vao) return;
+    mithril::VertexAttrib& a = vao->attribs[attribindex];
+    a.size = size;
+    a.type = type;
+    a.normalized = (normalized != 0);
+    a.integer = false;
+    // relativeoffset is the byte offset within the vertex buffer binding's
+    // stride where this attribute's data begins. Stored in pointer field
+    // (same as glVertexAttribPointer's pointer-as-offset convention).
+    a.pointer = (const void*)(uintptr_t)relativeoffset;
+    vao->attribVersions[attribindex]++;
+    vao->configVersion++;
+}
+
+void glVertexAttribIFormat(GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset) {
+    MITHRIL_ENSURE_INIT();
+    if (attribindex >= (GLuint)mithril::kMaxVertexAttribs) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (!vao) return;
+    mithril::VertexAttrib& a = vao->attribs[attribindex];
+    a.size = size;
+    a.type = type;
+    a.normalized = false;
+    a.integer = true;
+    a.pointer = (const void*)(uintptr_t)relativeoffset;
+    vao->attribVersions[attribindex]++;
+    vao->configVersion++;
+}
+
+void glVertexAttribLFormat(GLuint attribindex, GLint size, GLenum type, GLuint relativeoffset) {
+    // L-format = double-precision. Treated as I-format for now (MC doesn't use
+    // double-precision vertex attributes; this satisfies symbol resolution).
+    glVertexAttribIFormat(attribindex, size, type, relativeoffset);
+}
+
+void glVertexBindingDivisor(GLuint bindingindex, GLuint divisor) {
+    MITHRIL_ENSURE_INIT();
+    if (bindingindex >= (GLuint)mithril::kMaxVertexBindings) {
+        mithril::state_set_error(GL_INVALID_VALUE);
+        return;
+    }
+    mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
+    if (!vao) return;
+    vao->bindings[bindingindex].divisor = divisor;
+    vao->configVersion++;
+}
+
 void glVertexAttrib1f(GLuint index, GLfloat x) {
     MITHRIL_ENSURE_INIT();
     (void)index; (void)x;

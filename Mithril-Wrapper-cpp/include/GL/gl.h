@@ -431,6 +431,44 @@ GLAPI void GLAPIENTRY glDepthBoundsEXT(GLclampd zmin, GLclampd zmax);
 #ifndef GL_FLOAT_MAT4
 #define GL_FLOAT_MAT4 0x8B5C
 #endif
+// Minimal GL 2.0/3.0 scalar + vector types used by uniform reflection
+// (glGetActiveUniformBlockiv, Program.cpp). Standard GL enum values.
+#ifndef GL_INT
+#define GL_INT 0x1404
+#endif
+#ifndef GL_UNSIGNED_INT
+#define GL_UNSIGNED_INT 0x1405
+#endif
+#ifndef GL_BOOL
+#define GL_BOOL 0x8B56
+#endif
+#ifndef GL_INT_VEC2
+#define GL_INT_VEC2 0x8B53
+#endif
+#ifndef GL_INT_VEC3
+#define GL_INT_VEC3 0x8B54
+#endif
+#ifndef GL_INT_VEC4
+#define GL_INT_VEC4 0x8B55
+#endif
+#ifndef GL_BOOL_VEC2
+#define GL_BOOL_VEC2 0x8B57
+#endif
+#ifndef GL_BOOL_VEC3
+#define GL_BOOL_VEC3 0x8B58
+#endif
+#ifndef GL_BOOL_VEC4
+#define GL_BOOL_VEC4 0x8B59
+#endif
+#ifndef GL_UNSIGNED_INT_VEC2
+#define GL_UNSIGNED_INT_VEC2 0x8DC6
+#endif
+#ifndef GL_UNSIGNED_INT_VEC3
+#define GL_UNSIGNED_INT_VEC3 0x8DC7
+#endif
+#ifndef GL_UNSIGNED_INT_VEC4
+#define GL_UNSIGNED_INT_VEC4 0x8DC8
+#endif
 #ifndef GL_FLOAT_VEC2
 #define GL_FLOAT_VEC2 0x8B50
 #endif

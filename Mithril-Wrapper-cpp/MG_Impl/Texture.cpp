@@ -314,6 +314,120 @@ void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalform
                                   internalformat, target, samples > 1 ? samples : 1);
 }
 
+// ---------------------------------------------------------------------------
+// Compressed texture upload (GL 3.1+ / ARB_texture_compression).
+//
+// 压缩纹理数据直接 memcpy 到 staging buffer，vkCmdCopyBufferToImage 按块
+// 拷贝。iOS/Metal 原生支持 ASTC/ETC2/EAC（Apple GPU），BC1-BC7 需要
+// MoltenVK 1.2.9+ 的 emulate-default-* 选项（或硬件解码）。FormatMap.cpp
+// 已映射所有这些格式到对应的 VkFormat。
+//
+// 深度参考 MobileGL VkTextureManager::UploadCompressedTexture：数据直接
+// 拷贝到 staging，VkBufferImageCopy.bufferRowLength=0（紧密排列），不
+// 做像素展开。本实现等价。
+// ---------------------------------------------------------------------------
+
+void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
+                            GLsizei width, GLsizei height, GLint border,
+                            GLsizei imageSize, const void* data) {
+    MITHRIL_ENSURE_INIT();
+    if (border != 0) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    if (imageSize <= 0 || !data) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    if (target == GL_PROXY_TEXTURE_2D) {
+        // Proxy query: accept if within max texture size.
+        GLint maxSize = 16384;
+        if (width > 0 && height > 0 && width <= maxSize && height <= maxSize) {
+            g_state->proxyTexture2D.width = width;
+            g_state->proxyTexture2D.height = height;
+            g_state->proxyTexture2D.internalFormat = internalformat;
+            g_state->proxyTexture2D.valid = true;
+        } else {
+            g_state->proxyTexture2D.valid = false;
+        }
+        return;
+    }
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    if (level == 0) {
+        t->internalFormat = internalformat;
+        t->width  = width;
+        t->height = height;
+        t->depth  = 1;
+        t->isCompressed = true;
+    }
+    if (t->levels < level + 1) t->levels = level + 1;
+    backend_get_or_create_texture(t->id, t->width, t->height, 1, t->levels,
+                                  internalformat, target, 1);
+    backend_texture_upload_compressed(t->id, level, 0, 0, 0, width, height, 1,
+                                      internalformat, imageSize, data,
+                                      /*is_full_upload=*/1);
+}
+
+void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat,
+                            GLsizei width, GLsizei height, GLsizei depth, GLint border,
+                            GLsizei imageSize, const void* data) {
+    MITHRIL_ENSURE_INIT();
+    if (border != 0) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    if (imageSize <= 0 || !data) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    if (level == 0) {
+        t->internalFormat = internalformat;
+        t->width  = width;
+        t->height = height;
+        t->depth  = depth;
+        t->isCompressed = true;
+    }
+    if (t->levels < level + 1) t->levels = level + 1;
+    backend_get_or_create_texture(t->id, width, height, depth, t->levels,
+                                  internalformat, target, 1);
+    backend_texture_upload_compressed(t->id, level, 0, 0, 0, width, height, depth,
+                                      internalformat, imageSize, data,
+                                      /*is_full_upload=*/1);
+}
+
+void glCompressedTexSubImage2D(GLenum target, GLint level,
+                               GLint xoffset, GLint yoffset,
+                               GLsizei width, GLsizei height,
+                               GLenum format, GLsizei imageSize, const void* data) {
+    MITHRIL_ENSURE_INIT();
+    if (imageSize <= 0 || !data) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    // format parameter is the compressed format; pass as internalFormat to backend.
+    backend_texture_upload_compressed(t->id, level, xoffset, yoffset, 0,
+                                      width, height, 1, format, imageSize, data,
+                                      /*is_full_upload=*/0);
+}
+
+void glCompressedTexSubImage3D(GLenum target, GLint level,
+                               GLint xoffset, GLint yoffset, GLint zoffset,
+                               GLsizei width, GLsizei height, GLsizei depth,
+                               GLenum format, GLsizei imageSize, const void* data) {
+    MITHRIL_ENSURE_INIT();
+    if (imageSize <= 0 || !data) { mithril::state_set_error(GL_INVALID_VALUE); return; }
+    mithril::Texture* t = bound_texture_for_target(target);
+    if (!t) return;
+    backend_texture_upload_compressed(t->id, level, xoffset, yoffset, zoffset,
+                                      width, height, depth, format, imageSize, data,
+                                      /*is_full_upload=*/0);
+}
+
+void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat,
+                            GLsizei width, GLint border,
+                            GLsizei imageSize, const void* data) {
+    // 1D textures are emulated as 2D with height=1.
+    glCompressedTexImage2D(target, level, internalformat, width, 1, border,
+                           imageSize, data);
+}
+
+void glCompressedTexSubImage1D(GLenum target, GLint level,
+                               GLint xoffset, GLsizei width,
+                               GLenum format, GLsizei imageSize, const void* data) {
+    glCompressedTexSubImage2D(target, level, xoffset, 0, width, 1,
+                              format, imageSize, data);
+}
+
 void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
     MITHRIL_ENSURE_INIT();
     mithril::Texture* t = bound_texture_for_target(target);
