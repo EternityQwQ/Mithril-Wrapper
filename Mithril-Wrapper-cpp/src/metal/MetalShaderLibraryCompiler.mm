@@ -61,9 +61,12 @@ core::ValueResult<std::shared_ptr<CompiledMetalShader>> MetalShaderLibraryCompil
             length:artifact.entryPoint.size() encoding:NSUTF8StringEncoding];
         id<MTLFunction> function = [library newFunctionWithName:entry];
         if (function == nil) {
+            NSString* available = [library.functionNames componentsJoinedByString:@", "];
+            NSString* detail = [NSString stringWithFormat:@"Metal entry '%@' was not found; available: %@",
+                entry, available];
             return core::ValueResult<std::shared_ptr<CompiledMetalShader>>::failure(core::Error::make(
                 core::ErrorDomain::shader, core::ErrorCode::not_found,
-                "Metal shader entry point was not found"));
+                detail.UTF8String != nullptr ? detail.UTF8String : "Metal shader entry point was not found"));
         }
         auto impl = std::make_unique<CompiledMetalShader::Impl>();
         impl->library = library;

@@ -43,11 +43,18 @@ core::Expected<MslArtifact, ShaderDiagnostic> SpirvCrossMslCompiler::translate(
 
         MslArtifact result;
         result.stage = input.stage;
-        result.entryPoint = compiler.get_cleansed_entry_point_name(input.entryPoint,
-            input.stage == ShaderStage::vertex ? spv::ExecutionModelVertex : spv::ExecutionModelFragment);
         appendBindings(result.bindings, compiler, resources.uniform_buffers, BindingKind::uniformBuffer);
         appendBindings(result.bindings, compiler, resources.sampled_images, BindingKind::sampledTexture);
         result.source = compiler.compile();
+        // MSL compilation performs the final identifier legalization (for
+        // example, GLSL "main" becomes "main0"). Query the entry point only
+        // after compile() has finalized that mapping.
+        result.entryPoint = compiler.get_cleansed_entry_point_name(input.entryPoint,
+            input.stage == ShaderStage::vertex ? spv::ExecutionModelVertex : spv::ExecutionModelFragment);
+        if (result.entryPoint.empty()) {
+            return core::Expected<MslArtifact, ShaderDiagnostic>::failure({
+                ShaderErrorCode::translationFailed, "MSL entry point mapping is empty", "shader"});
+        }
         return result;
     } catch (const std::exception& error) {
         return core::Expected<MslArtifact, ShaderDiagnostic>::failure(sanitizeDiagnostic({
