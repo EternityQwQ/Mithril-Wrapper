@@ -8,7 +8,7 @@
 
 namespace mithril::ir {
 
-enum class Primitive : std::uint8_t { point, line, triangle };
+enum class Primitive : std::uint8_t { point, line, lineStrip, triangle, triangleStrip };
 enum class Compare : std::uint8_t { always, less, lessEqual, equal, greater };
 
 struct PipelineKey {

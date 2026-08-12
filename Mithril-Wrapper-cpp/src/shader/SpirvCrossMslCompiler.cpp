@@ -39,6 +39,10 @@ core::Expected<MslArtifact, ShaderDiagnostic> SpirvCrossMslCompiler::translate(
         options.platform = spirv_cross::CompilerMSL::Options::macOS;
 #endif
         compiler.set_msl_options(options);
+        auto commonOptions = compiler.get_common_options();
+        commonOptions.vertex.fixup_clipspace = true;
+        commonOptions.vertex.flip_vert_y = true;
+        compiler.set_common_options(commonOptions);
         const auto resources = compiler.get_shader_resources();
 
         MslArtifact result;

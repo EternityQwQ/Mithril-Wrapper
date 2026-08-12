@@ -55,6 +55,10 @@ option(MITHRIL_ENABLE_SHADER_TOOLCHAIN "Build the GLSL to MSL toolchain adapter"
 option(MITHRIL_BUILD_DIRECT "Build the Direct Metal shared library" ${APPLE})
 option(MITHRIL_BUILD_LEGACY "Build the retired Vulkan compatibility target" OFF)
 
+if(MITHRIL_BUILD_DIRECT AND NOT MITHRIL_ENABLE_SHADER_TOOLCHAIN)
+    message(FATAL_ERROR "MITHRIL_BUILD_DIRECT requires MITHRIL_ENABLE_SHADER_TOOLCHAIN")
+endif()
+
 # Keep the shipping target intact while the new core is established. Windows
 # can configure and test the new target without requiring the legacy SDK.
 if(MITHRIL_BUILD_LEGACY)

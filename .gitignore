@@ -3,6 +3,7 @@ build-core/
 build-core-*/
 build-verify-*/
 build-shader-*/
+build-gl-*/
 build-macos/
 build-ios/
 *.o

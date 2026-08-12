@@ -17,7 +17,7 @@ public:
     core::ValueResult<backend::Frame> acquire(core::SurfaceHandle) override {
         calls.emplace_back("acquire");
         if (!drawableAvailable) return core::ValueResult<backend::Frame>::failure(core::Error::make(core::ErrorDomain::surface, core::ErrorCode::unavailable, "drawable unavailable"));
-        return backend::Frame{1, generation, core::TextureHandle{1, 1}};
+        return backend::Frame{1, generation, core::TextureHandle{1, 1}, 640, 480};
     }
     core::Result present(const backend::Frame&) override { calls.emplace_back("present"); return {}; }
     core::Result release(core::SurfaceHandle) override { calls.emplace_back("release"); return {}; }

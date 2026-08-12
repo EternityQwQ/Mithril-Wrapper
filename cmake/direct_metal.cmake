@@ -56,6 +56,22 @@ if(MITHRIL_ENABLE_SHADER_TOOLCHAIN)
     if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         target_compile_definitions(mithril_shader_toolchain PRIVATE MITHRIL_TARGET_IOS=1)
     endif()
+
+    add_library(mithril_gl_frontend STATIC
+        ${MITHRIL_CORE_ROOT}/src/frontend/gl/DirectGlApi.cpp
+        ${MITHRIL_CORE_ROOT}/src/frontend/gl/DirectGlContext.cpp
+    )
+    target_include_directories(mithril_gl_frontend PUBLIC
+        ${MITHRIL_CORE_ROOT}/src
+        ${MITHRIL_CORE_ROOT}/include)
+    target_compile_features(mithril_gl_frontend PUBLIC cxx_std_20)
+    target_link_libraries(mithril_gl_frontend PRIVATE mithril_core mithril_shader_toolchain)
+    set_target_properties(mithril_gl_frontend PROPERTIES CXX_EXTENSIONS OFF)
+    if(MSVC)
+        target_compile_options(mithril_gl_frontend PRIVATE /W4 /WX /permissive- /utf-8)
+    else()
+        target_compile_options(mithril_gl_frontend PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    endif()
 endif()
 
 if(APPLE AND MITHRIL_BUILD_DIRECT)
@@ -74,7 +90,7 @@ if(APPLE AND MITHRIL_BUILD_DIRECT)
         ${MITHRIL_CORE_ROOT}/src
         ${MITHRIL_CORE_ROOT}/include)
     target_compile_features(mithril_direct PUBLIC cxx_std_20)
-    target_link_libraries(mithril_direct PRIVATE mithril_core
+    target_link_libraries(mithril_direct PRIVATE mithril_core mithril_shader_toolchain mithril_gl_frontend
         "-framework Metal" "-framework QuartzCore" "-framework Foundation")
     if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         target_link_libraries(mithril_direct PRIVATE "-framework UIKit")

@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
-$directories = @("metal", "platform/apple", "egl")
+$directories = @("metal", "platform/apple", "egl", "frontend/gl")
 $files = foreach ($directory in $directories) {
     $path = Join-Path $root ("Mithril-Wrapper-cpp/src/" + $directory)
     if (Test-Path -LiteralPath $path) {

@@ -1,6 +1,9 @@
 #import <EGL/egl.h>
 
 #include "egl/EglConfig.h"
+#include "egl/EglBridge.h"
+#include "frontend/gl/DirectGlContext.h"
+#include "frontend/gl/DirectGlApi.h"
 #include "gl/Context.h"
 #include "metal/MetalDeviceSession.h"
 
@@ -8,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <string_view>
 #include <unordered_set>
 
@@ -26,15 +30,21 @@ struct Display final {
 };
 
 struct Context final {
-    explicit Context(std::shared_ptr<gl::ShareGroup> share, const gl::CapabilityManifest& capabilities)
-        : glContext(std::move(share), capabilities) {}
+    Context(std::shared_ptr<gl::ShareGroup> share, const gl::CapabilityManifest& capabilities,
+            std::shared_ptr<frontend::gl::DirectGlShareGroup> directShare,
+            std::shared_ptr<metal::MetalDeviceSession> session)
+        : glContext(std::move(share), capabilities),
+          directContext(std::move(directShare), std::move(session)) {}
     gl::Context glContext;
+    frontend::gl::DirectGlContext directContext;
 };
 
 struct Surface final {
     core::SurfaceHandle handle;
     backend::SurfaceDesc desc;
     bool window{};
+    std::mutex frameMutex;
+    std::optional<backend::Frame> frame;
 };
 
 Display g_display;
@@ -122,6 +132,48 @@ using Proc = void (*)(void);
 struct ProcEntry { std::string_view name; Proc address; };
 
 } // namespace mithril::egl
+
+namespace mithril::egl::bridge {
+
+std::shared_ptr<metal::MetalDeviceSession> currentSession() {
+    std::lock_guard lock(g_display.mutex);
+    return g_display.session;
+}
+
+frontend::gl::DirectGlContext* currentGlContext() noexcept {
+    return g_context != nullptr ? &g_context->directContext : nullptr;
+}
+
+core::ValueResult<backend::Frame> acquireDrawFrame() {
+    if (g_draw == nullptr) return core::ValueResult<backend::Frame>::failure(core::Error::make(
+        core::ErrorDomain::surface, core::ErrorCode::invalid_state, "no current EGL draw surface"));
+    std::lock_guard lock(g_draw->frameMutex);
+    if (g_draw->frame) return *g_draw->frame;
+    auto session = currentSession();
+    if (!session) return core::ValueResult<backend::Frame>::failure(core::Error::make(
+        core::ErrorDomain::device, core::ErrorCode::unavailable, "EGL display has no Metal session"));
+    auto frame = session->acquire(g_draw->handle);
+    if (!frame) return frame;
+    g_draw->frame = frame.value();
+    return frame.value();
+}
+
+core::Result presentDrawFrame() {
+    if (g_draw == nullptr) return core::Result::failure(core::Error::make(
+        core::ErrorDomain::surface, core::ErrorCode::invalid_state, "no current EGL draw surface"));
+    std::optional<backend::Frame> frame;
+    {
+        std::lock_guard lock(g_draw->frameMutex);
+        frame = std::move(g_draw->frame);
+        g_draw->frame.reset();
+    }
+    if (!frame) return {};
+    auto session = currentSession();
+    return session ? session->present(*frame) : core::Result::failure(core::Error::make(
+        core::ErrorDomain::device, core::ErrorCode::unavailable, "EGL display has no Metal session"));
+}
+
+} // namespace mithril::egl::bridge
 
 extern "C" {
 
@@ -252,14 +304,18 @@ MITHRIL_EXPORT EGLContext eglCreateContext(EGLDisplay display, EGLConfig config,
     if (major != 3 || minor > 3 || (g_api == EGL_OPENGL_API &&
         (profile & EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT) == 0)) return fail(EGL_BAD_MATCH, EGL_NO_CONTEXT);
     std::shared_ptr<mithril::gl::ShareGroup> shareGroup;
+    std::shared_ptr<mithril::frontend::gl::DirectGlShareGroup> directShare;
     if (shared != EGL_NO_CONTEXT) {
         auto* parent = contextFrom(shared);
         if (parent == nullptr) return fail(EGL_BAD_CONTEXT, EGL_NO_CONTEXT);
         shareGroup = parent->glContext.shareGroup();
+        directShare = parent->directContext.shareGroup();
     } else {
         shareGroup = std::make_shared<mithril::gl::ShareGroup>();
+        directShare = std::make_shared<mithril::frontend::gl::DirectGlShareGroup>(g_display.session);
     }
-    auto* context = new (std::nothrow) Context(std::move(shareGroup), g_display.session->capabilities());
+    auto* context = new (std::nothrow) Context(std::move(shareGroup), g_display.session->capabilities(),
+        std::move(directShare), g_display.session);
     if (context == nullptr) return fail(EGL_BAD_ALLOC, EGL_NO_CONTEXT);
     std::lock_guard lock(g_objectsMutex);
     g_contexts.insert(context);
@@ -342,9 +398,10 @@ MITHRIL_EXPORT EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface handle) 
     auto* surface = surfaceFrom(handle);
     if (surface == nullptr) return fail(EGL_BAD_SURFACE, EGL_FALSE);
     if (!surface->window) return EGL_TRUE;
-    auto frame = g_display.session->acquire(surface->handle);
+    if (surface != g_draw) return fail(EGL_BAD_SURFACE, EGL_FALSE);
+    auto frame = bridge::acquireDrawFrame();
     if (!frame) return fail(EGL_BAD_SURFACE, EGL_FALSE);
-    return g_display.session->present(frame.value()) ? EGL_TRUE : fail(EGL_BAD_SURFACE, EGL_FALSE);
+    return bridge::presentDrawFrame() ? EGL_TRUE : fail(EGL_BAD_SURFACE, EGL_FALSE);
 }
 
 MITHRIL_EXPORT EGLBoolean eglSwapInterval(EGLDisplay display, EGLint interval) {
@@ -411,7 +468,7 @@ MITHRIL_EXPORT void (*eglGetProcAddress(const char* name))(void) {
     };
 #undef EGL_PROC
     for (const auto& entry : entries) if (entry.name == name) return entry.address;
-    return nullptr;
+    return reinterpret_cast<Proc>(mithril::frontend::gl::lookupDirectGlProc(name));
 }
 
 } // extern "C"

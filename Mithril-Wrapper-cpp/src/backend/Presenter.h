@@ -12,6 +12,8 @@ struct Frame {
     std::uint64_t serial{};
     std::uint64_t surfaceGeneration{};
     core::TextureHandle drawable;
+    std::uint32_t width{};
+    std::uint32_t height{};
 };
 
 class Presenter {

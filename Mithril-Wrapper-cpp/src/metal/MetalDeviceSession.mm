@@ -182,12 +182,38 @@ public:
         return {};
     }
 
+    core::Result setViewport(const backend::Viewport& viewport) override {
+        if (!encoder_ || viewport.width < 0.0 || viewport.height < 0.0 ||
+            viewport.nearDepth < 0.0 || viewport.farDepth > 1.0 ||
+            viewport.nearDepth > viewport.farDepth) {
+            return fail(core::ErrorCode::invalid_argument, "invalid Metal viewport");
+        }
+        [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) setViewport:MTLViewport{
+            viewport.x, viewport.y, viewport.width, viewport.height,
+            viewport.nearDepth, viewport.farDepth}];
+        return {};
+    }
+
     core::Result bindVertexBuffer(std::uint32_t slot, core::BufferHandle handle, std::size_t offset) override {
         auto buffer = session_->impl_->buffers.get(handle);
         if (!buffer) return core::Result::failure(buffer.error());
         if (!encoder_ || offset > buffer.value()->size) return fail(core::ErrorCode::invalid_argument, "invalid vertex buffer bind");
         [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) setVertexBuffer:
             bridgeMetal<id<MTLBuffer>>(buffer.value()->object) offset:offset atIndex:slot];
+        return {};
+    }
+
+    core::Result bindIndexBuffer(core::BufferHandle handle, std::size_t offset,
+                                 backend::IndexType type) override {
+        auto buffer = session_->impl_->buffers.get(handle);
+        if (!buffer) return core::Result::failure(buffer.error());
+        const std::size_t alignment = type == backend::IndexType::uint16 ? 2U : 4U;
+        if (!encoder_ || offset >= buffer.value()->size || offset % alignment != 0) {
+            return fail(core::ErrorCode::invalid_argument, "invalid index buffer bind");
+        }
+        indexBuffer_ = buffer.value()->object;
+        indexOffset_ = offset;
+        indexType_ = type == backend::IndexType::uint16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
         return {};
     }
 
@@ -213,6 +239,18 @@ public:
         return {};
     }
 
+    core::Result drawIndexed(const backend::DrawIndexedCommand& command) override {
+        if (!encoder_ || !indexBuffer_ || command.indexCount == 0 || command.instanceCount == 0) {
+            return fail(core::ErrorCode::invalid_argument, "invalid indexed draw command");
+        }
+        [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) drawIndexedPrimitives:primitive_
+            indexCount:command.indexCount indexType:indexType_
+            indexBuffer:bridgeMetal<id<MTLBuffer>>(indexBuffer_) indexBufferOffset:indexOffset_
+            instanceCount:command.instanceCount baseVertex:command.baseVertex
+            baseInstance:command.baseInstance];
+        return {};
+    }
+
     core::Result endRenderPass() override {
         if (!encoder_) return fail(core::ErrorCode::invalid_state, "render pass is not active");
         [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) endEncoding];
@@ -235,6 +273,9 @@ private:
     std::uint64_t serial_{};
     std::shared_ptr<void> commandBuffer_;
     std::shared_ptr<void> encoder_;
+    std::shared_ptr<void> indexBuffer_;
+    std::size_t indexOffset_{};
+    MTLIndexType indexType_{MTLIndexTypeUInt16};
     MTLPrimitiveType primitive_{MTLPrimitiveTypeTriangle};
     bool committed_{};
 };
@@ -509,6 +550,8 @@ core::ValueResult<core::PipelineHandle> MetalDeviceSession::createPipeline(
     MTLPrimitiveType primitive = MTLPrimitiveTypeTriangle;
     if (key.primitive == ir::Primitive::point) primitive = MTLPrimitiveTypePoint;
     else if (key.primitive == ir::Primitive::line) primitive = MTLPrimitiveTypeLine;
+    else if (key.primitive == ir::Primitive::lineStrip) primitive = MTLPrimitiveTypeLineStrip;
+    else if (key.primitive == ir::Primitive::triangleStrip) primitive = MTLPrimitiveTypeTriangleStrip;
     auto result = impl_->pipelines.create(PipelineResource{
         retainMetal(pipeline), std::move(depthState), cacheKey, 1, primitive});
     if (result) {
@@ -565,7 +608,8 @@ core::ValueResult<backend::Frame> MetalDeviceSession::acquire(core::SurfaceHandl
         static_cast<std::uint32_t>(texture.height), 1, backend::PixelFormat::bgra8Unorm};
     auto textureHandle = impl_->textures.create(TextureResource{retainMetal(texture), textureDesc});
     if (!textureHandle) { impl_->scheduler.cancel(serial.value()); return core::ValueResult<backend::Frame>::failure(textureHandle.error()); }
-    backend::Frame frame{serial.value(), surface.value()->surface.generation(), textureHandle.value()};
+    backend::Frame frame{serial.value(), surface.value()->surface.generation(), textureHandle.value(),
+        static_cast<std::uint32_t>(texture.width), static_cast<std::uint32_t>(texture.height)};
     std::lock_guard lock(impl_->framesMutex);
     impl_->frames.emplace(frame.serial, DrawableFrame{frame, retainMetal(drawable), serial.value(), false});
     return frame;

@@ -86,6 +86,11 @@ jobs:
                         eglCreateWindowSurface eglMakeCurrent eglSwapBuffers eglGetProcAddress; do
             printf '%s\n' "$symbols" | grep -q " _$symbol$"
           done
+          for symbol in glGetString glGetError glGenBuffers glBufferData \
+                        glGenVertexArrays glCreateShader glCompileShader \
+                        glCreateProgram glLinkProgram glDrawArrays glDrawElements; do
+            printf '%s\n' "$symbols" | grep -q " _$symbol$"
+          done
           if printf '%s\n' "$symbols" | grep -Eqi ' _vk[A-Z]|moltenvk'; then exit 1; fi
       - uses: actions/upload-artifact@v4
         with:

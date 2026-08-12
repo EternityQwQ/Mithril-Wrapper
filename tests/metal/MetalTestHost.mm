@@ -14,6 +14,7 @@
 
 namespace {
 
+
 struct Vertex {
     float x;
     float y;
