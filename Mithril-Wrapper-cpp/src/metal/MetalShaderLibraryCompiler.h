@@ -16,6 +16,7 @@ public:
 
     [[nodiscard]] shader::ShaderStage stage() const noexcept;
     [[nodiscard]] std::uint64_t hash() const noexcept;
+    [[nodiscard]] void* nativeFunction() const noexcept;
 
 private:
     struct Impl;

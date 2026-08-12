@@ -454,9 +454,9 @@ core::ValueResult<core::PipelineHandle> MetalDeviceSession::createPipeline(
         }
     }
     MTLRenderPipelineDescriptor* descriptor = [MTLRenderPipelineDescriptor new];
-    descriptor.vertexFunction = vertex->impl_->function;
-    descriptor.fragmentFunction = fragment->impl_->function;
-    descriptor.sampleCount = key.sampleCount;
+    descriptor.vertexFunction = (__bridge id<MTLFunction>)vertex->nativeFunction();
+    descriptor.fragmentFunction = (__bridge id<MTLFunction>)fragment->nativeFunction();
+    descriptor.rasterSampleCount = key.sampleCount;
     descriptor.alphaToCoverageEnabled = desc.alphaToCoverage;
     for (std::uint8_t index = 0; index < key.colorAttachmentCount; ++index) {
         descriptor.colorAttachments[index].pixelFormat = metalFormat(key.colorFormats[index]);

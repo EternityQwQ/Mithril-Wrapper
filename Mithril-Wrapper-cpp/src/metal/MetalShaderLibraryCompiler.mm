@@ -30,6 +30,9 @@ CompiledMetalShader::CompiledMetalShader(std::unique_ptr<Impl> impl) : impl_(std
 CompiledMetalShader::~CompiledMetalShader() = default;
 shader::ShaderStage CompiledMetalShader::stage() const noexcept { return impl_->stage; }
 std::uint64_t CompiledMetalShader::hash() const noexcept { return impl_->hash; }
+void* CompiledMetalShader::nativeFunction() const noexcept {
+    return (__bridge void*)impl_->function;
+}
 
 MetalShaderLibraryCompiler::MetalShaderLibraryCompiler(void* device) noexcept : device_(device) {}
 
@@ -45,7 +48,6 @@ core::ValueResult<std::shared_ptr<CompiledMetalShader>> MetalShaderLibraryCompil
         NSString* source = [[NSString alloc] initWithBytes:artifact.source.data()
             length:artifact.source.size() encoding:NSUTF8StringEncoding];
         MTLCompileOptions* options = [MTLCompileOptions new];
-        options.fastMathEnabled = YES;
         if (@available(iOS 12.0, macOS 10.14, *)) options.languageVersion = MTLLanguageVersion2_0;
         NSError* error = nil;
         id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&error];
