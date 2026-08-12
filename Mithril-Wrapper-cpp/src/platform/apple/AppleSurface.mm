@@ -106,10 +106,6 @@ core::Result AppleSurface::resize(const backend::SurfaceDesc& desc) {
 
 void* AppleSurface::nextDrawable() {
     if (!impl_) return nullptr;
-    if (impl_->layer.superlayer == nil) {
-        [CATransaction begin];
-        [CATransaction commit];
-    }
     return (__bridge_retained void*)[impl_->layer nextDrawable];
 }
 
