@@ -41,11 +41,23 @@ set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_C_VISIBILITY_PRESET default)
 set(CMAKE_OBJCXX_VISIBILITY_PRESET default)
 set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fvisibility=default")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=default")
-if(APPLE)
-    set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fvisibility=default")
+if(NOT MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fvisibility=default")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=default")
+    if(APPLE)
+        set(CMAKE_OBJCXX_FLAGS "${CMAKE_OBJCXX_FLAGS} -fvisibility=default")
+    endif()
 endif()
+
+option(MITHRIL_BUILD_CORE "Build the platform-neutral refactor core" ON)
+option(MITHRIL_BUILD_TESTS "Build the platform-neutral refactor tests" ON)
+option(MITHRIL_ENABLE_SHADER_TOOLCHAIN "Build the GLSL to MSL toolchain adapter" ${APPLE})
+option(MITHRIL_BUILD_DIRECT "Build the Direct Metal shared library" ${APPLE})
+option(MITHRIL_BUILD_LEGACY "Build the retired Vulkan compatibility target" OFF)
+
+# Keep the shipping target intact while the new core is established. Windows
+# can configure and test the new target without requiring the legacy SDK.
+if(MITHRIL_BUILD_LEGACY)
 
 # ---------------------------------------------------------------------------
 # MoltenVK: Vulkan 1.2 implementation backed by Metal 2.
@@ -82,6 +94,10 @@ if(APPLE)
     message(STATUS "MoltenVK library: ${MOLTENVK_LIBRARY}")
 endif()
 
+endif() # MITHRIL_BUILD_LEGACY MoltenVK discovery
+
+if(MITHRIL_BUILD_LEGACY OR MITHRIL_ENABLE_SHADER_TOOLCHAIN)
+
 # ---------------------------------------------------------------------------
 # glslang: GLSL front-end -> SPIR-V  (submodule under 3rdparty/, mirrors the
 # MobileGlues layout which uses add_subdirectory(3rdparty/glslang) instead of
@@ -111,9 +127,9 @@ add_subdirectory(Mithril-Wrapper-cpp/3rdparty/glslang)
 set(SPIRV_CROSS_STATIC                 ON  CACHE BOOL "" FORCE)
 set(SPIRV_CROSS_CLI                    OFF CACHE BOOL "" FORCE)
 set(SPIRV_CROSS_ENABLE_TESTS           OFF CACHE BOOL "" FORCE)
-set(SPIRV_CROSS_ENABLE_GLSL            OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_GLSL            ${MITHRIL_ENABLE_SHADER_TOOLCHAIN} CACHE BOOL "" FORCE)
 set(SPIRV_CROSS_ENABLE_HLSL            OFF CACHE BOOL "" FORCE)
-set(SPIRV_CROSS_ENABLE_MSL             OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_MSL             ${MITHRIL_ENABLE_SHADER_TOOLCHAIN} CACHE BOOL "" FORCE)
 set(SPIRV_CROSS_ENABLE_CPP             OFF CACHE BOOL "" FORCE)
 set(SPIRV_CROSS_ENABLE_REFLECT         OFF CACHE BOOL "" FORCE)
 set(SPIRV_CROSS_ENABLE_C_API           OFF CACHE BOOL "" FORCE)
@@ -122,6 +138,14 @@ set(SPIRV_HEADERS_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/Mithril-Wrapper-cpp/3rdparty/SPIRV-Headers/include"
     CACHE PATH "" FORCE)
 add_subdirectory(Mithril-Wrapper-cpp/3rdparty/SPIRV-Cross)
+
+endif() # shader dependencies
+
+if(MITHRIL_BUILD_CORE)
+    include(cmake/direct_metal.cmake)
+endif()
+
+if(MITHRIL_BUILD_LEGACY)
 
 # ---------------------------------------------------------------------------
 # Mithril-Wrapper shared library (libmithril.dylib on Apple)
@@ -338,4 +362,6 @@ if(APPLE)
 else()
     set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX ".so")
 endif()
+
+endif() # MITHRIL_BUILD_LEGACY
 

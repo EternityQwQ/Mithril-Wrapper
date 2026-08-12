@@ -1,4 +1,10 @@
 build-linux/
+build-core/
+build-core-*/
+build-verify-*/
+build-shader-*/
+build-macos/
+build-ios/
 *.o
 *.so
 *.a

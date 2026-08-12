@@ -1,0 +1,22 @@
+{
+  "format_version": "1.0",
+  "host": {
+    "repository": "Amethyst-iOS repository not yet supplied",
+    "revision": "unlocked"
+  },
+  "game": {
+    "version": "1.21.1",
+    "distribution": "vanilla"
+  },
+  "device": {
+    "model": "iPhone X (A11)",
+    "os": "iOS 16.7.15",
+    "graphics_baseline": "Metal 2"
+  },
+  "complete": false,
+  "events": [],
+  "blockers": [
+    "Exact Amethyst-iOS repository revision is not available",
+    "No device-side LWJGL dlsym trace has been captured"
+  ]
+}

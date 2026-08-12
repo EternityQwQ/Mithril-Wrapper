@@ -83,7 +83,7 @@ typedef EGLNativeWindowType  NativeWindowType;
 #define EGL_BAD_SYNC_KHR             0x307F
 
 /* ---- Config attributes ---- */
-#define EGL_BUFFER_SIZE              0x3080
+#define EGL_BUFFER_SIZE              0x3020
 #define EGL_ALPHA_SIZE               0x3021
 #define EGL_BLUE_SIZE                0x3022
 #define EGL_GREEN_SIZE               0x3023
@@ -93,12 +93,12 @@ typedef EGLNativeWindowType  NativeWindowType;
 #define EGL_CONFIG_CAVEAT            0x3051
 #define EGL_CONFIG_ID                0x3028
 #define EGL_LEVEL                    0x3029
-#define EGL_MAX_PBUFFER_HEIGHT       0x3030
-#define EGL_MAX_PBUFFER_PIXELS       0x302E
+#define EGL_MAX_PBUFFER_HEIGHT       0x302A
+#define EGL_MAX_PBUFFER_PIXELS       0x302B
 #define EGL_MAX_PBUFFER_WIDTH        0x302C
-#define EGL_NATIVE_RENDERABLE        0x302B
-#define EGL_NATIVE_VISUAL_ID         0x3030
-#define EGL_NATIVE_VISUAL_TYPE       0x3031
+#define EGL_NATIVE_RENDERABLE        0x302D
+#define EGL_NATIVE_VISUAL_ID         0x302E
+#define EGL_NATIVE_VISUAL_TYPE       0x302F
 #define EGL_SAMPLES                  0x3031
 #define EGL_SAMPLE_BUFFERS           0x3032
 #define EGL_SURFACE_TYPE             0x3033

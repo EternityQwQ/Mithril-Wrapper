@@ -1,0 +1,61 @@
+{
+  "feature": "direct-metal-gl33",
+  "createdAt": "2026-08-12T09:03:38Z",
+  "parameters": {
+    "skipUI": true,
+    "skipDeploy": false,
+    "quick": false,
+    "roles": "full",
+    "humanInTheLoop": "auto"
+  },
+  "baseline": {
+    "branch": "refactor/gl33-core-metal2",
+    "commit": "e53d7a670792c1048d51264ffb2bf1c272d511ba",
+    "minecraft": "1.21.1 Vanilla",
+    "device": "iPhone X (A11, Metal 2)",
+    "os": "iOS 16.7.15",
+    "launcher": "Amethyst-iOS/LWJGL 3 (exact commit pending)"
+  },
+  "stages": {
+    "1": {
+      "status": "completed",
+      "startTime": "2026-08-12T08:43:00Z",
+      "endTime": "2026-08-12T09:03:38Z",
+      "artifacts": ["prd.md", "architecture.md"],
+      "uiSkippedReason": "Dynamic rendering library with no user interface"
+    },
+    "2": {
+      "status": "completed",
+      "startTime": "2026-08-12T09:08:00Z",
+      "endTime": "2026-08-12T09:43:00Z",
+      "artifacts": ["tech-review.md", "tasks.md"],
+      "review": "conditionally_approved",
+      "tasks": 46
+    },
+    "3": { "status": "in_progress", "startTime": "2026-08-12T09:43:00Z", "endTime": null },
+    "4": { "status": "pending", "startTime": null, "endTime": null }
+  },
+  "qualityGates": {
+    "gate0": {
+      "status": "passed",
+      "checks": [
+        "Direct Metal 2+ is the only runtime backend",
+        "Vulkan and MoltenVK removal is mandatory",
+        "Minecraft 1.21.1 Vanilla on iPhone X/iOS 16.7.15 is the P0 device gate",
+        "Automated evidence and device evidence are tracked separately"
+      ]
+    },
+    "gate1": null,
+    "gate2": null
+  },
+  "humanInterventions": [
+    {
+      "time": "2026-08-12T08:44:00Z",
+      "decision": "Full rewrite with no Vulkan or MoltenVK runtime"
+    },
+    {
+      "time": "2026-08-12T08:48:00Z",
+      "decision": "P0 test baseline set to Minecraft Java 1.21.1 Vanilla on iPhone X with iOS 16.7.15"
+    }
+  ]
+}

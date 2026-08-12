@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mithril.invalid/schema/abi-manifest-1.0.json",
+  "title": "Mithril ABI Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format_version", "library", "generated_from", "symbols"],
+  "properties": {
+    "format_version": { "const": "1.0" },
+    "library": { "type": "string", "minLength": 1 },
+    "generated_from": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "symbols": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "signature", "signature_hash", "api", "since", "status", "error_behavior", "evidence"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^(gl|egl)[A-Za-z0-9_]+$" },
+          "signature": { "type": "string", "minLength": 4 },
+          "signature_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "api": { "enum": ["GL", "EGL", "GLX"] },
+          "since": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["implemented", "provisional", "unsupported"] },
+          "error_behavior": { "type": "string" },
+          "evidence": { "type": "string" }
+        }
+      }
+    }
+  }
+}

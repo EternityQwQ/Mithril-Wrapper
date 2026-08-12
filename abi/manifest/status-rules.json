@@ -1,0 +1,8 @@
+{
+  "rules_version": "1.0",
+  "default_status": "provisional",
+  "unsupported_source": "Mithril-Wrapper-cpp/MG_Impl/Stubs.cpp",
+  "provisional_reason": "Awaiting locked Amethyst/LWJGL 3 and Minecraft 1.21.1 host trace",
+  "unsupported_error_behavior": "Procedure lookup returns null; compatibility profile is outside the product contract",
+  "provisional_error_behavior": "Not advertised for release until implementation and host trace evidence pass"
+}

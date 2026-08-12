@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format_version", "host", "game", "device", "complete", "events", "blockers"],
+  "properties": {
+    "format_version": { "const": "1.0" },
+    "host": { "type": "object", "required": ["repository", "revision"] },
+    "game": { "type": "object", "required": ["version", "distribution"] },
+    "device": { "type": "object", "required": ["model", "os", "graphics_baseline"] },
+    "complete": { "type": "boolean" },
+    "events": { "type": "array", "items": { "type": "object", "required": ["sequence", "stage", "symbol", "resolved"] } },
+    "blockers": { "type": "array", "items": { "type": "string" } }
+  }
+}
