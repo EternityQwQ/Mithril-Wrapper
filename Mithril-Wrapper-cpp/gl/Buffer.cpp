@@ -63,7 +63,7 @@ void glDeleteBuffers(GLsizei n, const GLuint* buffers) {
                 }
             }
         }
-        backend_delete_buffer(name);
+        g_vk_func.delete_buffer(name);
         g_state->buffers.erase(name);
         g_state->bufferNames.release(name);
     }
@@ -128,7 +128,7 @@ void glBufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage
     if (data && size > 0) std::memcpy(b->data.data(), data, (size_t)size);
     b->mapped = nullptr;
     // Recreate the VkBuffer (allocates + uploads).
-    backend_get_or_create_buffer(b->id, data && size ? b->data.data() : nullptr, (size_t)size);
+    g_vk_func.get_or_create_buffer(b->id, data && size ? b->data.data() : nullptr, (size_t)size);
 }
 
 // GL 4.4 ARB_buffer_storage — immutable storage with persistent mapping.
@@ -161,13 +161,13 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void* data, GLbitfiel
     if (persistent) {
         // Use backend_create_buffer_storage for persistent mapping (GL 4.4 path).
         // Upload initial data via glBufferSubData after creation.
-        backend_create_buffer_storage(b->id, (VkDeviceSize)size, 0, persistent, coherent);
+        g_vk_func.create_buffer_storage(b->id, (VkDeviceSize)size, 0, persistent, coherent);
         if (data && size > 0) {
-            backend_buffer_upload(b->id, 0, data, (size_t)size);
+            g_vk_func.buffer_upload(b->id, 0, data, (size_t)size);
         }
     } else {
         // Non-persistent: use regular glBufferData path
-        backend_get_or_create_buffer(b->id, data && size ? b->data.data() : nullptr, (size_t)size);
+        g_vk_func.get_or_create_buffer(b->id, data && size ? b->data.data() : nullptr, (size_t)size);
     }
 }
 
@@ -181,7 +181,7 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
         return;
     }
     std::memcpy(b->data.data() + offset, data, (size_t)size);
-    backend_buffer_upload(b->id, offset, data, (size_t)size);
+    g_vk_func.buffer_upload(b->id, offset, data, (size_t)size);
 }
 
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget,
@@ -197,7 +197,7 @@ void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget,
         return;
     }
     std::memmove(dst->data.data() + writeOffset, src->data.data() + readOffset, (size_t)size);
-    backend_buffer_upload(dst->id, writeOffset, dst->data.data() + writeOffset, (size_t)size);
+    g_vk_func.buffer_upload(dst->id, writeOffset, dst->data.data() + writeOffset, (size_t)size);
 }
 
 void* glMapBuffer(GLenum target, GLenum access) {
@@ -234,7 +234,7 @@ GLboolean glUnmapBuffer(GLenum target) {
     mithril::Buffer* b = bound_buffer_for_target(target);
     if (!b || !b->mapped) return GL_FALSE;
     // Upload the (possibly) modified range to the VkBuffer.
-    backend_buffer_upload(b->id, b->mapOffset, b->mapped, (size_t)b->mapLength);
+    g_vk_func.buffer_upload(b->id, b->mapOffset, b->mapped, (size_t)b->mapLength);
     b->mapped = nullptr;
     return GL_TRUE;
 }
@@ -245,7 +245,7 @@ void glFlushMappedBufferRange(GLenum target, GLintptr offset, GLsizeiptr length)
     if (!b || !b->mapped) return;
     GLintptr base = b->mapOffset + offset;
     if (base < 0 || length <= 0 || base + length > b->size) return;
-    backend_buffer_upload(b->id, base, (uint8_t*)b->mapped + offset, (size_t)length);
+    g_vk_func.buffer_upload(b->id, base, (uint8_t*)b->mapped + offset, (size_t)length);
 }
 
 void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params) {

@@ -169,7 +169,7 @@ void glBindFramebuffer(GLenum target, GLuint framebuffer) {
         // flags from a previous FBO's glInvalidateFramebuffer from applying
         // to the new FBO's next render pass.
         if (g_state->currentDrawFBO != framebuffer) {
-            backend_set_invalidate_attachments(0, false, false);
+            g_vk_func.set_invalidate_attachments(0, false, false);
         }
         g_state->currentDrawFBO = framebuffer;
     }
@@ -455,8 +455,8 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
     // backend_blit_images 通过 aspect_for_format(format) 自动选择
     // VK_IMAGE_ASPECT_DEPTH_BIT / STENCIL_BIT，所以只需传入 depth 格式即可。
     if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) {
-        backend_end_render_pass();
-        backend_commit();
+        g_vk_func.end_render_pass();
+        g_vk_func.commit();
 
         VkImage dsrc = VK_NULL_HANDLE, ddst = VK_NULL_HANDLE;
         VkFormat dsrc_fmt = VK_FORMAT_UNDEFINED, ddst_fmt = VK_FORMAT_UNDEFINED;
@@ -469,9 +469,9 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
         } else {
             mithril::Framebuffer* sf = mithril::state_get_framebuffer(g_state->currentReadFBO);
             if (sf && sf->depth.texture) {
-                dsrc = backend_get_texture_image(sf->depth.texture);
+                dsrc = g_vk_func.get_texture_image(sf->depth.texture);
                 mithril::Texture* t = mithril::state_get_texture(sf->depth.texture);
-                if (t) dsrc_fmt = backend_vk_format_for_gl((GLenum)t->internalFormat);
+                if (t) dsrc_fmt = g_vk_func.vk_format_for_gl((GLenum)t->internalFormat);
             }
         }
         if (d_dst_default) {
@@ -481,14 +481,14 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
         } else {
             mithril::Framebuffer* df = mithril::state_get_framebuffer(g_state->currentDrawFBO);
             if (df && df->depth.texture) {
-                ddst = backend_get_texture_image(df->depth.texture);
+                ddst = g_vk_func.get_texture_image(df->depth.texture);
                 mithril::Texture* t = mithril::state_get_texture(df->depth.texture);
-                if (t) { ddst_fmt = backend_vk_format_for_gl((GLenum)t->internalFormat); ddst_h = t->height; }
+                if (t) { ddst_fmt = g_vk_func.vk_format_for_gl((GLenum)t->internalFormat); ddst_h = t->height; }
             }
         }
         if (dsrc != VK_NULL_HANDLE && ddst != VK_NULL_HANDLE &&
             dsrc_fmt != VK_FORMAT_UNDEFINED && ddst_fmt != VK_FORMAT_UNDEFINED) {
-            backend_blit_images(dsrc, dsrc_fmt, ddst, ddst_fmt,
+            g_vk_func.blit_images(dsrc, dsrc_fmt, ddst, ddst_fmt,
                                 srcX0, srcY0, srcX1, srcY1,
                                 dstX0, dstY0, dstX1, dstY1,
                                 mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT),
@@ -502,8 +502,8 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
 
     // Flush any pending rendering into the source/destination so the blit
     // sees the latest pixels and subsequent draws see the blit's result.
-    backend_end_render_pass();
-    backend_commit();
+    g_vk_func.end_render_pass();
+    g_vk_func.commit();
 
     // Resolve the source FBO's colour attachment. The read FBO is the source.
     //   - FBO 0 (EGL default): use the swapchain image installed on g_state.
@@ -529,9 +529,9 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                 tex = fbo->colors[0].texture;
             }
             if (tex) {
-                src_image = backend_get_texture_image(tex);
+                src_image = g_vk_func.get_texture_image(tex);
                 mithril::Texture* t = mithril::state_get_texture(tex);
-                if (t) src_format = backend_vk_format_for_gl((GLenum)t->internalFormat);
+                if (t) src_format = g_vk_func.vk_format_for_gl((GLenum)t->internalFormat);
             }
         }
     }
@@ -552,10 +552,10 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
         if (fbo) {
             GLuint tex = fbo->colors[0].texture;
             if (tex) {
-                dst_image = backend_get_texture_image(tex);
+                dst_image = g_vk_func.get_texture_image(tex);
                 mithril::Texture* t = mithril::state_get_texture(tex);
                 if (t) {
-                    dst_format = backend_vk_format_for_gl((GLenum)t->internalFormat);
+                    dst_format = g_vk_func.vk_format_for_gl((GLenum)t->internalFormat);
                     dst_height = t->height;
                 }
             }
@@ -575,7 +575,7 @@ void glBlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
     // so their blit coords pass through unchanged. Deep reference: MobileGL
     // ApplyNativeBlitDefaultFramebufferTransform (identity branch).
     // Source Y is never flipped (MobileGL never flips src Y).
-    backend_blit_images(src_image, src_format,
+    g_vk_func.blit_images(src_image, src_format,
                         dst_image, dst_format,
                         srcX0, srcY0, srcX1, srcY1,
                         dstX0, dstY0, dstX1, dstY1,
@@ -918,7 +918,7 @@ void glInvalidateFramebuffer(GLenum target, GLsizei numAttachments,
     if (!parse_invalidate_attachments(numAttachments, attachments, isDefault,
                                       colorMask, invDepth, invStencil))
         return;
-    backend_set_invalidate_attachments(colorMask, invDepth, invStencil);
+    g_vk_func.set_invalidate_attachments(colorMask, invDepth, invStencil);
 }
 
 void glInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments,
@@ -947,7 +947,7 @@ void glInvalidateSubFramebuffer(GLenum target, GLsizei numAttachments,
     if (!parse_invalidate_attachments(numAttachments, attachments, isDefault,
                                       colorMask, invDepth, invStencil))
         return;
-    backend_set_invalidate_attachments(colorMask, invDepth, invStencil);
+    g_vk_func.set_invalidate_attachments(colorMask, invDepth, invStencil);
 }
 
 } // extern "C"
@@ -986,7 +986,7 @@ int collect_draw_fbo_attachments(VkImageView out_color[8], VkImageView* out_dept
         if (fbo->drawBuffers[i] == GL_NONE) break;
         GLuint tex = fbo->colors[i].texture;
         if (tex == 0) { out_color[i] = VK_NULL_HANDLE; continue; }
-        VkImageView view = backend_get_texture_view(tex);
+        VkImageView view = g_vk_func.get_texture_view(tex);
         out_color[i] = view;
         if (view != VK_NULL_HANDLE) { count = i + 1; }
         if (w == 0) {
@@ -995,7 +995,7 @@ int collect_draw_fbo_attachments(VkImageView out_color[8], VkImageView* out_dept
         }
     }
     if (fbo->depth.texture) {
-        *out_depth = backend_get_texture_view(fbo->depth.texture);
+        *out_depth = g_vk_func.get_texture_view(fbo->depth.texture);
         if (w == 0) {
             Texture* t = state_get_texture(fbo->depth.texture);
             if (t) { w = t->width; h = t->height; }

@@ -28,7 +28,7 @@
 #include <vulkan/vulkan.h>
 
 #include <GL/gl.h>
-#include "../MG_Impl/Log.h"
+#include "../gl/Log.h"
 
 // ---- Standard GL enums absent from the project's minimal glcorearb.h ----
 // Guarded so a fuller GL header is harmless.

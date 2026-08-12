@@ -277,31 +277,31 @@ void glGetIntegerv(GLenum pname, GLint* params) {
          * 保证不会比原来更差。
          */
         case GL_MAX_TEXTURE_SIZE:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_TEXTURE_SIZE, 16384); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_TEXTURE_SIZE, 16384); break;
         case GL_MAX_3D_TEXTURE_SIZE:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_3D_TEXTURE_SIZE, 2048); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_3D_TEXTURE_SIZE, 2048); break;
         case GL_MAX_CUBE_MAP_TEXTURE_SIZE:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_CUBE_MAP_TEXTURE_SIZE, 16384); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_CUBE_MAP_TEXTURE_SIZE, 16384); break;
         case GL_MAX_ARRAY_TEXTURE_LAYERS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_ARRAY_TEXTURE_LAYERS, 2048); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_ARRAY_TEXTURE_LAYERS, 2048); break;
         case GL_MAX_TEXTURE_IMAGE_UNITS:
         case GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_TEXTURE_IMAGE_UNITS,
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_TEXTURE_IMAGE_UNITS,
                                            mithril::kMaxTextureUnits); break;
         case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_COMBINED_TEX_UNITS,
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_COMBINED_TEX_UNITS,
                                            mithril::kMaxTextureUnits); break;
         case GL_MAX_VERTEX_ATTRIBS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_VERTEX_ATTRIBS,
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_VERTEX_ATTRIBS,
                                            mithril::kMaxVertexAttribs); break;
         case GL_MAX_VERTEX_UNIFORM_COMPONENTS:*params = 4096; break;
         case GL_MAX_FRAGMENT_UNIFORM_COMPONENTS:*params = 4096; break;
         case GL_MAX_VIEWPORT_DIMS:
-            params[0] = backend_device_limit(MITHRIL_LIMIT_MAX_VIEWPORT_WIDTH, 16384);
-            params[1] = backend_device_limit(MITHRIL_LIMIT_MAX_VIEWPORT_HEIGHT, 16384);
+            params[0] = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_VIEWPORT_WIDTH, 16384);
+            params[1] = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_VIEWPORT_HEIGHT, 16384);
             break;
         case GL_MAX_RENDERBUFFER_SIZE:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_RENDERBUFFER_SIZE, 16384); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_RENDERBUFFER_SIZE, 16384); break;
         case GL_MAX_ELEMENTS_VERTICES:        *params = 1 << 24; break;
         case GL_MAX_ELEMENTS_INDICES:         *params = 1 << 24; break;
         case GL_SUBPIXEL_BITS:                *params = 4; break;
@@ -323,22 +323,22 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         case GL_DOUBLEBUFFER:                 *params = GL_TRUE; break;
         case GL_STEREO:                       *params = GL_FALSE; break;
         case GL_MAX_DRAW_BUFFERS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_COLOR_ATTACHMENTS, 8); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_COLOR_ATTACHMENTS, 8); break;
         case GL_MAX_COLOR_ATTACHMENTS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_COLOR_ATTACHMENTS,
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_COLOR_ATTACHMENTS,
                                            mithril::kMaxColorAttachments); break;
         case GL_MAX_TEXTURE_UNITS:            *params = mithril::kMaxTextureUnits; break;
         /* ---- 4.x capacity limits Sodium / Iris read ---- */
         case GL_MAX_UNIFORM_BUFFER_BINDINGS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_UNIFORM_BUFFER_BINDINGS,
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_UNIFORM_BUFFER_BINDINGS,
                                            mithril::kMaxIndexedBindings); break;
         case GL_MAX_UNIFORM_BLOCK_SIZE:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_UNIFORM_BLOCK_SIZE, 64 * 1024); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_UNIFORM_BLOCK_SIZE, 64 * 1024); break;
         /* UBO 偏移对齐必须报设备真实值。MoltenVK 上常见 16 或 256，
          * 报小了 Sodium 会按更细的粒度打包 UBO → vkCmdBindDescriptorSets
          * 的 dynamic offset 触发 VUID 校验失败（offset 未对齐）。 */
         case GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT:
-            *params = backend_device_limit(MITHRIL_LIMIT_UNIFORM_BUFFER_ALIGNMENT, 256); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_UNIFORM_BUFFER_ALIGNMENT, 256); break;
         case GL_MAX_VERTEX_UNIFORM_BLOCKS:    *params = 14; break;
         case GL_MAX_FRAGMENT_UNIFORM_BLOCKS:  *params = 14; break;
         case GL_MAX_GEOMETRY_UNIFORM_BLOCKS:  *params = 14; break;
@@ -353,21 +353,21 @@ void glGetIntegerv(GLenum pname, GLint* params) {
         case GL_MAX_COLOR_TEXTURE_SAMPLES:
         case GL_MAX_DEPTH_TEXTURE_SAMPLES:
         case GL_MAX_INTEGER_SAMPLES:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_SAMPLES, 4); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_SAMPLES, 4); break;
         case GL_MAX_ATOMIC_COUNTER_BUFFER_BINDINGS: *params = 8; break;
         case GL_MAX_COMBINED_ATOMIC_COUNTERS: *params = 8; break;
         case GL_MAX_VERTEX_ATOMIC_COUNTERS:   *params = 8; break;
         case GL_MAX_FRAGMENT_ATOMIC_COUNTERS: *params = 8; break;
         /* ---- Shader storage / compute (Iris) ---- */
         case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_SSBO_BINDINGS,
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_SSBO_BINDINGS,
                                            mithril::kMaxIndexedBindings); break;
         case GL_MAX_COMBINED_SHADER_STORAGE_BLOCKS: *params = 96; break;
         case GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS: *params = 16; break;
         case GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS: *params = 16; break;
         case GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS: *params = 16; break;
         case GL_MAX_SHADER_STORAGE_BLOCK_SIZE:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_SSBO_SIZE, 128 * 1024 * 1024); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_SSBO_SIZE, 128 * 1024 * 1024); break;
         case GL_MAX_COMBINED_IMAGE_UNIFORMS:  *params = 192; break;
         case GL_MAX_IMAGE_UNITS:              *params = 32; break;
         case GL_MAX_VERTEX_IMAGE_UNIFORMS:    *params = 32; break;
@@ -379,14 +379,14 @@ void glGetIntegerv(GLenum pname, GLint* params) {
          * Metal 的 threadgroup 上限比桌面小得多（常见 512 而非 1024），
          * 报高了 vkCmdDispatch 会静默失败或触发 GPU hang。 */
         case GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS:
-            *params = backend_device_limit(MITHRIL_LIMIT_MAX_COMPUTE_WG_INVOCATIONS, 1024); break;
+            *params = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_COMPUTE_WG_INVOCATIONS, 1024); break;
         case GL_MAX_COMPUTE_WORK_GROUP_COUNT: {
-            int c = backend_device_limit(MITHRIL_LIMIT_MAX_COMPUTE_WG_COUNT_X, 65535);
+            int c = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_COMPUTE_WG_COUNT_X, 65535);
             params[0] = c; params[1] = c; params[2] = c;
             break;
         }
         case GL_MAX_COMPUTE_WORK_GROUP_SIZE: {
-            int s = backend_device_limit(MITHRIL_LIMIT_MAX_COMPUTE_WG_SIZE_X, 256);
+            int s = g_vk_func.device_limit(MITHRIL_LIMIT_MAX_COMPUTE_WG_SIZE_X, 256);
             params[0] = s;
             params[1] = s;
             params[2] = s < 64 ? s : 64;

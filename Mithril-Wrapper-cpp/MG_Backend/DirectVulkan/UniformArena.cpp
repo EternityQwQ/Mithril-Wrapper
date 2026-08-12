@@ -6,7 +6,7 @@
 
 #include "Device.h"
 #include "Resources.h"   // find_memory_type / try_allocate_memory_with_gc
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 
 #include <cstring>
 #include <vector>

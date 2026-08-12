@@ -17,7 +17,7 @@
 #define VK_USE_PLATFORM_METAL_EXT 1
 #include "Swapchain.h"
 #include "Device.h"
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 // Full CAMetalLayer interface (QuartzCore). Required to set
 // maximumDrawableCount below — the Vulkan headers only forward-declare the
 // class, so the property would otherwise be "not found in forward class".

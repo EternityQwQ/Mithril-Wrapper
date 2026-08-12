@@ -62,7 +62,7 @@ void glDeleteProgram(GLuint program) {
     p->markedForDeletion = true;
     if (g_state->currentProgram != program) {
         // Release the Vulkan shader modules + cached pipelines owned by this program.
-        backend_delete_program_resources(program);
+        g_vk_func.delete_program_resources(program);
         g_state->programs.erase(program);
         g_state->programNames.release(program);
     }
@@ -179,7 +179,7 @@ void glLinkProgram(GLuint program) {
     // the new render state. MobileGL rebuilds pipelines on every link
     // (ProgramObject::Link -> GenerateBinary -> PipelineFactory); we mirror
     // that by tearing down here so the next draw rebuilds from scratch.
-    backend_delete_program_resources(program);
+    g_vk_func.delete_program_resources(program);
 
     p->vertexSpirv.clear();
     p->vertexSpirvYFlipped.clear();
@@ -422,7 +422,7 @@ void glUseProgram(GLuint program) {
     if (prev != 0 && prev != program) {
         mithril::Program* pp = mithril::state_get_program(prev);
         if (pp && pp->markedForDeletion) {
-            backend_delete_program_resources(prev);
+            g_vk_func.delete_program_resources(prev);
             g_state->programs.erase(prev);
             g_state->programNames.release(prev);
         }

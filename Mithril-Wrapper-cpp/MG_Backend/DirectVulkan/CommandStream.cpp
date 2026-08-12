@@ -9,7 +9,7 @@
 #include "Pipeline.h"       // clear_all_pipeline_caches (OOM recovery)
 #include "UniformArena.h"   // ubo_arena_rewind (per-frame transient UBO storage)
 #include "../Backend.h"
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 #include "../../MG_State/State.h"  // g_state (for scissorTest in clear_attachments +
                                   //  root cause AG: currentBaseVertex/currentBaseInstance +
                                   //  root cause Z: viewportH fallback)

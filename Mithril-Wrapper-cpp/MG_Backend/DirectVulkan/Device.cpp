@@ -23,7 +23,8 @@
 #include "DescriptorSet.h"  // reset_all_descriptor_pools() for swapchain rebuild recovery
 #include "UniformArena.h"  // ubo_arena_shutdown() — transient UBO arena teardown
 #include "../../MG_State/State.h"  // kMaxTextureUnits 等容量常量（backend_device_limit 用来夹紧上报值）
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
+#include "../backend_func.h"  // vk_func_t / g_vk_func (Task 1 backend dispatch table)
 
 #include <cstring>
 #include <ctime>
@@ -1485,10 +1486,155 @@ void shutdown_device() {
 // ===========================================================================
 // Public C API lifecycle functions (declared in MG_Backend/Backend.h)
 // ===========================================================================
+
+// vk_func_t dispatch table (Task 1 of the MobileGlues-architecture refactor).
+// Defined here, populated in backend_init(). Mirrors MobileGlues g_gles_func
+// (gles/gles.h:859 + the init loop in gles/loader.cpp). The frontend will
+// dispatch through g_vk_func.* in Task 2.3; until then the table is populated
+// but unused — existing frontend code continues to call backend_* directly.
+extern "C" {
+vk_func_t g_vk_func;
+}
+
+// Populate every field of g_vk_func with the address of the matching backend_*
+// function. Called from backend_init() after the device is fully initialised.
+// Idempotent (just pointer stores). Mirrors MobileGlues' INIT_GLES_FUNC loop.
+static void populate_vk_func_table(void) {
+    /* Lifecycle */
+    g_vk_func.init                   = backend_init;
+    g_vk_func.shutdown               = backend_shutdown;
+    g_vk_func.available              = backend_available;
+    g_vk_func.physical_device_name   = backend_physical_device_name;
+    g_vk_func.vram_bytes             = backend_vram_bytes;
+
+    /* Clear / load op */
+    g_vk_func.set_clear_color        = backend_set_clear_color;
+    g_vk_func.set_clear_depth        = backend_set_clear_depth;
+    g_vk_func.set_clear_stencil      = backend_set_clear_stencil;
+    g_vk_func.set_load_clear         = backend_set_load_clear;
+    g_vk_func.set_load_load          = backend_set_load_load;
+    g_vk_func.clear_attachments      = backend_clear_attachments;
+    g_vk_func.clear_buffer_indexed   = backend_clear_buffer_indexed;
+
+    /* Render pass */
+    g_vk_func.begin_render_pass           = backend_begin_render_pass;
+    g_vk_func.set_fbo_attachment_tex_ids  = backend_set_fbo_attachment_tex_ids;
+    g_vk_func.set_invalidate_attachments  = backend_set_invalidate_attachments;
+    g_vk_func.end_render_pass             = backend_end_render_pass;
+    g_vk_func.commit                      = backend_commit;
+
+    /* Swapchain (EGL-owned; backend registers/queries) */
+    g_vk_func.set_active_swapchain        = backend_set_active_swapchain;
+    g_vk_func.swapchain_set_drawable_size = backend_swapchain_set_drawable_size;
+    g_vk_func.swapchain_mark_rebuild      = backend_swapchain_mark_rebuild;
+    g_vk_func.drain_and_detach_swapchain  = backend_drain_and_detach_swapchain;
+    g_vk_func.swapchain_needs_rebuild     = backend_swapchain_needs_rebuild;
+
+    /* Encoder dynamic state (vkCmdSet* under dynamic rendering) */
+    g_vk_func.bind_pipeline         = backend_bind_pipeline;
+    g_vk_func.set_viewport          = backend_set_viewport;
+    g_vk_func.set_scissor           = backend_set_scissor;
+    g_vk_func.set_vertex_buffer     = backend_set_vertex_buffer;
+    g_vk_func.set_fragment_buffer   = backend_set_fragment_buffer;
+    g_vk_func.set_vertex_texture    = backend_set_vertex_texture;
+    g_vk_func.set_fragment_texture  = backend_set_fragment_texture;
+    g_vk_func.set_blend_color       = backend_set_blend_color;
+    g_vk_func.set_depth_bias        = backend_set_depth_bias;
+    g_vk_func.set_cull_mode         = backend_set_cull_mode;
+    g_vk_func.set_front_face        = backend_set_front_face;
+    g_vk_func.set_depth_test        = backend_set_depth_test;
+    g_vk_func.set_color_write_mask  = backend_set_color_write_mask;
+    g_vk_func.set_stencil_state     = backend_set_stencil_state;
+
+    /* Draw calls */
+    g_vk_func.draw_arrays                  = backend_draw_arrays;
+    g_vk_func.draw_indexed                 = backend_draw_indexed;
+    g_vk_func.draw_arrays_instanced        = backend_draw_arrays_instanced;
+    g_vk_func.draw_indexed_instanced       = backend_draw_indexed_instanced;
+    g_vk_func.push_constants               = backend_push_constants;
+    g_vk_func.draw_indirect                = backend_draw_indirect;
+    g_vk_func.draw_indexed_indirect        = backend_draw_indexed_indirect;
+    g_vk_func.draw_indirect_count          = backend_draw_indirect_count;
+    g_vk_func.draw_indexed_indirect_count  = backend_draw_indexed_indirect_count;
+
+    /* Buffers */
+    g_vk_func.get_or_create_buffer         = backend_get_or_create_buffer;
+    g_vk_func.create_buffer_storage        = backend_create_buffer_storage;
+    g_vk_func.buffer_upload                = backend_buffer_upload;
+    g_vk_func.get_buffer_mapped_pointer    = backend_get_buffer_mapped_pointer;
+    g_vk_func.get_buffer                   = backend_get_buffer;
+    g_vk_func.delete_buffer                = backend_delete_buffer;
+    g_vk_func.get_zero_buffer              = backend_get_zero_buffer;
+    g_vk_func.update_generic_attribs       = backend_update_generic_attribs;
+    g_vk_func.get_generic_attrib_buffer    = backend_get_generic_attrib_buffer;
+
+    /* Textures */
+    g_vk_func.get_or_create_texture        = backend_get_or_create_texture;
+    g_vk_func.texture_upload               = backend_texture_upload;
+    g_vk_func.texture_upload_compressed    = backend_texture_upload_compressed;
+    g_vk_func.texture_set_params           = backend_texture_set_params;
+    g_vk_func.get_texture_view             = backend_get_texture_view;
+    g_vk_func.get_texture_image            = backend_get_texture_image;
+    g_vk_func.delete_texture               = backend_delete_texture;
+    g_vk_func.invalidate_sampler_cache     = backend_invalidate_sampler_cache;
+    g_vk_func.transition_texture_layout    = backend_transition_texture_layout;
+    g_vk_func.generate_mipmaps             = backend_generate_mipmaps;
+    g_vk_func.read_pixels                  = backend_read_pixels;
+    g_vk_func.blit_texture                 = backend_blit_texture;
+    g_vk_func.blit_images                  = backend_blit_images;
+
+    /* Samplers */
+    g_vk_func.get_or_create_sampler        = backend_get_or_create_sampler;
+
+    /* Format helpers */
+    g_vk_func.vk_format_for_gl             = backend_vk_format_for_gl;
+
+    /* Pipeline cache */
+    g_vk_func.get_or_create_pipeline       = backend_get_or_create_pipeline;
+    g_vk_func.get_or_create_compute_pipeline = backend_get_or_create_compute_pipeline;
+
+    /* Compute / memory barrier */
+    g_vk_func.dispatch_compute             = backend_dispatch_compute;
+    g_vk_func.dispatch_compute_indirect    = backend_dispatch_compute_indirect;
+    g_vk_func.memory_barrier               = backend_memory_barrier;
+    g_vk_func.delete_program_resources     = backend_delete_program_resources;
+
+    /* GL sync object backing (glFenceSync / glClientWaitSync) */
+    g_vk_func.last_completed_serial        = backend_last_completed_serial;
+    g_vk_func.current_submit_serial        = backend_current_submit_serial;
+    g_vk_func.wait_serial                  = backend_wait_serial;
+
+    /* Program layouts / descriptors */
+    g_vk_func.ensure_program_layouts       = backend_ensure_program_layouts;
+    g_vk_func.bind_program_descriptors     = backend_bind_program_descriptors;
+
+    /* Present / swapchain lifecycle (EGL-owned) */
+    g_vk_func.present_and_acquire              = backend_present_and_acquire;
+    g_vk_func.create_swapchain                 = backend_create_swapchain;
+    g_vk_func.destroy_swapchain                = backend_destroy_swapchain;
+    g_vk_func.swapchain_acquire_color          = backend_swapchain_acquire_color;
+    g_vk_func.swapchain_acquire_depth          = backend_swapchain_acquire_depth;
+    g_vk_func.swapchain_width                  = backend_swapchain_width;
+    g_vk_func.swapchain_height                 = backend_swapchain_height;
+    g_vk_func.swapchain_current_color_image    = backend_swapchain_current_color_image;
+    g_vk_func.swapchain_color_format           = backend_swapchain_color_format;
+    g_vk_func.swapchain_current_depth_image    = backend_swapchain_current_depth_image;
+    g_vk_func.swapchain_depth_format           = backend_swapchain_depth_format;
+
+    /* Device limits (GL_MAX_* queries) */
+    g_vk_func.device_limit                 = backend_device_limit;
+}
+
 extern "C" {
 
 void backend_init(void) {
     mithril::vk::init_device();
+    // Populate the backend function-pointer table after the device is fully
+    // initialised. Idempotent (pointer stores). The frontend (Task 2.3) will
+    // dispatch through g_vk_func.* instead of calling backend_* directly;
+    // until then the table is populated but unused. Mirrors MobileGlues
+    // g_gles_func init in gles/loader.cpp.
+    populate_vk_func_table();
 }
 
 void backend_shutdown(void) {

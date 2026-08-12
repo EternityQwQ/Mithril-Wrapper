@@ -11,6 +11,7 @@
 #include "../MG_State/State.h"
 #include "Framebuffer.h"
 #include "../MG_Backend/Backend.h"
+#include "../MG_Backend/backend_func.h"
 
 // Bring the global GL state pointer into the global namespace so that
 // `extern "C"` GL entry points (which live in the global namespace) can refer

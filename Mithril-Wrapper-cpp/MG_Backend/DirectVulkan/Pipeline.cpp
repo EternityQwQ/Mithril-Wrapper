@@ -8,7 +8,7 @@
 #include "Resources.h"
 #include "DescriptorSet.h"
 #include "../Backend.h"
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 // FIX (root cause AF - Primitive Restart): 读取 g_state->primitiveRestart /
 // primitiveRestartFixedIndex 以动态设置 ia.primitiveRestartEnable，并将其
 // 纳入 hash_signature 缓存键。深度对照 MobileGL VulkanRenderer.cpp:3861-3877。

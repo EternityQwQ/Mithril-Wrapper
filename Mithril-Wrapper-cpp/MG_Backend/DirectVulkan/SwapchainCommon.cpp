@@ -17,7 +17,7 @@
 #include "Swapchain.h"
 #include "Device.h"
 #include "Resources.h"
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 
 #include <algorithm>
 #include <cstring>

@@ -27,7 +27,7 @@
 #include "UniformArena.h"  // transient per-frame UBO storage (see below)
 #include "../Backend.h"
 #include "../../MG_State/State.h"
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 
 #include <algorithm>
 #include <cstring>

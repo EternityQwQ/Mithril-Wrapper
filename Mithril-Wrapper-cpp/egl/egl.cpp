@@ -40,13 +40,14 @@
 // includes.h lives in MG_Impl/ (sibling of egl/); use a relative path since
 // the egl/ directory is not on the include search path and the quote-include
 // lookup only checks the current file's directory + -I dirs.
-#include "../MG_Impl/includes.h"
-#include "../MG_Impl/EGLConfig.h"
-#include "../MG_Impl/Log.h"
+#include "../gl/includes.h"
+#include "../gl/EGLConfig.h"
+#include "../gl/Log.h"
 #include "../MG_Backend/DirectVulkan/Device.h"
 #include <EGL/egl.h>
 
 #include "EglInternal.h"   // shared internal handle types + state + swapchain helper decls
+#include "context.h"       // MGContext tracking model (additive layer over EglContext)
 
 // Renderer/version strings built in MG_Impl/Getter.cpp + Getter_gpu.mm. Declared
 // here (not in a shared header) so eglMakeCurrent can emit the once-per-process
@@ -449,6 +450,13 @@ EGLContext eglCreateContext(EGLDisplay dpy, EGLConfig config,
         std::lock_guard<std::mutex> lk(g_ctxMutex);
         sh->refcount.fetch_add(1);
     }
+
+    // Register the additive MGContext tracking record (mirrors MobileGlues'
+    // mg_context_create). MGContext only tracks metadata + monotonic id; it
+    // does NOT own the GLState (EglContext still owns ctx->state).
+    mg_context_create(dpy, (EGLContext)ctx, share_context, ctx->clientAPI,
+                      ctx->majorVer, ctx->minorVer, 0, 0, ctx->state);
+
     return (EGLContext)ctx;
 }
 
@@ -459,6 +467,12 @@ EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
     if (!c || c == (EglContext*)EGL_NO_CONTEXT) {
         set_error(EGL_BAD_CONTEXT); return EGL_FALSE;
     }
+    // Drop the additive MGContext tracking record (mirrors MobileGlues'
+    // mg_context_destroy). Called BEFORE the EglContext detach/refcount logic
+    // so the MGContext can still resolve the handle. MGContext does NOT free
+    // the GLState or the EglContext — the refcount logic below still owns
+    // those (state_destroy + delete c when refcount hits 0).
+    mg_context_destroy((EGLContext)c);
     // If this context is current on this thread, detach it first.
     if (t_currentCtx == c) {
         install_surface_on_state(nullptr, false);
@@ -492,6 +506,9 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
         t_currentCtx = nullptr;
         t_currentDraw = nullptr;
         t_currentRead = nullptr;
+        // Mirror the detach into the MGContext tracking layer (clears this
+        // thread's g_current_ctx + drops the keeping-it-alive ref).
+        mg_context_make_current(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         return EGL_TRUE;
     }
 
@@ -549,6 +566,11 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
     t_currentCtx  = c;
     t_currentDraw = d;
     t_currentRead = r ? r : d;
+    // Mirror the make-current into the MGContext tracking layer (sets this
+    // thread's g_current_ctx + dispatches per-subsystem bind hooks). Called
+    // AFTER g_state/t_currentCtx are set so subsystems see a consistent
+    // current context.
+    mg_context_make_current(dpy, draw, read, (EGLContext)c);
     return EGL_TRUE;
 }
 

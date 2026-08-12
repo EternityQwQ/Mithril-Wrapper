@@ -13,7 +13,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>   // NSObject introspection only (no ISA rewrite)
 
-#include "../MG_Impl/Log.h"
+#include "../gl/Log.h"
 
 // ---------------------------------------------------------------------------
 // surface_create: coerce CALayer -> CAMetalLayer and pin format/attrs.

@@ -145,7 +145,7 @@ void glReadnPixels(GLint x, GLint y, GLsizei width, GLsizei height,
  * granularity is not meaningful on Vulkan/MoltenVK (tiling is hidden). */
 void glMemoryBarrierByRegion(GLbitfield barriers) {
     MITHRIL_ENSURE_INIT();
-    backend_memory_barrier(barriers);
+    g_vk_func.memory_barrier(barriers);
 }
 
 /* 10. glGetTexLevelParameterfv - Delegate to glGetTexLevelParameteriv and

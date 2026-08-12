@@ -145,7 +145,7 @@ static bool prepare_draw(GLenum mode) {
         for (int i = 0; i < color_count; ++i) {
             GLuint t = fbo->colors[i].texture;
             mithril::Texture* tex = mithril::state_get_texture(t);
-            if (tex) color_formats[i] = backend_vk_format_for_gl((GLenum)tex->internalFormat);
+            if (tex) color_formats[i] = g_vk_func.vk_format_for_gl((GLenum)tex->internalFormat);
         }
     } else {
         // EGL default framebuffer: read the swapchain's actual color format
@@ -174,7 +174,7 @@ static bool prepare_draw(GLenum mode) {
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     if (fbo && fbo->depth.texture) {
         mithril::Texture* dt = mithril::state_get_texture(fbo->depth.texture);
-        if (dt) depth_format = backend_vk_format_for_gl((GLenum)dt->internalFormat);
+        if (dt) depth_format = g_vk_func.vk_format_for_gl((GLenum)dt->internalFormat);
     } else if (depth_view != VK_NULL_HANDLE) {
         // EGL default framebuffer: depth is always D32_SFLOAT_S8_UINT.
         depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
@@ -212,7 +212,7 @@ static bool prepare_draw(GLenum mode) {
     if (g_state->colorMask[0][1]) cwm_bits |= 2;
     if (g_state->colorMask[0][2]) cwm_bits |= 4;
     if (g_state->colorMask[0][3]) cwm_bits |= 8;
-    VkPipeline pipeline = backend_get_or_create_pipeline(
+    VkPipeline pipeline = g_vk_func.get_or_create_pipeline(
         prog->id,
         vs_spirv.data(),            (int)vs_spirv.size(),
         prog->fragmentSpirv.data(), (int)prog->fragmentSpirv.size(),
@@ -250,17 +250,17 @@ static bool prepare_draw(GLenum mode) {
             color_tex_ids[i] = fbo->colors[i].texture;
         }
         GLuint depth_tex_id = fbo->depth.texture;
-        backend_set_fbo_attachment_tex_ids(color_tex_ids, color_count, depth_tex_id);
+        g_vk_func.set_fbo_attachment_tex_ids(color_tex_ids, color_count, depth_tex_id);
     } else {
-        backend_set_fbo_attachment_tex_ids(nullptr, 0, 0);
+        g_vk_func.set_fbo_attachment_tex_ids(nullptr, 0, 0);
     }
 
     // Begin render pass (Load action preserves previous contents).
-    backend_set_load_load();
-    backend_begin_render_pass(colors, color_count, depth_view, w, h, 1);
+    g_vk_func.set_load_load();
+    g_vk_func.begin_render_pass(colors, color_count, depth_view, w, h, 1);
 
     // Bind pipeline + set dynamic state via vkCmdSet*.
-    backend_bind_pipeline(pipeline);
+    g_vk_func.bind_pipeline(pipeline);
     // FIX (root cause: gl_VertexID baseVertex semantics): push
     // currentBaseVertex into the shader's _MithrilBaseVertex push-constant
     // block on EVERY draw. Shader.cpp defines gl_VertexID as
@@ -270,13 +270,13 @@ static bool prepare_draw(GLenum mode) {
     // restores desktop GL's gl_VertexID == index + baseVertex semantics. Always
     // writing (not just when baseVertex != 0) guarantees the push constant is
     // never undefined when the shader reads it.
-    backend_push_constants(prog->id, 0, 4, &g_state->currentBaseVertex);
+    g_vk_func.push_constants(prog->id, 0, 4, &g_state->currentBaseVertex);
     // Bind the program's descriptor set (UBOs + sampled images) immediately
     // after the pipeline so the shader's uniform/texture bindings are live for
     // the upcoming draw. The set is built per-draw from Program.uniforms +
     // g_state->boundTextures by DescriptorSet.cpp.
-    backend_bind_program_descriptors(prog->id);
-    backend_set_viewport(g_state->viewportX, g_state->viewportY,
+    g_vk_func.bind_program_descriptors(prog->id);
+    g_vk_func.set_viewport(g_state->viewportX, g_state->viewportY,
                          g_state->viewportW, g_state->viewportH,
                          g_state->depthNear, g_state->depthFar);
     // FIX (root cause G): ALWAYS set the scissor. VK_DYNAMIC_STATE_SCISSOR is
@@ -286,10 +286,10 @@ static bool prepare_draw(GLenum mode) {
     // (0,0,0,0) — which clips ALL pixels → black screen. MobileGL always
     // sets a scissor (full viewport when GL_SCISSOR_TEST is off).
     if (g_state->scissorTest) {
-        backend_set_scissor(g_state->scissorX, g_state->scissorY,
+        g_vk_func.set_scissor(g_state->scissorX, g_state->scissorY,
                             g_state->scissorW, g_state->scissorH);
     } else {
-        backend_set_scissor(0, 0, g_state->viewportW, g_state->viewportH);
+        g_vk_func.set_scissor(0, 0, g_state->viewportW, g_state->viewportH);
     }
     // FIX (root cause H + Y-flip winding fix): ALWAYS set cull mode.
     // VK_DYNAMIC_STATE_CULL_MODE is dynamic; skipping the call when cullFace is
@@ -325,34 +325,34 @@ static bool prepare_draw(GLenum mode) {
         } else {  // GL_FRONT_AND_BACK
             vk_cull = 3;  // VK_CULL_MODE_FRONT_AND_BACK
         }
-        backend_set_cull_mode(vk_cull);
+        g_vk_func.set_cull_mode(vk_cull);
         // Y 翻转使缠绕反转：GL-CCW → Vulkan-CW。设 frontFace=CW 补偿（仅默认帧缓冲）。
         // 用户 FBO 无 Y 翻转，frontFace 按 GL 值映射（CCW→1, CW→0）。
-        backend_set_front_face(is_default_fbo ? 0 /*CW*/ :
+        g_vk_func.set_front_face(is_default_fbo ? 0 /*CW*/ :
                                (g_state->frontFace == GL_CCW ? 1 : 0));
     } else {
-        backend_set_cull_mode(0);  // VK_CULL_MODE_NONE
+        g_vk_func.set_cull_mode(0);  // VK_CULL_MODE_NONE
     }
-    backend_set_color_write_mask(
+    g_vk_func.set_color_write_mask(
         g_state->colorMask[0][0], g_state->colorMask[0][1],
         g_state->colorMask[0][2], g_state->colorMask[0][3]);
-    backend_set_depth_test(
+    g_vk_func.set_depth_test(
         g_state->depthTest ? 1 : 0,
         g_state->depthMask ? 1 : 0,
         (int)g_state->depthFunc);
     // Apply dynamic pipeline state: depth bias + stencil.
     // 对照 MobileGL 动态状态应用.
     if (g_state->polygonOffsetFill) {
-        backend_set_depth_bias(g_state->polygonOffsetFactor, g_state->polygonOffsetUnits);
+        g_vk_func.set_depth_bias(g_state->polygonOffsetFactor, g_state->polygonOffsetUnits);
     }
     if (g_state->stencilTest) {
-        backend_set_stencil_state(1, (int)g_state->stencilFunc, g_state->stencilRef,
+        g_vk_func.set_stencil_state(1, (int)g_state->stencilFunc, g_state->stencilRef,
                                   (int)g_state->stencilValueMask,
                                   (int)g_state->stencilSfail, (int)g_state->stencilDpfail,
                                   (int)g_state->stencilDppass);
     }
     if (g_state->blends[0].enabled) {
-        backend_set_blend_color(
+        g_vk_func.set_blend_color(
             g_state->blendColor[0], g_state->blendColor[1],
             g_state->blendColor[2], g_state->blendColor[3]);
     }
@@ -362,11 +362,11 @@ static bool prepare_draw(GLenum mode) {
     // attribute slots the VAO didn't enable, bind the shared zero buffer so
     // the unbound vertex input reads vec4(0) instead of dereferencing
     // unbound memory.
-    VkBuffer zero_buf = backend_get_zero_buffer();
+    VkBuffer zero_buf = g_vk_func.get_zero_buffer();
     bool bound_slots[16] = {false};
     for (int i = 0; i < attrib_count; ++i) {
         MGVertexAttrib& m = attribs[i];
-        VkBuffer buf = backend_get_buffer(m.buffer_name);
+        VkBuffer buf = g_vk_func.get_buffer(m.buffer_name);
         if (buf != VK_NULL_HANDLE) {
 // FIX (Root Cause H - 顶点属性偏移双重应用):
 // Vulkan 顶点寻址公式: buffer + pOffsets[binding] + vertexIndex*stride + attr.offset
@@ -375,7 +375,7 @@ static bool prepare_draw(GLenum mode) {
 // 偏移会被应用两次 → 有效地址 = buffer + 2*m.offset，导致交错顶点格式（如
 // position@0/color@12/uv@24）的属性读取错位 → 加载界面红屏/花屏。
 // 参考 MobileGL VkglVertexAttribBindingState：binding offset 恒为 0，偏移由属性描述处理。
-            backend_set_vertex_buffer(m.location, buf, 0);
+            g_vk_func.set_vertex_buffer(m.location, buf, 0);
             if (m.location < 16) bound_slots[m.location] = true;
         }
     }
@@ -383,7 +383,7 @@ static bool prepare_draw(GLenum mode) {
     if (zero_buf != VK_NULL_HANDLE) {
         for (int loc = 0; loc < 16; ++loc) {
             if (!bound_slots[loc]) {
-                backend_set_vertex_buffer(loc, zero_buf, 0);
+                g_vk_func.set_vertex_buffer(loc, zero_buf, 0);
             }
         }
     }
@@ -408,7 +408,7 @@ static void end_draw(void) {
     // which presents the swapchain image. Committing per-draw would flush
     // the Vulkan pipeline hundreds of times per frame, causing severe perf
     // loss and present timing issues.
-    backend_end_render_pass();
+    g_vk_func.end_render_pass();
 }
 
 static int index_type_to_int(GLenum type) {
@@ -457,14 +457,14 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     // outside a render-pass instance and crash inside MoltenVK. Bail out
     // without calling end_draw(): there is no pass to end.
     if (!prepare_draw(mode)) return;
-    backend_draw_arrays((int)mode, (int)first, (int)count);
+    g_vk_func.draw_arrays((int)mode, (int)first, (int)count);
     end_draw();
 }
 
 void glDrawArraysInstanced(GLenum mode, GLint first, GLsizei count, GLsizei primcount) {
     MITHRIL_ENSURE_INIT();
     if (!prepare_draw(mode)) return;  // root cause AI — see glDrawArrays
-    backend_draw_arrays_instanced((int)mode, (int)first, (int)count, (int)primcount);
+    g_vk_func.draw_arrays_instanced((int)mode, (int)first, (int)count, (int)primcount);
     end_draw();
 }
 
@@ -479,7 +479,7 @@ void glDrawArraysInstancedBaseInstance(GLenum mode, GLint first, GLsizei count,
     // the early-out path too, otherwise it leaks into the next draw (which
     // expects firstInstance == 0) and misaddresses its instance data.
     if (!prepare_draw(mode)) { g_state->currentBaseInstance = 0; return; }
-    backend_draw_arrays_instanced((int)mode, (int)first, (int)count, (int)primcount);
+    g_vk_func.draw_arrays_instanced((int)mode, (int)first, (int)count, (int)primcount);
     g_state->currentBaseInstance = 0;
     end_draw();
 }
@@ -491,9 +491,9 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices
     // If a VBO is bound for GL_ELEMENT_ARRAY_BUFFER, indices is an offset into it.
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
-    VkBuffer ib = backend_get_buffer(ib_name);
+    VkBuffer ib = g_vk_func.get_buffer(ib_name);
     if (ib != VK_NULL_HANDLE) {
-        backend_draw_indexed((int)mode, (int)count, index_type_to_int(type),
+        g_vk_func.draw_indexed((int)mode, (int)count, index_type_to_int(type),
                              ib, (VkDeviceSize)(intptr_t)indices);
     } else if (indices) {
         // Client-space index pointer: stage into a transient VkBuffer.
@@ -501,10 +501,10 @@ void glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices
         // 否则 staging 大小翻倍 → 越界读 + 索引错乱。
         size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
         GLuint transient = (GLuint)(uintptr_t)indices; // use address as throwaway name
-        VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
+        VkBuffer staged = g_vk_func.get_or_create_buffer(transient | 0x80000000u,
                                                        indices, (size_t)count * elem);
         if (staged != VK_NULL_HANDLE) {
-            backend_draw_indexed((int)mode, (int)count, index_type_to_int(type),
+            g_vk_func.draw_indexed((int)mode, (int)count, index_type_to_int(type),
                                  staged, 0);
         }
     }
@@ -542,19 +542,19 @@ void glDrawElementsInstanced(GLenum mode, GLsizei count, GLenum type,
     if (!prepare_draw(mode)) return;  // root cause AI — see glDrawArrays
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
-    VkBuffer ib = backend_get_buffer(ib_name);
+    VkBuffer ib = g_vk_func.get_buffer(ib_name);
     if (ib != VK_NULL_HANDLE) {
-        backend_draw_indexed_instanced((int)mode, (int)count,
+        g_vk_func.draw_indexed_instanced((int)mode, (int)count,
                                        index_type_to_int(type), ib,
                                        (VkDeviceSize)(intptr_t)indices, (int)primcount);
     } else if (indices) {
         // FIX (root cause AE): GL_UNSIGNED_BYTE 索引按 1 字节/索引 staging。
         size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
         GLuint transient = (GLuint)(uintptr_t)indices;
-        VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
+        VkBuffer staged = g_vk_func.get_or_create_buffer(transient | 0x80000000u,
                                                        indices, (size_t)count * elem);
         if (staged != VK_NULL_HANDLE) {
-            backend_draw_indexed_instanced((int)mode, (int)count,
+            g_vk_func.draw_indexed_instanced((int)mode, (int)count,
                                            index_type_to_int(type), staged, 0,
                                            (int)primcount);
         }
@@ -641,7 +641,7 @@ void glMultiDrawArrays(GLenum mode, const GLint* first, const GLsizei* count, GL
     if (!first || !count || drawcount <= 0) return;
     if (!prepare_draw(mode)) return;  // root cause AI — 一次 SetupDraw
     for (GLsizei i = 0; i < drawcount; ++i) {
-        if (count[i] > 0) backend_draw_arrays((int)mode, (int)first[i], (int)count[i]);
+        if (count[i] > 0) g_vk_func.draw_arrays((int)mode, (int)first[i], (int)count[i]);
     }
     end_draw();  // 一次 end_render_pass
 }
@@ -654,7 +654,7 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
     // 仅 offset 不同）。客户端指针路径逐 sub-draw staging。
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
-    VkBuffer ib = backend_get_buffer(ib_name);
+    VkBuffer ib = g_vk_func.get_buffer(ib_name);
     int idx_type = index_type_to_int(type);
     size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
     if (!prepare_draw(mode)) return;  // root cause AI — 一次 SetupDraw
@@ -662,7 +662,7 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
         // VBO 路径：indices[i] 是 offset，零拷贝
         for (GLsizei i = 0; i < drawcount; ++i) {
             if (count[i] > 0)
-                backend_draw_indexed((int)mode, (int)count[i], idx_type, ib,
+                g_vk_func.draw_indexed((int)mode, (int)count[i], idx_type, ib,
                                      (VkDeviceSize)(intptr_t)indices[i]);
         }
     } else {
@@ -670,10 +670,10 @@ void glMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
         for (GLsizei i = 0; i < drawcount; ++i) {
             if (count[i] > 0 && indices[i]) {
                 GLuint transient = (GLuint)(uintptr_t)indices[i];
-                VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
+                VkBuffer staged = g_vk_func.get_or_create_buffer(transient | 0x80000000u,
                                                                indices[i], (size_t)count[i] * elem);
                 if (staged != VK_NULL_HANDLE)
-                    backend_draw_indexed((int)mode, (int)count[i], idx_type, staged, 0);
+                    g_vk_func.draw_indexed((int)mode, (int)count[i], idx_type, staged, 0);
             }
         }
     }
@@ -687,7 +687,7 @@ void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum typ
     if (!count || !indices || drawcount <= 0) return;
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
-    VkBuffer ib = backend_get_buffer(ib_name);
+    VkBuffer ib = g_vk_func.get_buffer(ib_name);
     int idx_type = index_type_to_int(type);
     size_t elem = (type == GL_UNSIGNED_INT) ? 4 : (type == GL_UNSIGNED_BYTE) ? 1 : 2;
     if (!prepare_draw(mode)) return;
@@ -695,7 +695,7 @@ void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum typ
         for (GLsizei i = 0; i < drawcount; ++i) {
             if (count[i] > 0) {
                 g_state->currentBaseVertex = basevertex[i];
-                backend_draw_indexed((int)mode, (int)count[i], idx_type, ib,
+                g_vk_func.draw_indexed((int)mode, (int)count[i], idx_type, ib,
                                      (VkDeviceSize)(intptr_t)indices[i]);
             }
         }
@@ -705,10 +705,10 @@ void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum typ
             if (count[i] > 0 && indices[i]) {
                 g_state->currentBaseVertex = basevertex[i];
                 GLuint transient = (GLuint)(uintptr_t)indices[i];
-                VkBuffer staged = backend_get_or_create_buffer(transient | 0x80000000u,
+                VkBuffer staged = g_vk_func.get_or_create_buffer(transient | 0x80000000u,
                                                                indices[i], (size_t)count[i] * elem);
                 if (staged != VK_NULL_HANDLE)
-                    backend_draw_indexed((int)mode, (int)count[i], idx_type, staged, 0);
+                    g_vk_func.draw_indexed((int)mode, (int)count[i], idx_type, staged, 0);
             }
         }
         g_state->currentBaseVertex = 0;
@@ -731,10 +731,10 @@ void glMultiDrawElementsBaseVertex(GLenum mode, const GLsizei* count, GLenum typ
 void glDrawArraysIndirect(GLenum mode, const void* indirect) {
     MITHRIL_ENSURE_INIT();
     GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
-    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    VkBuffer indirect_buf = g_vk_func.get_buffer(buf_name);
     if (indirect_buf == VK_NULL_HANDLE) return;
     if (!prepare_draw(mode)) return;  // root cause AI
-    backend_draw_indirect((int)mode, indirect_buf,
+    g_vk_func.draw_indirect((int)mode, indirect_buf,
                           (VkDeviceSize)(intptr_t)indirect, 1, 0);
     end_draw();
 }
@@ -742,14 +742,14 @@ void glDrawArraysIndirect(GLenum mode, const void* indirect) {
 void glDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
     MITHRIL_ENSURE_INIT();
     GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
-    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    VkBuffer indirect_buf = g_vk_func.get_buffer(buf_name);
     if (indirect_buf == VK_NULL_HANDLE) return;
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
-    VkBuffer ib = backend_get_buffer(ib_name);
+    VkBuffer ib = g_vk_func.get_buffer(ib_name);
     if (ib == VK_NULL_HANDLE) return;
     if (!prepare_draw(mode)) return;
-    backend_draw_indexed_indirect((int)mode, index_type_to_int(type), ib, 0,
+    g_vk_func.draw_indexed_indirect((int)mode, index_type_to_int(type), ib, 0,
                                   indirect_buf, (VkDeviceSize)(intptr_t)indirect,
                                   1, 0);
     end_draw();
@@ -760,11 +760,11 @@ void glMultiDrawArraysIndirect(GLenum mode, const void* indirect,
     MITHRIL_ENSURE_INIT();
     if (drawcount <= 0) return;
     GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
-    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    VkBuffer indirect_buf = g_vk_func.get_buffer(buf_name);
     if (indirect_buf == VK_NULL_HANDLE) return;
     if (!prepare_draw(mode)) return;
     int s = stride ? stride : 16;  // sizeof(VkDrawIndirectCommand)
-    backend_draw_indirect((int)mode, indirect_buf,
+    g_vk_func.draw_indirect((int)mode, indirect_buf,
                           (VkDeviceSize)(intptr_t)indirect, drawcount, s);
     end_draw();
 }
@@ -774,15 +774,15 @@ void glMultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect,
     MITHRIL_ENSURE_INIT();
     if (drawcount <= 0) return;
     GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
-    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    VkBuffer indirect_buf = g_vk_func.get_buffer(buf_name);
     if (indirect_buf == VK_NULL_HANDLE) return;
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
-    VkBuffer ib = backend_get_buffer(ib_name);
+    VkBuffer ib = g_vk_func.get_buffer(ib_name);
     if (ib == VK_NULL_HANDLE) return;
     if (!prepare_draw(mode)) return;
     int s = stride ? stride : 20;  // sizeof(VkDrawIndexedIndirectCommand)
-    backend_draw_indexed_indirect((int)mode, index_type_to_int(type), ib, 0,
+    g_vk_func.draw_indexed_indirect((int)mode, index_type_to_int(type), ib, 0,
                                   indirect_buf, (VkDeviceSize)(intptr_t)indirect,
                                   drawcount, s);
     end_draw();
@@ -809,7 +809,7 @@ void glMultiDrawArraysIndirectCount(GLenum mode, const void* indirect,
     MITHRIL_ENSURE_INIT();
     if (maxdrawcount <= 0) return;
     GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
-    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    VkBuffer indirect_buf = g_vk_func.get_buffer(buf_name);
     if (indirect_buf == VK_NULL_HANDLE) return;
     // GL 规范：drawcount 是 GL_DRAW_INDIRECT_BUFFER 内的字节偏移，存储一个
     // uint32 的 draw 数量。Vulkan 的 count 参数正是 (buffer, offset)。
@@ -817,7 +817,7 @@ void glMultiDrawArraysIndirectCount(GLenum mode, const void* indirect,
     VkDeviceSize count_off = (VkDeviceSize)drawcount;
     if (!prepare_draw(mode)) return;
     int s = stride ? stride : 16;  // sizeof(VkDrawIndirectCommand)
-    backend_draw_indirect_count((int)mode, indirect_buf,
+    g_vk_func.draw_indirect_count((int)mode, indirect_buf,
                                 (VkDeviceSize)(intptr_t)indirect,
                                 count_buf, count_off, maxdrawcount, s);
     end_draw();
@@ -829,18 +829,18 @@ void glMultiDrawElementsIndirectCount(GLenum mode, GLenum type,
     MITHRIL_ENSURE_INIT();
     if (maxdrawcount <= 0) return;
     GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DrawIndirect].name;
-    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    VkBuffer indirect_buf = g_vk_func.get_buffer(buf_name);
     if (indirect_buf == VK_NULL_HANDLE) return;
     mithril::VertexArray* vao = mithril::state_get_vao(g_state->currentVAO);
     GLuint ib_name = vao ? vao->elementArrayBuffer : 0;
-    VkBuffer ib = backend_get_buffer(ib_name);
+    VkBuffer ib = g_vk_func.get_buffer(ib_name);
     if (ib == VK_NULL_HANDLE) return;
     // 同 Arrays 变体：count 在 GL_DRAW_INDIRECT_BUFFER 的 drawcount 偏移处。
     VkBuffer count_buf = indirect_buf;
     VkDeviceSize count_off = (VkDeviceSize)drawcount;
     if (!prepare_draw(mode)) return;
     int s = stride ? stride : 20;  // sizeof(VkDrawIndexedIndirectCommand)
-    backend_draw_indexed_indirect_count((int)mode, index_type_to_int(type),
+    g_vk_func.draw_indexed_indirect_count((int)mode, index_type_to_int(type),
                                         ib, 0,
                                         indirect_buf, (VkDeviceSize)(intptr_t)indirect,
                                         count_buf, count_off, maxdrawcount, s);
@@ -861,15 +861,15 @@ void glMultiDrawElementsIndirectCount(GLenum mode, GLenum type,
 
 void glDispatchCompute(GLuint groups_x, GLuint groups_y, GLuint groups_z) {
     MITHRIL_ENSURE_INIT();
-    backend_dispatch_compute(groups_x, groups_y, groups_z);
+    g_vk_func.dispatch_compute(groups_x, groups_y, groups_z);
 }
 
 void glDispatchComputeIndirect(GLintptr indirect) {
     MITHRIL_ENSURE_INIT();
     GLuint buf_name = g_state->bufferBindings[(int)mithril::BufferTarget::DispatchIndirect].name;
-    VkBuffer indirect_buf = backend_get_buffer(buf_name);
+    VkBuffer indirect_buf = g_vk_func.get_buffer(buf_name);
     if (indirect_buf == VK_NULL_HANDLE) return;
-    backend_dispatch_compute_indirect(indirect_buf, (VkDeviceSize)indirect);
+    g_vk_func.dispatch_compute_indirect(indirect_buf, (VkDeviceSize)indirect);
 }
 
 /* =========================================================================
@@ -901,14 +901,14 @@ void glDispatchComputeIndirect(GLintptr indirect) {
 
 void glMemoryBarrier(GLbitfield barriers) {
     MITHRIL_ENSURE_INIT();
-    backend_memory_barrier(barriers);
+    g_vk_func.memory_barrier(barriers);
 }
 
 void glTextureBarrier(void) {
     MITHRIL_ENSURE_INIT();
     // GL 4.5 ARB_texture_barrier: 确保 framebuffer 读取看到之前 draw 的写入。
     // 保守实现为完整 memory barrier。
-    backend_memory_barrier(GL_FRAMEBUFFER_BARRIER_BIT);
+    g_vk_func.memory_barrier(GL_FRAMEBUFFER_BARRIER_BIT);
 }
 
 /* ---- Sync objects (P1-16 FIX) ---- */

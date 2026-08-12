@@ -8,7 +8,7 @@
 #include "Pipeline.h"       // clear_all_pipeline_caches — OOM 时驱逐 pipeline
 #include "DescriptorSet.h"  // reset_all_descriptor_pools — OOM 时驱逐 descriptor
 #include "../Backend.h"
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 
 #include <cstring>
 #include <algorithm>

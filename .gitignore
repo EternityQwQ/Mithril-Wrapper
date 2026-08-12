@@ -8,6 +8,7 @@ build/
 # 本地参考仓库，勿提交
 MobileGL/
 glslang_check/
+.refs/
 
 # 本地根因分析文档，含敏感信息，勿提交
 ROOT_CAUSE_CONTEXT.md

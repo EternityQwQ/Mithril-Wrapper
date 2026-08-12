@@ -19,7 +19,7 @@ message(STATUS "Mithril build commit id: ${MITHRIL_COMMIT_ID}")
 
 # Objective-C++ (.mm) standard for the EGL surface layer + Apple GPU info +
 # Vulkan Metal-backed swapchain. The .mm files in the cross-platform split are
-# egl/SurfaceMetal.mm (CAMetalLayer coercion), MG_Impl/Getter_gpu.mm (NSString
+# egl/SurfaceMetal.mm (CAMetalLayer coercion), gl/Getter_gpu.mm (NSString
 # / NSLog helpers), and MG_Backend/DirectVulkan/SwapchainMetal.mm (defines
 # VK_USE_PLATFORM_METAL_EXT so it can call vkCreateMetalSurfaceEXT). All of
 # them are Foundation/QuartzCore/Metal — no other platforms build .mm files.
@@ -146,7 +146,7 @@ add_subdirectory(Mithril-Wrapper-cpp/3rdparty/SPIRV-Cross)
 #
 # Source layout (cross-platform Vulkan/MoltenVK rewrite):
 #   Mithril-Wrapper-cpp/
-#     MG_Impl/         — OpenGL 3.3 Core Profile entry points (GL calls into
+#     gl/              — OpenGL 3.3 Core Profile entry points (GL calls into
 #                        the Vulkan backend via the C API in MG_Backend/Backend.h)
 #     MG_State/        — GL state machine (per-EGLContext GLState)
 #     MG_Backend/      — abstract backend C API (Backend.h)
@@ -158,22 +158,34 @@ add_subdirectory(Mithril-Wrapper-cpp/3rdparty/SPIRV-Cross)
 #     include/         — public GL/EGL headers
 # ---------------------------------------------------------------------------
 set(MITHRIL_SOURCES
-    # MG_Impl: OpenGL 3.3 Core Profile entry points
-    Mithril-Wrapper-cpp/MG_Impl/init.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Log.cpp
-    Mithril-Wrapper-cpp/MG_Impl/gl.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Getter.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Program.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Shader.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Buffer.cpp
-    Mithril-Wrapper-cpp/MG_Impl/VertexArray.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Texture.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Framebuffer.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Drawing.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Stubs.cpp
-    Mithril-Wrapper-cpp/MG_Impl/GL46_Compat.cpp
-    Mithril-Wrapper-cpp/MG_Impl/Debug.cpp
-    Mithril-Wrapper-cpp/MG_Impl/lookup.cpp
+    # gl: OpenGL 3.3 Core Profile entry points
+    Mithril-Wrapper-cpp/gl/init.cpp
+    Mithril-Wrapper-cpp/gl/Log.cpp
+    Mithril-Wrapper-cpp/gl/gl.cpp
+    Mithril-Wrapper-cpp/gl/enable.cpp
+    Mithril-Wrapper-cpp/gl/pixel.cpp
+    Mithril-Wrapper-cpp/gl/Getter.cpp
+    Mithril-Wrapper-cpp/gl/Program.cpp
+    Mithril-Wrapper-cpp/gl/Shader.cpp
+    # gl/glsl/: GLSL->SPIR-V translation + SHA-256 LRU persistent cache
+    # (MobileGlues-style module split). glsl_for_vk.cpp holds the translation
+    # pipeline migrated from the former gl/Shader.cpp; cache.cpp holds the
+    # SHA-256 LRU disk cache. gl/Shader.cpp is now a thin forwarder that
+    # preserves the mithril::shader_translate / get_fallback_spirv API.
+    # SHA-256 is inlined (FIPS 180-4, no libcrypto dependency) so no
+    # find_package(OpenSSL) is needed.
+    Mithril-Wrapper-cpp/gl/glsl/glsl_for_vk.cpp
+    Mithril-Wrapper-cpp/gl/glsl/cache.cpp
+    Mithril-Wrapper-cpp/gl/Buffer.cpp
+    Mithril-Wrapper-cpp/gl/VertexArray.cpp
+    Mithril-Wrapper-cpp/gl/Texture.cpp
+    Mithril-Wrapper-cpp/gl/Framebuffer.cpp
+    Mithril-Wrapper-cpp/gl/Drawing.cpp
+    Mithril-Wrapper-cpp/gl/gl_stub.cpp
+    Mithril-Wrapper-cpp/gl/gl_native.cpp
+    Mithril-Wrapper-cpp/gl/GL46_Compat.cpp
+    Mithril-Wrapper-cpp/gl/Debug.cpp
+    Mithril-Wrapper-cpp/gl/lookup.cpp
 
     # MITHRIL_SOURCES historically but the source files were never committed to
     # the repo (and no other translation unit references their symbols). They are
@@ -202,11 +214,11 @@ set(MITHRIL_SOURCES
     # after creating the VkSurfaceKHR.
     Mithril-Wrapper-cpp/MG_Backend/DirectVulkan/SwapchainCommon.cpp
 
-    # MG_Impl: pure-logic EGL config table extracted from the EGL layer so it
+    # gl: pure-logic EGL config table extracted from the EGL layer so it
     # can be unit-tested without an ObjC++ toolchain. Compiled into every
     # platform's dylib/so (egl.cpp #includes EGLConfig.h and treats g_configs
     # as its config table).
-    Mithril-Wrapper-cpp/MG_Impl/EGLConfig.cpp
+    Mithril-Wrapper-cpp/gl/EGLConfig.cpp
 
     # egl/egl.cpp: cross-platform EGL 1.5 core (all egl* entry points +
     # shadow sync/image objects). No platform-specific includes — surface
@@ -221,6 +233,13 @@ set(MITHRIL_SOURCES
     # Plain C++ (the swapchain is owned by the backend), built on every platform.
     # Shared internal types live in egl/EglInternal.h (header only).
     Mithril-Wrapper-cpp/egl/SwapchainHelper.cpp
+
+    # egl/context.cpp: MGContext tracking model (mirrors MobileGlues'
+    # egl/context.cpp). An ADDITIVE layer over EglContext: tracks per-context
+    # metadata (monotonic id, display, granted version, share-group pointer)
+    # and gives subsystems a thread-local current-context pointer + per-context
+    # bind/forget hooks. Does NOT own GLState or free EglContext.
+    Mithril-Wrapper-cpp/egl/context.cpp
 )
 
 # ---- Platform-specific sources ----
@@ -236,7 +255,7 @@ if(APPLE)
         Mithril-Wrapper-cpp/egl/SurfaceMetal.mm
         # GPU info string builder (queries VkPhysicalDeviceProperties for
         # GL_RENDERER; .mm so it can use NSString/NSLog without an #ifdef dance).
-        Mithril-Wrapper-cpp/MG_Impl/Getter_gpu.mm
+        Mithril-Wrapper-cpp/gl/Getter_gpu.mm
         # Vulkan swapchain: VkSurfaceKHR via VK_EXT_metal_surface. Compiled as
         # Objective-C++ because it #defines VK_USE_PLATFORM_METAL_EXT before
         # including <vulkan/vulkan.h>, which pulls in <Metal/Metal.h>
@@ -364,7 +383,7 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 if(APPLE)
     set_source_files_properties(
         Mithril-Wrapper-cpp/egl/SurfaceMetal.mm
-        Mithril-Wrapper-cpp/MG_Impl/Getter_gpu.mm
+        Mithril-Wrapper-cpp/gl/Getter_gpu.mm
         Mithril-Wrapper-cpp/MG_Backend/DirectVulkan/SwapchainMetal.mm
         PROPERTIES COMPILE_FLAGS "-fobjc-arc"
     )
@@ -373,6 +392,24 @@ endif()
 # Reasonable warnings, no -Werror (CI must be tolerant during bring-up)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable)
+endif()
+
+# Symbol interposition: bind internal TU-to-TU calls to THIS library's own GL
+# entry points instead of letting them go through a preemptible PLT slot. On a
+# host process whose global symbol scope contains a system libGL / libGLESv2
+# (Android, or any process that loaded a competing GL implementation), an
+# internal call to an exported gl* symbol could otherwise be preempted by the
+# system library — silently bypassing all of Mithril's state tracking and
+# translation. The symbols stay exported for dlsym / eglGetProcAddress; only
+# who internal calls bind to changes.
+#
+# Mirrors MobileGlues CMakeLists.txt:142-152, which applies the flag
+# unconditionally (NOT MSVC) and builds iOS with it. ld64 / the new ld-prime
+# accept -Wl,-Bsymbolic-functions (treating it as -Bsymbolic for the function
+# case); on iOS there is no competing system GL library in the global scope,
+# but the flag is harmless and keeps the link line identical across platforms.
+if(NOT MSVC)
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,-Bsymbolic-functions)
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

@@ -20,7 +20,7 @@
 #include "Resources.h"
 #include "../Backend.h"
 #include "../../MG_State/State.h"
-#include "../../MG_Impl/Log.h"
+#include "../../gl/Log.h"
 
 #include <cstring>
 #include <vector>

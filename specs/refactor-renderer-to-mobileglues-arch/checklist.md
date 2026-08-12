@@ -1,0 +1,26 @@
+# Checklist
+
+- [x] `gl/` 三层结构建立（`gl/` 前端 + `vk_func_t` 后端函数指针表 + `egl/`）
+- [x] `gl/` 层无直接 `vkCmd*` / `vk*` 调用，所有后端调用经 `vk_func_t` 函数指针表派发
+- [x] `MG_Impl/` 已重组为 `gl/` 风格文件（buffer/drawing/enable/framebuffer/getter/program/shader/texture/transfer/vertexattrib/pixel/gl_native/gl_stub）
+- [x] `NATIVE_FUNCTION_HEAD` 宏导出 `glFoo` + `glFooARB` 别名（59 个入口：gl.cpp 49 + enable.cpp 6 + gl_native.cpp 2 + pixel.cpp 2）
+- [x] `CMakeLists.txt` 链接 `-Wl,-Bsymbolic-functions`
+- [ ] 中心化 `mithril::GLState` 大结构已移除（**待后续**：访问点迁移完成后才能移除；当前分布式基础设施已就位，GLState 仍作为 subview 后端存在）
+- [x] 各子系统分布式 per-context 状态（`unordered_map<ctx_id, unique_ptr<state>>` + `thread_local` 当前指针）就位（12 个子系统：buffer/texture/framebuffer/enable/pixel/mg/program/shader/vertexattrib/sync/query/transformfeedback）
+- [x] `mg_<subsystem>_bind_context` / `forget_context` 钩子实现并被 `eglMakeCurrent` / 销毁调用（12 个子系统，含 sync/query/tf no-op 桩）
+- [ ] 状态访问器（`mg_buffer_current` / `mg_texture_current` / `mg_enable_current` / `mg_framebuffer_current` 等）提供，原 `g_state->` 访问全部迁移（**访问器已就位**；**待后续**：`g_state->` 访问点迁移到访问器是独立任务）
+- [ ] `DirectVulkan/*` 改读分布式状态访问器（Device/Resources/Pipeline/CommandStream/DescriptorSet）（**待后续**：访问点迁移）
+- [ ] EGL 默认帧缓冲 `VkImageView` 字段迁移到 framebuffer 子系统默认 FBO 状态（**待后续**：访问点迁移）
+- [x] `gl/glsl/` 着色器翻译模块建立（`glsl_for_vk` + `cache`）
+- [x] glslang GLSL→SPIR-V + spirv_cross 反射管线工作（spirv_cross 仅反射，非 GLSL ES 反编译；反射在 `MG_Backend/DirectVulkan/{Reflect,DescriptorSet}.cpp`）
+- [x] SHA-256 LRU 持久化缓存（磁盘 load/save + 16 条/5 秒增量 flush + LRU 淘汰）实现（内联 FIPS 180-4 SHA-256、`.new`+`rename` 原子替换、`thread_local` digest 复用、`MITHRIL_GLSL_CACHE` 环境变量自动 load）
+- [x] 现有着色器预处理保留（`MG_MITHRIL` 宏、版本归一、layout 归一、`gl_FragColor` 合成、`glBindAttribLocation` 注入）
+- [x] `MGContext` 模型实现（单调 `id`、`shared_ptr` + `current_count`、share group、display 引用计数）
+- [x] `eglMakeCurrent` 调度 `bind_context`；销毁调 `forget_context`
+- [x] OOM 主动 GC（`backend_proactive_gc_if_needed` + `backend_poll_completed_frames`）保留
+- [x] per-frame transient staging arena 保留
+- [x] `safe_device_wait_idle` 保留
+- [x] swapchain 三级降级 + deviceLost 恢复 + pipeline 负缓存清除保留（`failedSignatures` 集合 + `vkCreateSwapchainKHR` fallback + deviceLost 跳帧恢复）
+- [ ] iOS arm64 dylib 构建通过（**需 macOS CI**：Linux 沙箱无 MoltenVK；`syntax_check.sh` + `link_check.sh` 在 Linux 通过）
+- [ ] `nm -gU` 校验 `glFoo` + `glFooARB` 别名导出（**需 macOS CI**：`__attribute__((alias))` 在 ELF 上生效，Mach-O 上按 MobileGlues 惯例仅导出 `glFoo`；`NATIVE_FUNCTION_HEAD` 宏机制已验证）
+- [x] `tests/` 与 `verify/` 现有测试通过（`syntax_check.sh` 36/36 通过 + `link_check.sh` 无未定义符号）

@@ -15,8 +15,8 @@
 // original code.
 #include "EglInternal.h"
 
-#include "../MG_Impl/includes.h"          // g_state, MITHRIL_LOG_*, backend_*
-#include "../MG_Impl/Log.h"
+#include "../gl/includes.h"          // g_state, MITHRIL_LOG_*, backend_*
+#include "../gl/Log.h"
 #include "../MG_Backend/DirectVulkan/Device.h"
 
 #include <cstdlib>

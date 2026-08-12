@@ -50,7 +50,7 @@ void glDeleteTextures(GLsizei n, const GLuint* textures) {
                     g_state->textureBindings[u][t].bind(0);
             }
         }
-        backend_delete_texture(name);
+        g_vk_func.delete_texture(name);
         g_state->textures.erase(name);
         g_state->textureNames.release(name);
     }
@@ -155,7 +155,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
     // 在 backend_texture_upload 内按当前 level 的 width/height 设置）。
     // 对照 MobileGL CheckMipmapCompleteness (VkTextureManager.cpp:1918-1957)：
     // MobileGL 始终用 base level 尺寸作为 VkImage extent。
-    backend_get_or_create_texture(t->id, t->width, t->height, 1, t->levels,
+    g_vk_func.get_or_create_texture(t->id, t->width, t->height, 1, t->levels,
                                   internalFormat, target, 1);
     if (pixels) {
         MGUnpackParams unpack{
@@ -166,7 +166,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalFormat,
             g_state->pixelStore.unpackImageHeight,
             g_state->pixelStore.unpackSkipImages
         };
-        backend_texture_upload(t->id, level, 0, 0, 0, width, height, 1,
+        g_vk_func.texture_upload(t->id, level, 0, 0, 0, width, height, 1,
                                format, type, pixels, &unpack,
                                /*is_full_upload=*/1);
     }
@@ -187,7 +187,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
     }
     if (t->levels < level + 1) t->levels = level + 1;
 
-    backend_get_or_create_texture(t->id, width, height, depth, t->levels,
+    g_vk_func.get_or_create_texture(t->id, width, height, depth, t->levels,
                                   internalFormat, target, 1);
     if (pixels) {
         MGUnpackParams unpack{
@@ -198,7 +198,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalFormat,
             g_state->pixelStore.unpackImageHeight,
             g_state->pixelStore.unpackSkipImages
         };
-        backend_texture_upload(t->id, level, 0, 0, 0, width, height, depth,
+        g_vk_func.texture_upload(t->id, level, 0, 0, 0, width, height, depth,
                                format, type, pixels, &unpack,
                                /*is_full_upload=*/1);
     }
@@ -234,11 +234,11 @@ void glTexStorage2D(GLenum target, GLsizei levels, GLenum internalFormat,
     t->immutable = true;
     t->immutableLevels = levels;
 
-    backend_get_or_create_texture(t->id, width, height, 1, levels,
+    g_vk_func.get_or_create_texture(t->id, width, height, 1, levels,
                                   internalFormat, target, 1);
     // Transition UNDEFINED -> SHADER_READ_ONLY_OPTIMAL so the texture is in a
     // valid sampling layout before any draw references it.
-    backend_transition_texture_layout(t->id, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    g_vk_func.transition_texture_layout(t->id, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat,
@@ -254,9 +254,9 @@ void glTexStorage3D(GLenum target, GLsizei levels, GLenum internalFormat,
     t->immutable = true;
     t->immutableLevels = levels;
 
-    backend_get_or_create_texture(t->id, width, height, depth, levels,
+    g_vk_func.get_or_create_texture(t->id, width, height, depth, levels,
                                   internalFormat, target, 1);
-    backend_transition_texture_layout(t->id, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    g_vk_func.transition_texture_layout(t->id, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 }
 
 void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
@@ -273,7 +273,7 @@ void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
         g_state->pixelStore.unpackImageHeight,
         g_state->pixelStore.unpackSkipImages
     };
-    backend_texture_upload(t->id, level, xoffset, yoffset, 0,
+    g_vk_func.texture_upload(t->id, level, xoffset, yoffset, 0,
                            width, height, 1, format, type, pixels, &unpack,
                            /*is_full_upload=*/0);
 }
@@ -293,7 +293,7 @@ void glTexSubImage3D(GLenum target, GLint level,
         g_state->pixelStore.unpackImageHeight,
         g_state->pixelStore.unpackSkipImages
     };
-    backend_texture_upload(t->id, level, xoffset, yoffset, zoffset,
+    g_vk_func.texture_upload(t->id, level, xoffset, yoffset, zoffset,
                            width, height, depth, format, type, pixels, &unpack,
                            /*is_full_upload=*/0);
 }
@@ -310,7 +310,7 @@ void glTexImage2DMultisample(GLenum target, GLsizei samples, GLenum internalform
     t->depth  = 1;
     t->samples = samples;
     t->fixedSampleLocations = fixedsamplelocations != 0;
-    backend_get_or_create_texture(t->id, width, height, 1, 1,
+    g_vk_func.get_or_create_texture(t->id, width, height, 1, 1,
                                   internalformat, target, samples > 1 ? samples : 1);
 }
 
@@ -356,9 +356,9 @@ void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat,
         t->isCompressed = true;
     }
     if (t->levels < level + 1) t->levels = level + 1;
-    backend_get_or_create_texture(t->id, t->width, t->height, 1, t->levels,
+    g_vk_func.get_or_create_texture(t->id, t->width, t->height, 1, t->levels,
                                   internalformat, target, 1);
-    backend_texture_upload_compressed(t->id, level, 0, 0, 0, width, height, 1,
+    g_vk_func.texture_upload_compressed(t->id, level, 0, 0, 0, width, height, 1,
                                       internalformat, imageSize, data,
                                       /*is_full_upload=*/1);
 }
@@ -379,9 +379,9 @@ void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat,
         t->isCompressed = true;
     }
     if (t->levels < level + 1) t->levels = level + 1;
-    backend_get_or_create_texture(t->id, width, height, depth, t->levels,
+    g_vk_func.get_or_create_texture(t->id, width, height, depth, t->levels,
                                   internalformat, target, 1);
-    backend_texture_upload_compressed(t->id, level, 0, 0, 0, width, height, depth,
+    g_vk_func.texture_upload_compressed(t->id, level, 0, 0, 0, width, height, depth,
                                       internalformat, imageSize, data,
                                       /*is_full_upload=*/1);
 }
@@ -395,7 +395,7 @@ void glCompressedTexSubImage2D(GLenum target, GLint level,
     mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
     // format parameter is the compressed format; pass as internalFormat to backend.
-    backend_texture_upload_compressed(t->id, level, xoffset, yoffset, 0,
+    g_vk_func.texture_upload_compressed(t->id, level, xoffset, yoffset, 0,
                                       width, height, 1, format, imageSize, data,
                                       /*is_full_upload=*/0);
 }
@@ -408,7 +408,7 @@ void glCompressedTexSubImage3D(GLenum target, GLint level,
     if (imageSize <= 0 || !data) { mithril::state_set_error(GL_INVALID_VALUE); return; }
     mithril::Texture* t = bound_texture_for_target(target);
     if (!t) return;
-    backend_texture_upload_compressed(t->id, level, xoffset, yoffset, zoffset,
+    g_vk_func.texture_upload_compressed(t->id, level, xoffset, yoffset, zoffset,
                                       width, height, depth, format, imageSize, data,
                                       /*is_full_upload=*/0);
 }
@@ -459,10 +459,10 @@ void glTexParameterf(GLenum target, GLenum pname, GLfloat param) {
     if (samplerChanged) {
         // Vulkan samplers are immutable; invalidate cached VkSampler so it's
         // rebuilt on next use. 对照 MobileGL VkSamplerManager.
-        backend_invalidate_sampler_cache(t->id);
+        g_vk_func.invalidate_sampler_cache(t->id);
     }
     ++t->paramsVersion;
-    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+    g_vk_func.texture_set_params(t->id, t->minFilter, t->magFilter,
                                t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
 
@@ -478,7 +478,7 @@ void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColor[i] = params[i];
-            backend_invalidate_sampler_cache(t->id);
+            g_vk_func.invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];
@@ -493,7 +493,7 @@ void glTexParameterfv(GLenum target, GLenum pname, const GLfloat* params) {
             return;
     }
     ++t->paramsVersion;
-    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+    g_vk_func.texture_set_params(t->id, t->minFilter, t->magFilter,
                                t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
 
@@ -505,7 +505,7 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColor[i] = (GLfloat)params[i];
-            backend_invalidate_sampler_cache(t->id);
+            g_vk_func.invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];
@@ -518,7 +518,7 @@ void glTexParameteriv(GLenum target, GLenum pname, const GLint* params) {
             return;
     }
     ++t->paramsVersion;
-    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+    g_vk_func.texture_set_params(t->id, t->minFilter, t->magFilter,
                                t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
 
@@ -530,7 +530,7 @@ void glTexParameterIiv(GLenum target, GLenum pname, const GLint* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColorI[i] = params[i];
-            backend_invalidate_sampler_cache(t->id);
+            g_vk_func.invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];
@@ -543,7 +543,7 @@ void glTexParameterIiv(GLenum target, GLenum pname, const GLint* params) {
             return;
     }
     ++t->paramsVersion;
-    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+    g_vk_func.texture_set_params(t->id, t->minFilter, t->magFilter,
                                t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
 
@@ -555,7 +555,7 @@ void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint* params) {
     switch (pname) {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; ++i) t->borderColorUI[i] = (GLint)params[i];
-            backend_invalidate_sampler_cache(t->id);
+            g_vk_func.invalidate_sampler_cache(t->id);
             break;
         case GL_TEXTURE_SWIZZLE_RGBA:
             t->swizzleR = (GLenum)params[0];
@@ -568,7 +568,7 @@ void glTexParameterIuiv(GLenum target, GLenum pname, const GLuint* params) {
             return;
     }
     ++t->paramsVersion;
-    backend_texture_set_params(t->id, t->minFilter, t->magFilter,
+    g_vk_func.texture_set_params(t->id, t->minFilter, t->magFilter,
                                t->wrapS, t->wrapT, t->wrapR, t->borderColor);
 }
 
@@ -584,7 +584,7 @@ void glGenerateMipmap(GLenum target) {
     // app sees the base level only. This is acceptable for MC Java (its
     // modern pipeline uses glTexStorage2D for mipmapped textures).
     t->generateMipmaps = true;
-    backend_generate_mipmaps(t->id);
+    g_vk_func.generate_mipmaps(t->id);
 }
 
 /* ---- Texture parameter queries (P1-4) ----
@@ -759,7 +759,7 @@ void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
     // staging buffer via vkCmdCopyImageToBuffer, and synchronously maps +
     // memcpy's into the caller's buffer. Returns 0 if readback isn't
     // possible (e.g. no FBO bound to the default framebuffer).
-    (void)backend_read_pixels((int)x, (int)y, (int)width, (int)height,
+    (void)g_vk_func.read_pixels((int)x, (int)y, (int)width, (int)height,
                               format, type, pixels);
 }
 
@@ -813,19 +813,19 @@ void glCopyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
         return;
     }
 
-    VkImage srcImage = backend_get_texture_image(srcName);
-    VkImage dstImage = backend_get_texture_image(dstName);
+    VkImage srcImage = g_vk_func.get_texture_image(srcName);
+    VkImage dstImage = g_vk_func.get_texture_image(dstName);
     if (srcImage == VK_NULL_HANDLE || dstImage == VK_NULL_HANDLE) return;
 
-    VkFormat srcFmt = backend_vk_format_for_gl((GLenum)srcTex->internalFormat);
-    VkFormat dstFmt = backend_vk_format_for_gl((GLenum)dstTex->internalFormat);
+    VkFormat srcFmt = g_vk_func.vk_format_for_gl((GLenum)srcTex->internalFormat);
+    VkFormat dstFmt = g_vk_func.vk_format_for_gl((GLenum)dstTex->internalFormat);
     if (srcFmt == VK_FORMAT_UNDEFINED) srcFmt = VK_FORMAT_R8G8B8A8_UNORM;
     if (dstFmt == VK_FORMAT_UNDEFINED) dstFmt = VK_FORMAT_R8G8B8A8_UNORM;
 
     // Flush pending rendering — the blit must see the latest src contents and
     // subsequent draws must see the blit's result.
-    backend_end_render_pass();
-    backend_commit();
+    g_vk_func.end_render_pass();
+    g_vk_func.commit();
 
     // Blit each Z-slice. For 2D textures, depth==1 → single iteration.
     // For 3D textures and cube map arrays, blit each slice separately.
@@ -846,7 +846,7 @@ void glCopyImageSubData(GLuint srcName, GLenum srcTarget, GLint srcLevel,
             dstY0 = dstY; dstY1 = dstY + srcHeight;
         }
 
-        backend_blit_images(srcImage, srcFmt, dstImage, dstFmt,
+        g_vk_func.blit_images(srcImage, srcFmt, dstImage, dstFmt,
                             srcX0, srcY0, srcX1, srcY1,
                             dstX0, dstY0, dstX1, dstY1,
                             GL_COLOR_BUFFER_BIT, GL_NEAREST,

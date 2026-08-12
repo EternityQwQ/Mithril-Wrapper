@@ -14,10 +14,10 @@
 // Build (against the glslang submodule):
 //   GL=Mithril-Wrapper-cpp/3rdparty/glslang
 //   clang++ -std=c++20 -O0 \
-//     -IMithril-Wrapper-cpp/include -IMithril-Wrapper-cpp/MG_Impl \
+//     -IMithril-Wrapper-cpp/include -IMithril-Wrapper-cpp/gl \
 //     -I$GL -I$GL/build-test/External/spirv-tools/include \
 //     verify/shader_mc_pipeline_test.cpp \
-//     Mithril-Wrapper-cpp/MG_Impl/Shader.cpp Mithril-Wrapper-cpp/MG_Impl/Log.cpp \
+//     Mithril-Wrapper-cpp/gl/Shader.cpp Mithril-Wrapper-cpp/gl/Log.cpp \
 //     $GL/build-test/glslang/libglslang.a $GL/build-test/glslang/libMachineIndependent.a \
 //     $GL/build-test/glslang/libGenericCodeGen.a \
 //     $GL/build-test/glslang/OSDependent/Unix/libOSDependent.a \

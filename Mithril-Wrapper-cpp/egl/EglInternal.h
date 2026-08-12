@@ -26,7 +26,7 @@
 #include <unordered_map>
 
 #include <EGL/egl.h>
-#include "../MG_Impl/EGLConfig.h"
+#include "../gl/EGLConfig.h"
 #include "../MG_State/State.h"   // mithril::GLState
 
 // ---------------------------------------------------------------------------
