@@ -92,10 +92,19 @@ using mithril::egl::swapchain_present;
 using mithril::egl::swapchain_needs_rebuild;
 using mithril::egl::swapchain_destroy;
 
+} // namespace
+
 // ---------------------------------------------------------------------------
 // Shared EGL state (storage definitions for the extern declarations in
-// EglInternal.h). Thread-local state mirrors Khronos EGL semantics.
+// EglInternal.h). These MUST live in namespace mithril::egl so they satisfy
+// the extern declarations there; the anonymous-namespace using-declarations
+// below re-expose them to the extern "C" entry points unqualified. (If they
+// were left in the anonymous namespace, they would get anonymous-namespace
+// internal linkage and the extern "C" entry points + SwapchainHelper.cpp
+// would fail to link against mithril::egl::g_display / t_lastError / etc.)
 // ---------------------------------------------------------------------------
+namespace mithril {
+namespace egl {
 
 // Singleton display. Returned for every eglGetDisplay / eglGetPlatformDisplay.
 EglDisplay g_display;
@@ -117,6 +126,21 @@ uintptr_t g_nextSyncHandle = 1;
 std::unordered_map<EGLImage, EglImage> g_images;
 uintptr_t g_nextImageHandle = 1;
 
+} // namespace egl
+} // namespace mithril
+
+namespace {
+using mithril::egl::g_display;
+using mithril::egl::t_currentCtx;
+using mithril::egl::t_currentDraw;
+using mithril::egl::t_currentRead;
+using mithril::egl::t_lastError;
+using mithril::egl::t_boundAPI;
+using mithril::egl::g_ctxMutex;
+using mithril::egl::g_syncs;
+using mithril::egl::g_nextSyncHandle;
+using mithril::egl::g_images;
+using mithril::egl::g_nextImageHandle;
 } // namespace
 
 
