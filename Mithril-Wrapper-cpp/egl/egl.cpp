@@ -46,25 +46,16 @@
 #include "../MG_Backend/DirectVulkan/Device.h"
 #include <EGL/egl.h>
 
+#include "EglInternal.h"   // shared internal handle types + state + swapchain helper decls
+
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 
-// ---------------------------------------------------------------------------
-// Platform dispatch (defined in egl/Surface<Platform>.cpp/mm, selected by CMake)
-// ---------------------------------------------------------------------------
-// surface_create() prepares the native window for use as a Vulkan surface and
-// returns a void* native_window suitable for backend_create_swapchain():
-//   - Apple:   CAMetalLayer* (after CALayer -> CAMetalLayer coercion)
-// Returns nullptr on failure. out_w / out_h receive the window's current size
-// (0 if undetermined).
-//
-// surface_get_size() queries the current size of a native_window previously
-// returned by surface_create(). Returns false if the window is invalid or the
-// size cannot be determined.
-extern "C" void* surface_create(void* native_window, int* out_w, int* out_h);
-extern "C" bool  surface_get_size(void* native_window, int* out_w, int* out_h);
+// Platform surface dispatch (surface_create / surface_get_size) is declared in
+// EglInternal.h and implemented in egl/Surface<Platform>.cpp/mm (selected by
+// CMake on the APPLE guard).
 
 // ---------------------------------------------------------------------------
 // Internal handle types
@@ -75,66 +66,41 @@ namespace {
 // mithril::egl (see MG_Impl/EGLConfig.h) into this TU's anonymous namespace
 // so egl.cpp can keep referring to EglConfig / g_configs / kNumConfigs /
 // config_matches / config_get_attr unqualified, exactly as it did before the
-// extraction.
+// extraction. The internal handle types (EglDisplay / EglSurface / EglContext /
+// EglSync / EglImage) now live in mithril::egl (EglInternal.h) and are pulled
+// in the same way so the extern "C" entry points keep their unqualified names.
 using mithril::egl::EglConfig;
+using mithril::egl::EglDisplay;
+using mithril::egl::EglSurface;
+using mithril::egl::EglContext;
+using mithril::egl::EglSync;
+using mithril::egl::EglImage;
 using mithril::egl::g_configs;
 using mithril::egl::kNumConfigs;
 using mithril::egl::config_matches;
 using mithril::egl::config_get_attr;
+using mithril::egl::set_error;
+using mithril::egl::clear_error;
+using mithril::egl::valid_display;
+using mithril::egl::valid_config;
+using mithril::egl::ensure_swapchain;
+using mithril::egl::install_surface_on_state;
+using mithril::egl::swapchain_handle_device_lost;
+using mithril::egl::swapchain_poll_completed_frames;
+using mithril::egl::swapchain_flush_and_commit;
+using mithril::egl::swapchain_present;
+using mithril::egl::swapchain_needs_rebuild;
+using mithril::egl::swapchain_destroy;
 
-struct EglDisplay {
-    bool      initialized = false;
-    EGLenum   boundAPI   = EGL_OPENGL_API;
-};
-
-struct EglSurface {
-    void*         native_window    = nullptr;  // CAMetalLayer* (weak ref; owned by host)
-    void*         swapchain_state  = nullptr;  // mithril::vk::Swapchain*
-    EGLConfig     config           = nullptr;
-    EGLint        width            = 0;
-    EGLint        height           = 0;
-    EGLint        swapInterval     = 1;
-    bool          wantDepthStencil = false;
-    // FIX (swapchain 重建死循环): 退避计数器。ensure_swapchain 失败后，
-    // swapchainRetryBackoff 倒计时到 0 才允许下次重试，避免每帧重试刷屏。
-    // swapchainRetryCount 记录连续失败次数，用于日志限流。
-    int           swapchainRetryBackoff = 0;
-    int           swapchainRetryCount   = 0;
-};
-
-struct EglContext {
-    mithril::GLState*   state      = nullptr;
-    EGLConfig           config     = nullptr;
-    EglContext*         share      = nullptr;
-    EGLenum             clientAPI  = EGL_OPENGL_API;
-    EGLint              majorVer   = 3;   // we report OpenGL 3.3 Core Profile
-    EGLint              minorVer   = 3;
-    bool                lost       = false;
-    std::atomic<int>    refcount{1};
-};
-
-// EGL 1.5 sync object (shadow implementation: always signaled, no real GPU
-// fence). Backed by a process-local handle so eglClientWaitSync/eglWaitSync
-// can validate the handle without touching the Vulkan backend.
-struct EglSync {
-    EGLDisplay dpy       = EGL_NO_DISPLAY;
-    EGLenum    type      = 0;
-    EGLenum    condition = 0;
-    EGLenum    status    = EGL_SIGNALED;
-};
-
-// EGL 1.5 image object (shadow implementation: records target + buffer only,
-// no real VkImage import). Real interop will land with the Vulkan Image bind.
-struct EglImage {
-    EGLDisplay      dpy    = EGL_NO_DISPLAY;
-    EGLenum         target = 0;
-    EGLClientBuffer buffer = nullptr;
-};
+// ---------------------------------------------------------------------------
+// Shared EGL state (storage definitions for the extern declarations in
+// EglInternal.h). Thread-local state mirrors Khronos EGL semantics.
+// ---------------------------------------------------------------------------
 
 // Singleton display. Returned for every eglGetDisplay / eglGetPlatformDisplay.
 EglDisplay g_display;
 
-// Thread-local EGL current state (mirrors Khronos EGL semantics).
+// Thread-local EGL current state.
 thread_local EglContext* t_currentCtx    = nullptr;
 thread_local EglSurface* t_currentDraw   = nullptr;
 thread_local EglSurface* t_currentRead   = nullptr;
@@ -146,223 +112,13 @@ std::mutex g_ctxMutex; // guards share-group refcount updates
 // EGL 1.5 sync/image handle tables (shadow implementations). Handles are
 // process-local integers cast to EGLSync/EGLImage; 0 is reserved for
 // EGL_NO_SYNC / EGL_NO_IMAGE.
-static std::unordered_map<EGLSync, EglSync> g_syncs;
-static uintptr_t g_nextSyncHandle = 1;
-static std::unordered_map<EGLImage, EglImage> g_images;
-static uintptr_t g_nextImageHandle = 1;
-
-// ---------------------------------------------------------------------------
-// Error helpers
-// ---------------------------------------------------------------------------
-inline void set_error(EGLint e) { if (t_lastError == EGL_SUCCESS) t_lastError = e; }
-inline void clear_error()       { t_lastError = EGL_SUCCESS; }
-
-inline bool valid_display(EGLDisplay d) {
-    return d == (EGLDisplay)&g_display;
-}
-inline bool valid_config(EGLConfig c) {
-    if (!c) return false;
-    for (int i = 0; i < kNumConfigs; ++i) {
-        if ((EGLConfig)&g_configs[i] == c) return true;
-    }
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// Vulkan swapchain helpers
-// ---------------------------------------------------------------------------
-// Build (or rebuild) the per-surface Vulkan swapchain against the native
-// window. Returns true on success. The swapchain is owned by the EglSurface
-// and freed in eglDestroySurface / when the window size changes.
-//
-// On rebuild (size changed), this drains GPU work that references the old
-// swapchain BEFORE destroying it, so the Metal driver is no longer reading
-// the old IOSurface-backed images when they are torn down. Without this
-// drain, vkDestroySwapchainKHR frees IOSurfaces that the GPU is still
-// accessing, and the next IOSurfaceBindAccel call crashes with SIGSEGV (UAF).
-bool ensure_swapchain(EglSurface* s) {
-    if (!s || !s->native_window) return false;
-    int w = 0, h = 0;
-    if (!surface_get_size(s->native_window, &w, &h)) return false;
-    if (w <= 0 || h <= 0) {
-        // Window not yet sized; defer swapchain creation to a later call.
-        return false;
-    }
-    // FIX (swapchain 重建死循环): ensure_swapchain 失败后，如果每帧都重试，
-    // 会形成死循环刷屏（vkCreateSwapchainKHR failed × N）。引入退避机制：
-    // 失败后等待 N 帧再重试，给 GPU 时间释放资源。
-    // 这个计数器是 per-surface 的，避免多 surface 互相干扰。
-    if (s->swapchainRetryBackoff > 0) {
-        s->swapchainRetryBackoff--;
-        return false;
-    }
-    if (s->swapchain_state) {
-        int cur_w = backend_swapchain_width(s->swapchain_state);
-        int cur_h = backend_swapchain_height(s->swapchain_state);
-        if (cur_w == w && cur_h == h) {
-            s->width  = w;
-            s->height = h;
-            return true;
-        }
-        // Size changed: drain GPU work referencing the old swapchain, detach
-        // it from the encoder, THEN tear down + recreate. The drain is
-        // critical: it ensures the Metal driver has released the old
-        // IOSurface-backed drawables before vkDestroySwapchainKHR frees them.
-        // Skipping the drain causes IOSurfaceBindAccel UAF crashes on the
-        // next present.
-        if (t_currentDraw == s) {
-            backend_drain_and_detach_swapchain();
-        }
-        backend_destroy_swapchain(s->swapchain_state);
-        s->swapchain_state = nullptr;
-    }
-    // First-time creation: drain any in-flight GPU work (e.g. texture uploads
-    // or shader compilation issued during context init) BEFORE creating the
-    // swapchain. Without this, the first vkAcquireNextImageKHR races with
-    // outstanding work that may touch the presentation engine's IOSurface
-    // pool, and the first IOSurfaceBindAccel call crashes with SIGSEGV on
-    // iPadOS 16.x. MobileGL's RecreateSwapchain (VulkanRenderer.cpp:7786)
-    // calls vkDeviceWaitIdle unconditionally before swapchain creation; we
-    // mirror that here. backend_drain_and_detach_swapchain() also calls
-    // vkDeviceWaitIdle, so this is belt-and-suspenders even on the rebuild
-    // path above.
-    backend_drain_and_detach_swapchain();
-    s->swapchain_state = backend_create_swapchain(
-        s->native_window, w, h, s->wantDepthStencil ? 1 : 0, /*platform_hint=*/0);
-    if (!s->swapchain_state) {
-        // FIX: 退避机制。失败后等待 30 帧再重试（约 0.5 秒 @ 60fps），
-        // 避免 eglSwapBuffers 每帧重试形成死循环刷屏。同时限流日志。
-        s->swapchainRetryBackoff = 30;
-        s->swapchainRetryCount++;
-        if (s->swapchainRetryCount <= 3 || s->swapchainRetryCount % 50 == 0) {
-            MITHRIL_LOG_WARN("egl", "backend_create_swapchain failed (window size = %dx%d, "
-                              "retry #%d, backing off %d frames)",
-                              w, h, s->swapchainRetryCount, s->swapchainRetryBackoff);
-        }
-        return false;
-    }
-    // 成功创建：重置退避计数器
-    s->swapchainRetryBackoff = 0;
-    s->swapchainRetryCount = 0;
-    s->width  = backend_swapchain_width(s->swapchain_state);
-    s->height = backend_swapchain_height(s->swapchain_state);
-    return true;
-}
-
-// Push the surface's current swapchain image views into the active GLState so
-// framebuffer-0 renders land on the on-screen drawable. Acquires the next
-// swapchain image if none is currently acquired.
-//
-// Also registers the swapchain with the backend encoder (via
-// backend_set_active_swapchain) so begin_render_pass()/commit_frame() can
-// record the PRESENT_SRC/UNDEFINED <-> COLOR_ATTACHMENT_OPTIMAL layout barriers
-// on the swapchain color image, the one-shot UNDEFINED ->
-// DEPTH_STENCIL_ATTACHMENT_OPTIMAL barrier on the depth image, and signal the
-// swapchain's per-image renderFinished semaphore on submit. Without this
-// registration, dynamic rendering would hard-code COLOR_ATTACHMENT_OPTIMAL on
-// an image that is actually in PRESENT_SRC_KHR (or UNDEFINED on first use),
-// which MoltenVK treats as an illegal layout and renders nothing (black screen).
-void install_surface_on_state(EglSurface* s) {
-    if (!g_state) return;
-    if (s && s->swapchain_state) {
-        VkImageView color = backend_swapchain_acquire_color(s->swapchain_state);
-        VkImageView depth = backend_swapchain_acquire_depth(s->swapchain_state);
-        g_state->eglDefaultColor  = color;
-        g_state->eglDefaultDepth  = depth;
-        // Also expose the underlying VkImage handles + formats so image-level
-        // operations (glBlitFramebuffer / glReadPixels involving FBO 0) can
-        // reference the on-screen drawable directly.
-        g_state->eglDefaultColorImage   = backend_swapchain_current_color_image(s->swapchain_state);
-        g_state->eglDefaultColorFormat  = backend_swapchain_color_format(s->swapchain_state);
-        g_state->eglDefaultDepthImage   = backend_swapchain_current_depth_image(s->swapchain_state);
-        g_state->eglDefaultDepthFormat  = backend_swapchain_depth_format(s->swapchain_state);
-        // FIX (IOSurfaceBindAccel SIGSEGV): Use the ACTUAL drawable size from
-        // the native window (CAMetalLayer.drawableSize), NOT the swapchain's
-        // creation-time size (s->width). On MoltenVK/iOS, the swapchain image
-        // is backed by a CAMetalLayer drawable whose size = drawableSize at
-        // acquire time, NOT the swapchain's imageExtent at creation time.
-        // If the drawableSize changed after swapchain creation (e.g. GLFW
-        // resized the window between swapchain creation and the first frame),
-        // the IOSurface backing the acquired drawable has the NEW size, while
-        // s->width still holds the OLD size. Setting eglDefaultWidth to the
-        // stale s->width causes the render area to exceed the IOSurface
-        // dimensions → IOSurfaceBindAccel dereferences out-of-bounds memory
-        // → SIGSEGV.
-        //
-        // Use min(actual_drawable_size, swapchain_size) to handle both cases:
-        //   - drawable shrank: clamp to the smaller drawable size (IOSurface)
-        //   - drawable grew: clamp to the swapchain size (VkImage extent)
-        int actualW = s->width;
-        int actualH = s->height;
-        int drawW = 0, drawH = 0;
-        if (surface_get_size(s->native_window, &drawW, &drawH) && drawW > 0 && drawH > 0) {
-            // Update the swapchain's tracked actual drawable size so
-            // begin_render_pass() can clamp the render area as a safety net.
-            backend_swapchain_set_drawable_size(s->swapchain_state, drawW, drawH);
-            if (drawW != s->width || drawH != s->height) {
-                // drawableSize changed after swapchain creation. This is the
-                // ROOT CAUSE of the red/black screen: the swapchain's VkImage
-                // extent (s->width) no longer matches the CAMetalLayer's
-                // drawableSize (drawW), so the IOSurface backing the acquired
-                // drawable has a different size than the VkImage. MoltenVK
-                // presents a mismatched drawable → red screen or garbage.
-                //
-                // Mark the swapchain for rebuild so eglSwapBuffers recreates
-                // it at the new drawableSize. For THIS frame, clamp
-                // eglDefaultWidth to min(drawW, s->width) so the render area
-                // does not exceed the IOSurface (prevents IOSurfaceBindAccel
-                // SIGSEGV) while the rebuild is pending.
-                static bool warnedOnce = false;
-                if (!warnedOnce) {
-                    warnedOnce = true;
-                    MITHRIL_LOG_WARN("egl", "install_surface_on_state: drawableSize=%dx%d "
-                                      "differs from swapchainSize=%dx%d — marking swapchain "
-                                      "for rebuild, clamping eglDefault to %dx%d this frame",
-                                      drawW, drawH, s->width, s->height,
-                                      (drawW < s->width ? drawW : s->width),
-                                      (drawH < s->height ? drawH : s->height));
-                }
-                // Mark for rebuild: eglSwapBuffers will call ensure_swapchain()
-                // which detects needsRebuild and recreates the swapchain at
-                // the current drawableSize.
-                backend_swapchain_mark_rebuild(s->swapchain_state);
-            }
-            if (drawW < actualW) actualW = drawW;
-            if (drawH < actualH) actualH = drawH;
-        }
-        g_state->eglDefaultWidth  = actualW;
-        g_state->eglDefaultHeight = actualH;
-        // Register the swapchain with the encoder so it can record layout
-        // barriers and signal renderFinishedPerImage. Only register when the
-        // surface actually has an acquired color view (color != VK_NULL_HANDLE)
-        // — passing a swapchain whose acquire failed would crash the barrier
-        // recorder, which dereferences sc->images[sc->currentImage].
-        backend_set_active_swapchain(color != VK_NULL_HANDLE ? s->swapchain_state : nullptr);
-    } else {
-        g_state->eglDefaultColor  = VK_NULL_HANDLE;
-        g_state->eglDefaultDepth  = VK_NULL_HANDLE;
-        g_state->eglDefaultColorImage  = VK_NULL_HANDLE;
-        g_state->eglDefaultColorFormat = VK_FORMAT_UNDEFINED;
-        g_state->eglDefaultDepthImage  = VK_NULL_HANDLE;
-        g_state->eglDefaultDepthFormat = VK_FORMAT_UNDEFINED;
-        g_state->eglDefaultWidth  = 0;
-        g_state->eglDefaultHeight = 0;
-        // Detach the swapchain from the encoder so a headless / surfaceless
-        // frame (or a frame against a user FBO) does not try to record layout
-        // barriers against a destroyed swapchain.
-        backend_set_active_swapchain(nullptr);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Config matching
-// ---------------------------------------------------------------------------
-// config_matches / config_get_attr live in mithril::egl (see
-// MG_Impl/EGLConfig.{h,cpp}). The using-declarations above alias them into
-// this anonymous namespace so call sites in egl.cpp can refer to them
-// unqualified, exactly as before the extraction.
+std::unordered_map<EGLSync, EglSync> g_syncs;
+uintptr_t g_nextSyncHandle = 1;
+std::unordered_map<EGLImage, EglImage> g_images;
+uintptr_t g_nextImageHandle = 1;
 
 } // namespace
+
 
 // ===========================================================================
 // Public EGL entry points (extern "C", exported by libmithril.dylib)
@@ -552,8 +308,9 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
     EglConfig* cfg = (EglConfig*)config;
     s->wantDepthStencil = (cfg->depthSize > 0 || cfg->stencilSize > 0);
     // Build the Vulkan swapchain now if the window is already sized. If not,
-    // defer to eglMakeCurrent / eglSwapBuffers which will retry.
-    if (!ensure_swapchain(s)) {
+    // defer to eglMakeCurrent / eglSwapBuffers which will retry. This surface
+    // is not yet current on any thread, so pass is_current=false.
+    if (!ensure_swapchain(s, false)) {
         MITHRIL_LOG_WARN("egl", "eglCreateWindowSurface: deferred swapchain (window size = %dx%d)", w, h);
     }
     return (EGLSurface)s;
@@ -578,23 +335,19 @@ EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface surface) {
     if (!valid_display(dpy)) { set_error(EGL_BAD_DISPLAY); return EGL_FALSE; }
     if (surface == EGL_NO_SURFACE) { set_error(EGL_BAD_SURFACE); return EGL_FALSE; }
     EglSurface* s = (EglSurface*)surface;
-    // If this surface is current on this thread, drain GPU work referencing
-    // its swapchain and detach the swapchain from the encoder BEFORE we tear
-    // it down. Without the drain, vkDestroySwapchainKHR frees IOSurfaces that
-    // the GPU may still be reading, and the next IOSurfaceBindAccel call in
-    // the Metal driver crashes with SIGSEGV (UAF). The drain also calls
-    // set_active_swapchain(nullptr), so the encoder never records against
-    // the dying swapchain again.
-    if (t_currentDraw == s) {
-        backend_drain_and_detach_swapchain();
+    // If this surface is current on this thread, we must detach it from the
+    // encoder and clear the active state before tearing down the swapchain.
+    // swapchain_destroy() then drains GPU work referencing the swapchain and
+    // destroys it; without the drain, vkDestroySwapchainKHR frees IOSurfaces
+    // that the GPU may still be reading, and the next IOSurfaceBindAccel call
+    // in the Metal driver crashes with SIGSEGV (UAF).
+    const bool is_current = (t_currentDraw == s);
+    if (is_current) {
         t_currentDraw = nullptr;
-        install_surface_on_state(nullptr);
+        install_surface_on_state(nullptr, false);
     }
     if (t_currentRead == s) { t_currentRead = nullptr; }
-    if (s->swapchain_state) {
-        backend_destroy_swapchain(s->swapchain_state);
-        s->swapchain_state = nullptr;
-    }
+    swapchain_destroy(s, is_current);
     s->native_window = nullptr;
     delete s;
     return EGL_TRUE;
@@ -676,7 +429,7 @@ EGLBoolean eglDestroyContext(EGLDisplay dpy, EGLContext ctx) {
     }
     // If this context is current on this thread, detach it first.
     if (t_currentCtx == c) {
-        install_surface_on_state(nullptr);
+        install_surface_on_state(nullptr, false);
         mithril::g_state = nullptr;
         t_currentCtx = nullptr;
         t_currentDraw = nullptr;
@@ -702,7 +455,7 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
         if (draw != EGL_NO_SURFACE || read != EGL_NO_SURFACE) {
             set_error(EGL_BAD_MATCH); return EGL_FALSE;
         }
-        install_surface_on_state(nullptr);
+        install_surface_on_state(nullptr, false);
         mithril::g_state = nullptr;
         t_currentCtx = nullptr;
         t_currentDraw = nullptr;
@@ -727,9 +480,9 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
         if (!d->swapchain_state && d->native_window) {
             // First make-current on a freshly-created surface whose initial
             // swapchain creation failed (window wasn't sized yet). Retry now.
-            ensure_swapchain(d);
+            ensure_swapchain(d, true);
         }
-        install_surface_on_state(d);
+        install_surface_on_state(d, true);
         // Initialise the viewport to the surface size if the app hasn't yet.
         // Use g_state->eglDefaultWidth/Height (the actual drawable size, clamped
         // to the swapchain size by install_surface_on_state) instead of d->width
@@ -742,7 +495,7 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
             c->state->viewportH = g_state->eglDefaultHeight;
         }
     } else {
-        install_surface_on_state(nullptr);
+        install_surface_on_state(nullptr, false);
     }
 
     t_currentCtx  = c;
@@ -813,98 +566,14 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     //
     // 注意：在 deviceLost 检查之前调用，确保即使 deviceLost 恢复路径也能
     // 释放已完成帧的资源（poll 只处理 fencePending=true 且 fence=signaled 的 slot）。
-    mithril::vk::backend_poll_completed_frames();
+    swapchain_poll_completed_frames();
 
-    // 持久性 GPU 故障挂起守卫：一旦 backend 进入 deviceLost 状态，立即静默返回，
-    // 跳过 ensure_swapchain 重建、present、commit 等所有 GPU 操作，避免每帧尝试
-    // 重建 swapchain 形成死循环刷屏（见 latestlog.txt 中 ~3000 行 rebuilding 日志）。
-    // 让 GL 应用继续运行（返回 EGL_TRUE，不抛 EGL_BAD_ALLOC 等错误）。
-    //
-    // FIX (deviceLost 永久卡死): deviceLost 原本一旦置位就永不恢复，导致 GPU 超时
-    // 后整个进程永久卡死。现在改为：deviceLost 置位后，每隔一段时间尝试一次
-    // swapchain 重建（vkDeviceWaitIdle + 重建），如果重建成功则重置 deviceLost，
-    // 给设备恢复的机会。这是 MobileGL 的恢复策略：GPU 超时通常是暂时的（资源
-    // 压力释放后可恢复），不应永久终止渲染。
-    if (mithril::vk::backend_is_device_lost()) {
-        // 尝试恢复：每隔 10 帧尝试一次 swapchain 重建（约 0.17 秒 @ 60fps）
-        // 原 60 帧间隔太长，Minecraft 可能在等待期间检测到渲染失败而 exit(0)
-        static int recoveryAttemptCounter = 0;
-        static int recoveryFailCount = 0;  // 连续重建失败计数（成功时清零）
-        static bool recoveryGivenUp = false;  // 放弃恢复（Metal 设备已永久 fault）
-        recoveryAttemptCounter++;
-
-        // FIX (swapchain 重建死循环 - CRITICAL):
-        // Metal 上 VK_ERROR_DEVICE_LOST 是不可恢复的 —— Metal device 已 fault，
-        // 在同一个死掉的 VkDevice 上重建 swapchain 永远不会成功。旧代码无限重试
-        // （日志显示 >150 次失败 + 数千行 VK_NOT_READY 警告），最终 Minecraft
-        // 检测到渲染失败调用 exit(0)。
-        // 修复：连续失败 8 次后停止重试，避免死循环刷屏。VkDevice 已死，只有
-        // 销毁并重建整个 VkDevice 才能恢复（目前不可行 — 需要重启游戏）。
-        // 首要防线是防止 device lost 发生（见 Device.cpp 的 VRAM 预算降低）。
-        if (recoveryGivenUp) {
-            return EGL_TRUE;  // 静默返回，不再尝试
-        }
-        if (recoveryAttemptCounter >= 10 && s->native_window) {
-            recoveryAttemptCounter = 0;
-            // FIX (swapchain rebuild death loop - CRITICAL):
-            // The old path only drained disposalQueue + attempted swapchain
-            // rebuild. But rebuild kept failing because VkPipeline caches
-            // (hundreds of MTLRenderPipelineState objects, each 1-5 MB) and
-            // VkDescriptorSet pools (thousands of sets) were still consuming
-            // memory. This was a chicken-and-egg: rebuild needs memory, but
-            // caches are only freed AFTER rebuild succeeds.
-            //
-            // Fix: purge ALL recreatable cached resources BEFORE the rebuild
-            // attempt. Pipelines are re-created on next draw, descriptor sets
-            // on next bind — GL state (programs, textures, buffers) is preserved.
-            //
-            // Reference: MobileGL RecreateSwapchain (VulkanRenderer.cpp:8579)
-            // calls pipelineFactory->DestroyAll() + uniformManager->ResetAllPools()
-            // BEFORE creating the new swapchain.
-            mithril::vk::backend_purge_cached_resources_for_recovery();
-            // 强制重建 swapchain，如果成功则重置 deviceLost
-            if (s->swapchain_state) {
-                backend_destroy_swapchain(s->swapchain_state);
-                s->swapchain_state = nullptr;
-            }
-            if (ensure_swapchain(s) && s->swapchain_state) {
-                // 重建成功：重置 deviceLost，恢复渲染
-                // backend_reset_device_lost 会再次 drain + 清除 pipeline 缓存
-                mithril::vk::backend_reset_device_lost();
-                if (t_currentDraw == s) {
-                    install_surface_on_state(s);
-                }
-                if (recoveryFailCount > 0) {
-                    MITHRIL_LOG_WARN("egl", "deviceLost recovery: swapchain rebuilt "
-                                      "successfully after %d failed attempts, "
-                                      "resuming rendering", recoveryFailCount);
-                } else {
-                    MITHRIL_LOG_WARN("egl", "deviceLost recovery: swapchain rebuilt "
-                                      "successfully, resuming rendering");
-                }
-                recoveryFailCount = 0;
-                recoveryGivenUp = false;
-            } else {
-                // 重建失败：deviceLost 标志未清除，10 帧后重试。
-                recoveryFailCount++;
-                if (recoveryFailCount >= 8) {
-                    // Metal 设备已永久 fault — 停止重试，避免死循环。
-                    // VkDevice 上的 swapchain 重建无法恢复 faulted Metal device。
-                    MITHRIL_LOG_ERROR("egl", "deviceLost: swapchain rebuild failed "
-                                      "%d times — Metal device is permanently "
-                                      "faulted (VK_ERROR_DEVICE_LOST is "
-                                      "unrecoverable on Metal). Stopping recovery "
-                                      "attempts to avoid infinite loop. "
-                                      "Prevention: see VRAM budget in Device.cpp.",
-                                      recoveryFailCount);
-                    recoveryGivenUp = true;
-                } else if (recoveryFailCount <= 3 || recoveryFailCount % 30 == 0) {
-                    MITHRIL_LOG_WARN("egl", "deviceLost recovery: swapchain rebuild "
-                                      "failed (attempt #%d), will retry in 10 frames",
-                                      recoveryFailCount);
-                }
-            }
-        }
+    // Persistent device-loss recovery, extracted to SwapchainHelper.cpp.
+    // If the backend is device-lost, the recovery state machine runs (periodic
+    // swapchain rebuild after purging recreatable caches) and returns true; the
+    // caller must skip present/commit this frame. If not device-lost it returns
+    // false and the normal swap path proceeds.
+    if (swapchain_handle_device_lost(s, t_currentDraw == s)) {
         return EGL_TRUE;
     }
 
@@ -917,22 +586,21 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     // created because eglMakeCurrent's retry only fires on the very first
     // make-current). We retry on every swap until the swapchain comes up.
     if (s->native_window && !s->swapchain_state) {
-        ensure_swapchain(s);
+        ensure_swapchain(s, t_currentDraw == s);
         if (s->swapchain_state && t_currentDraw == s) {
             // New swapchain just came up: install it on the current GLState so
             // the next frame's draws land on the on-screen drawable.
-            install_surface_on_state(s);
+            install_surface_on_state(s, true);
         }
     }
 
     // Flush any pending Vulkan work into the current swapchain image view.
-    // backend_end_render_pass() + backend_commit() end the active render pass
-    // and submit the command buffer, so the encoded draws land on the
-    // currently-acquired swapchain image before we present. commit_frame()'s
-    // empty-submit defense skips the submit if no commands were recorded
-    // since the last commit (e.g. eglWaitClient already flushed this frame).
-    backend_end_render_pass();
-    backend_commit();
+    // swapchain_flush_and_commit() = backend_end_render_pass() + backend_commit():
+    // end the active render pass and submit the command buffer, so the encoded
+    // draws land on the currently-acquired swapchain image before we present.
+    // commit_frame()'s empty-submit defense skips the submit if no commands
+    // were recorded since the last commit (e.g. eglWaitClient flushed this frame).
+    swapchain_flush_and_commit();
 
     // Present the frame we just rendered, then acquire the next image for
     // the following frame. backend_present_and_acquire() calls
@@ -945,18 +613,16 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     // present the already-rendered frame against the current (still-valid)
     // swapchain, THEN tear down + recreate for the next frame.
     //
-    // ZERO-AREA GUARD: if the native window has collapsed to 0x0 (iOS app
-    // backgrounded / view minimized / snapshot not yet sized), skip present
-    // entirely. Mirrors MobileGL commit 7ab8386: presenting against an
+    // Present the frame, then acquire the next image for the following frame.
+    // swapchain_present() also applies the ZERO-AREA GUARD: if the native window
+    // has collapsed to 0x0 (iOS app backgrounded / view minimized), it skips
+    // present entirely. Mirrors MobileGL commit 7ab8386: presenting against an
     // out-of-date swapchain from a zero-area window previously let Present
-    // submit on an already-signaled fence and present an image that was
-    // never properly acquired → black screen with sound. Skipping present
-    // here lets the resize/rebuild path below recreate the swapchain at the
-    // new (non-zero) size on the next swap.
-    bool zero_area = (s->width <= 0 || s->height <= 0);
-    if (s->swapchain_state && !zero_area) {
-        backend_present_and_acquire(s->swapchain_state);
-    }
+    // submit on an already-signaled fence and present an image that was never
+    // properly acquired → black screen with sound. Skipping present here lets
+    // the resize/rebuild path below recreate the swapchain at the new (non-zero)
+    // size on the next swap.
+    swapchain_present(s);
 
     // Rebuild the swapchain if (a) the native window was resized between
     // frames, or (b) the backend marked the swapchain dead via
@@ -971,7 +637,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
         bool size_changed = (surface_get_size(s->native_window, &w, &h) &&
                              w > 0 && h > 0 &&
                              (w != s->width || h != s->height));
-        bool needs_rebuild = (backend_swapchain_needs_rebuild(s->swapchain_state) != 0);
+        bool needs_rebuild = swapchain_needs_rebuild(s);
         if (size_changed || needs_rebuild) {
             if (needs_rebuild) {
                 // 限流：同一故障串内最多输出一次。首次故障时 consecutiveSubmitFailures
@@ -984,7 +650,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
                                       "backend, rebuilding (GPU OOM / surface lost)");
                 }
             }
-            ensure_swapchain(s);
+            ensure_swapchain(s, t_currentDraw == s);
         }
     }
 
@@ -993,7 +659,7 @@ EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface) {
     // registers the swapchain with the encoder (backend_set_active_swapchain)
     // so layout barriers + per-image renderFinished signaling work next frame.
     if (s->swapchain_state && t_currentDraw == s) {
-        install_surface_on_state(s);
+        install_surface_on_state(s, true);
     }
     return EGL_TRUE;
 }
@@ -1008,8 +674,8 @@ EGLBoolean eglSwapInterval(EGLDisplay dpy, EGLint interval) {
 }
 
 // ---- Idle sync (no-ops; Mithril flushes work synchronously per draw) ----
-EGLBoolean eglWaitClient(void)  { backend_end_render_pass(); backend_commit(); return EGL_TRUE; }
-EGLBoolean eglWaitGL(void)      { backend_end_render_pass(); backend_commit(); return EGL_TRUE; }
+EGLBoolean eglWaitClient(void)  { swapchain_flush_and_commit(); return EGL_TRUE; }
+EGLBoolean eglWaitGL(void)      { swapchain_flush_and_commit(); return EGL_TRUE; }
 EGLBoolean eglWaitNative(EGLint) { return EGL_TRUE; }
 
 // ---- Extension function resolution ----

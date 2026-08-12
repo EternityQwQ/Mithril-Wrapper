@@ -11,7 +11,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Foundation/Foundation.h>
-#import <objc/runtime.h>   // object_setClass() for layer coercion
+#import <objc/runtime.h>   // NSObject introspection only (no ISA rewrite)
 
 #include "../MG_Impl/Log.h"
 
@@ -27,22 +27,50 @@ extern "C" void* surface_create(void* native_window, int* out_w, int* out_h) {
 
     CALayer* layer = (__bridge CALayer*)native_window;
     CAMetalLayer* mtlLayer = nil;
-    bool coerced = false;
     if ([layer isKindOfClass:[CAMetalLayer class]]) {
         mtlLayer = (CAMetalLayer*)layer;
         MITHRIL_LOG_INFO("egl", "SurfaceMetal: layer is already CAMetalLayer");
     } else {
-        // Coerce: replace the layer's class with CAMetalLayer.
-        // NOTE: object_setClass on a CALayer to make it a CAMetalLayer is
-        // fundamentally unsafe — CAMetalLayer may add ivars (e.g. device
-        // storage) that a plain CALayer doesn't have, causing memory
-        // corruption when those ivars are accessed. This path should ideally
-        // never be taken; the host app MUST provide a CAMetalLayer.
-        MITHRIL_LOG_WARN("egl", "SurfaceMetal: coercing CALayer -> CAMetalLayer "
-                          "(unsafe, may corrupt memory!)");
-        object_setClass(layer, [CAMetalLayer class]);
-        mtlLayer = (CAMetalLayer*)layer;
-        coerced = true;
+        // SAFE coercion (replaces the former object_setClass ISA rewrite).
+        //
+        // The old code did object_setClass(layer, [CAMetalLayer class]) to make
+        // a plain CALayer behave as a CAMetalLayer. That is fundamentally
+        // unsafe: CAMetalLayer allocates extra ivars (device, drawable pool,
+        // etc.) that a plain CALayer does not, so rewriting the ISA in place
+        // makes any access to those ivars read past the object's allocation →
+        // memory corruption / crash.
+        //
+        // Instead we construct a REAL CAMetalLayer (mirroring MobileGL's
+        // approach of allocating a genuine CAMetalLayer rather than mutating
+        // the host object), copy the original layer's presentation attributes,
+        // and swap it into the layer tree at the original's position. If the
+        // layer has no superlayer to swap into, we fail loudly rather than
+        // guess — the host app should hand us a CAMetalLayer (e.g. via MTKView)
+        // in the first place.
+        CALayer* parent = [layer superlayer];
+        CAMetalLayer* replacement = [CAMetalLayer layer];
+        replacement.frame         = layer.frame;
+        replacement.bounds        = layer.bounds;
+        replacement.position      = layer.position;
+        replacement.anchorPoint   = layer.anchorPoint;
+        replacement.transform     = layer.transform;
+        replacement.opacity       = layer.opacity;
+        replacement.hidden        = layer.hidden;
+        replacement.contentsScale = layer.contentsScale;
+        replacement.opaque        = layer.opaque;
+        replacement.zPosition     = layer.zPosition;
+        if (parent) {
+            [parent replaceSublayer:layer with:replacement];
+            mtlLayer = replacement;
+            MITHRIL_LOG_WARN("egl", "SurfaceMetal: layer was not a CAMetalLayer; "
+                              "constructed a real CAMetalLayer and swapped it into "
+                              "the layer tree at %p", layer);
+        } else {
+            MITHRIL_LOG_ERROR("egl", "SurfaceMetal: layer is not a CAMetalLayer and has "
+                              "no superlayer to swap into; refusing unsafe coercion. "
+                              "The host app MUST provide a CAMetalLayer.");
+            return nullptr;
+        }
     }
     if (!mtlLayer) {
         MITHRIL_LOG_WARN("egl", "SurfaceMetal: CAMetalLayer coercion failed");

@@ -214,6 +214,13 @@ set(MITHRIL_SOURCES
     # by the platform file (SurfaceMetal.mm) selected by
     # the APPLE guard below.
     Mithril-Wrapper-cpp/egl/egl.cpp
+
+    # egl/SwapchainHelper.cpp: Vulkan swapchain lifecycle (ensure_swapchain /
+    # install_surface_on_state) extracted out of the former monolithic egl.cpp
+    # so the EGL entry-point layer no longer carries swapchain/Vulkan details.
+    # Plain C++ (the swapchain is owned by the backend), built on every platform.
+    # Shared internal types live in egl/EglInternal.h (header only).
+    Mithril-Wrapper-cpp/egl/SwapchainHelper.cpp
 )
 
 # ---- Platform-specific sources ----
