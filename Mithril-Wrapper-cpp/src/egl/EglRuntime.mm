@@ -168,7 +168,7 @@ MITHRIL_EXPORT EGLBoolean eglTerminate(EGLDisplay display) {
                 return fail(EGL_BAD_ACCESS, EGL_FALSE);
             }
         }
-        (void)g_display.session->waitIdle(5ULL * NSEC_PER_SEC);
+        (void)g_display.session->waitIdle(5'000'000'000ULL);
         g_display.session.reset();
     }
     return EGL_TRUE;
