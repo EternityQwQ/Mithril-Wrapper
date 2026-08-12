@@ -362,12 +362,6 @@ VkPipelineLayout empty_pipeline_layout() {
     return layout;
 }
 
-// Exported accessor for the empty/fallback layout (used by
-// CommandStream.cpp:backend_push_constants for binding-less programs).
-VkPipelineLayout backend_default_pipeline_layout() {
-    return empty_pipeline_layout();
-}
-
 // Reflect all vertex-shader input locations from SPIR-V via SPIRV-Cross.
 // Returns the set of locations the vertex shader declares as stage inputs
 // (whether or not GL has enabled a corresponding vertex attrib). Used by
@@ -393,6 +387,19 @@ std::vector<uint32_t> reflect_vertex_input_locations(const uint32_t* spirv, int 
 }
 
 } // namespace
+
+// Exported accessor for the empty/fallback layout (used by
+// CommandStream.cpp:backend_push_constants for binding-less programs).
+//
+// MUST live OUTSIDE the anonymous namespace above (which closes at the
+// `} // namespace` line): functions inside an anonymous namespace have
+// internal linkage, so a definition placed there would never be linkable
+// from another translation unit (CommandStream.cpp). It may still call
+// empty_pipeline_layout() (declared earlier in this TU, internal linkage is
+// fine for a call site).
+VkPipelineLayout backend_default_pipeline_layout() {
+    return empty_pipeline_layout();
+}
 
 VkPipeline get_or_create_pipeline(GLuint program,
                                   const uint32_t* vertex_spirv, int vertex_word_count,
