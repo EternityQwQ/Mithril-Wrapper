@@ -53,9 +53,19 @@ extern "C" const char* mithril_get_settings_dump(void);
 #endif
 
 /* ---- Strings ---- */
-// Vendor string lists the project developers (mirrors MobileGlues' pattern of
-// putting the maintainer names in GL_VENDOR).
-static const char* kVendor   = "EternityQwQ, yitenchen123";
+// The build's git commit id is injected as a compile-definition by CMake
+// (MITHRIL_COMMIT_ID="$GITHUB_SHA", or "unknown" for local builds) and is used
+// to stamp the GL_VERSION string with the originating commit, mirroring
+// MobileGL's "..., GIT@<hash>" suffix. Guarded so direct/verify compiles that
+// forget the -D still build.
+#ifndef MITHRIL_COMMIT_ID
+#define MITHRIL_COMMIT_ID "unknown"
+#endif
+
+// Vendor string lists the project developers (mirrors MobileGL's CoreVendor
+// format "<ProjectName> (<maintainers>)" / MobileGlues putting the maintainer
+// names in GL_VENDOR).
+static const char* kVendor   = "Mithril-Wrapper (EternityQwQ, yitenchen123)";
 #if defined(__APPLE__)
 // GL_RENDERER is built on first query from the live VkPhysicalDevice (see
 // Getter_gpu.mm). Falls back to the static string if Vulkan is unavailable.
@@ -69,8 +79,23 @@ static const char* kRenderer = "Mithril-Wrapper (Vulkan 1.2 / MoltenVK backend)"
 // modern Minecraft + Sodium + Iris actually exercise. Metal's hard limits
 // (no geometry/tessellation stages, no fp64) are reported honestly below.
 // The §b (cyan) Minecraft formatting code highlights Mithril in the F3 screen.
-static const char* kVersion  = "4.6.0 §bMithril-Wrapper§r 1.0 (Vulkan 1.2 / MoltenVK)";
+//
+// GL_VERSION follows MobileGL's "{TargetGLVersion} {ProjectName} {CoreVersion},
+// {BackendName} Backend, GIT@{hash}" shape (see MobileGL GL_Getter.cpp): the
+// leading "OpenGL " keeps the string greppable, the backend token names the
+// Vulkan/MoltenVK path, and the GIT@ stamp identifies the exact build for
+// crash-log triage. Concatenation relies on MITHRIL_COMMIT_ID being a string
+// literal macro.
+#define MITHRIL_VERSION_STR "OpenGL 4.6.0 §bMithril-Wrapper§r 1.0, Vulkan (MoltenVK) Backend, GIT@" MITHRIL_COMMIT_ID
+static const char* kVersion  = MITHRIL_VERSION_STR;
 static const char* kShadingLangVer = "4.60 Mithril-Wrapper (glslang -> SPIR-V)";
+
+// Exposed so the EGL/init path can print the same version string on startup
+// (mirrors MobileGL's "Using graphics backend ... GIT@<hash>" log line) without
+// re-deriving it. Declared in egl.cpp.
+extern "C" const char* mithril_get_version_string(void) {
+    return kVersion;
+}
 
 // Full Core Profile 4.6 extension advertisement. LWJGL capability detection
 // resolves EVERY function pointer of an extension via the platform

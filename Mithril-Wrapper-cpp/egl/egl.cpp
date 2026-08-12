@@ -48,6 +48,14 @@
 
 #include "EglInternal.h"   // shared internal handle types + state + swapchain helper decls
 
+// Renderer/version strings built in MG_Impl/Getter.cpp + Getter_gpu.mm. Declared
+// here (not in a shared header) so eglMakeCurrent can emit the once-per-process
+// startup line mirroring MobileGL's "Using graphics backend/device" log.
+#if defined(__APPLE__)
+extern "C" const char* mithril_get_gpu_renderer_string(void);
+extern "C" const char* mithril_get_version_string(void);
+#endif
+
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -494,6 +502,22 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
 
     // Make sure the Vulkan backend is up before any GL call lands.
     backend_init();
+
+    // Emit the renderer/version identity once per process, at the first
+    // make-current (Minecraft's Render thread context is current by the time the
+    // launcher's first frame starts). Mirrors MobileGL's startup lines
+    // "Using graphics backend OpenGL, using drivers: <version>" and
+    // "Using graphics device: <renderer>" so crash logs and the console identify
+    // the exact backend + build without digging into F3.
+#if defined(__APPLE__)
+    static std::once_flag s_rendererLogged;
+    std::call_once(s_rendererLogged, [] {
+        MITHRIL_LOG_INFO("egl", "Using graphics backend OpenGL, using drivers: %s",
+                         mithril_get_version_string());
+        MITHRIL_LOG_INFO("egl", "Using graphics device: %s",
+                         mithril_get_gpu_renderer_string());
+    });
+#endif
 
     // Swap Mithril's global state pointer to this context's state.
     mithril::g_state = c->state;

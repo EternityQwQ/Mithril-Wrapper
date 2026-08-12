@@ -24,6 +24,12 @@
 #include <sstream>
 #include <cstdio>
 
+// The build's git commit id (CMake compile-definition). Guarded so standalone
+// / verify compiles that omit the -D still build.
+#ifndef MITHRIL_COMMIT_ID
+#define MITHRIL_COMMIT_ID "unknown"
+#endif
+
 /*
  * Note: this translation unit no longer touches Metal directly — the only
  * reason it stays .mm is that the rest of the Apple build (egl.mm) is .mm and
@@ -60,25 +66,20 @@ extern "C" const char* mithril_get_gpu_renderer_string(void) {
     if (!cached.empty()) return cached.c_str();
 
     if (!backend_available()) {
-        cached = "Mithril-Wrapper (Vulkan backend, no device)";
+        cached = "Mithril-Wrapper (Mithril-Wrapper Core) (Vulkan backend, no device)";
         return cached.c_str();
     }
 
     std::string gpuName = friendly_gpu_name(backend_physical_device_name());
     std::string api     = mithril_get_vulkan_api_string();
-    uint64_t    vram    = backend_vram_bytes();
 
-    char vramBuf[48] = {0};
-    if (vram > 0) {
-        snprintf(vramBuf, sizeof(vramBuf), ", %llu MB VRAM",
-                 (unsigned long long)(vram / (1024ULL * 1024ULL)));
-    }
-
-    // MoltenVK on iOS always presents unified memory; we keep the original
-    // "(Unified Memory)" suffix from the Metal-backend string for F3 screen
-    // continuity (mods / users grep for it).
-    cached = gpuName + " | " + api + " | Mithril-Wrapper (Unified Memory"
-           + vramBuf + ")";
+    // MobileGL-style three-part GL_RENDERER:
+    //   {RendererName} ({CoreName}) ({backendApiVersionString})
+    // (see MobileGL GL_Getter.cpp case GL_RENDERER, and DirectVulkan
+    // FormatBackendAPIVersionString = "{device}, Vulkan {ver}, Driver {driver}").
+    // The leading RendererName is the friendly GPU label; the parenthesised
+    // backend token carries the full device + API stack for the F3 screen.
+    cached = gpuName + " (Mithril-Wrapper Core) (" + gpuName + ", " + api + ")";
     return cached.c_str();
 }
 
@@ -95,8 +96,10 @@ extern "C" const char* mithril_get_settings_dump(void) {
 
     ss << "Mithril-Wrapper 1.0 (OpenGL 3.3 -> Vulkan 1.2 / MoltenVK)\n";
     ss << "  Backend: Vulkan 1.2 (MoltenVK static link)\n";
+    ss << "  Build: GIT@" MITHRIL_COMMIT_ID "\n";
 
     if (backend_available()) {
+        ss << "  Renderer: " << mithril_get_gpu_renderer_string() << "\n";
         ss << "  GPU: " << backend_physical_device_name() << "\n";
         ss << "  API: " << mithril_get_vulkan_api_string() << "\n";
         uint64_t vram = backend_vram_bytes();
