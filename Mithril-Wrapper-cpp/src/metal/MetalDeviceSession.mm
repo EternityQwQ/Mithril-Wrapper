@@ -99,7 +99,12 @@ struct PipelineResource {
     std::uint32_t references{1};
     MTLPrimitiveType primitive{MTLPrimitiveTypeTriangle};
 };
-struct SurfaceResource { platform::apple::AppleSurface surface; };
+struct SurfaceResource {
+    platform::apple::AppleSurface surface;
+    std::shared_ptr<void> offscreenTexture;
+    backend::SurfaceDesc desc;
+    bool offscreen{};
+};
 struct DrawableFrame {
     backend::Frame publicFrame;
     std::shared_ptr<void> drawable;
@@ -373,11 +378,13 @@ core::ValueResult<backend::SurfaceDesc> MetalDeviceSession::describeSurface(
     core::SurfaceHandle handle) const {
     auto surface = impl_->surfaces.get(handle);
     if (!surface) return core::ValueResult<backend::SurfaceDesc>::failure(surface.error());
-    backend::SurfaceDesc result;
-    result.width = surface.value()->surface.width();
-    result.height = surface.value()->surface.height();
-    result.generation = surface.value()->surface.generation();
-    result.nativeWindow = surface.value()->surface.layer();
+    backend::SurfaceDesc result = surface.value()->desc;
+    if (!surface.value()->offscreen) {
+        result.width = surface.value()->surface.width();
+        result.height = surface.value()->surface.height();
+        result.generation = surface.value()->surface.generation();
+        result.nativeWindow = surface.value()->surface.layer();
+    }
     return result;
 }
 
@@ -578,9 +585,31 @@ core::Result MetalDeviceSession::release(core::PipelineHandle h) {
 }
 
 core::ValueResult<core::SurfaceHandle> MetalDeviceSession::createSurface(const backend::SurfaceDesc& desc) {
+    if (desc.nativeWindow == nullptr) {
+        if (desc.width == 0 || desc.height == 0) {
+            return core::ValueResult<core::SurfaceHandle>::failure(core::Error::make(
+                core::ErrorDomain::surface, core::ErrorCode::invalid_argument,
+                "offscreen surface dimensions must be non-zero"));
+        }
+        MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:desc.width height:desc.height mipmapped:NO];
+        descriptor.storageMode = MTLStorageModePrivate;
+        descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        id<MTLTexture> texture = [bridgeMetal<id<MTLDevice>>(impl_->device)
+            newTextureWithDescriptor:descriptor];
+        if (texture == nil) {
+            return core::ValueResult<core::SurfaceHandle>::failure(core::Error::make(
+                core::ErrorDomain::surface, core::ErrorCode::out_of_memory,
+                "offscreen Metal surface allocation failed"));
+        }
+        return impl_->surfaces.create(SurfaceResource{
+            {}, retainMetal(texture), desc, true});
+    }
     auto surface = platform::apple::AppleSurface::create(desc);
     if (!surface) return core::ValueResult<core::SurfaceHandle>::failure(surface.error());
-    auto handle = impl_->surfaces.create(SurfaceResource{std::move(surface.value())});
+    auto handle = impl_->surfaces.create(SurfaceResource{
+        std::move(surface.value()), {}, desc, false});
     if (handle) {
         auto stored = impl_->surfaces.get(handle.value());
         CAMetalLayer* layer = stored ? (__bridge CAMetalLayer*)stored.value()->surface.layer() : nil;
@@ -591,12 +620,48 @@ core::ValueResult<core::SurfaceHandle> MetalDeviceSession::createSurface(const b
 
 core::Result MetalDeviceSession::resize(core::SurfaceHandle handle, const backend::SurfaceDesc& desc) {
     auto surface = impl_->surfaces.get(handle);
-    return surface ? surface.value()->surface.resize(desc) : core::Result::failure(surface.error());
+    if (!surface) return core::Result::failure(surface.error());
+    if (!surface.value()->offscreen) return surface.value()->surface.resize(desc);
+    if (desc.width == 0 || desc.height == 0) return core::Result::failure(core::Error::make(
+        core::ErrorDomain::surface, core::ErrorCode::invalid_argument,
+        "offscreen surface dimensions must be non-zero"));
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+        width:desc.width height:desc.height mipmapped:NO];
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [bridgeMetal<id<MTLDevice>>(impl_->device)
+        newTextureWithDescriptor:descriptor];
+    if (texture == nil) return core::Result::failure(core::Error::make(
+        core::ErrorDomain::surface, core::ErrorCode::out_of_memory,
+        "offscreen Metal surface resize failed"));
+    impl_->deferred.retire(impl_->scheduler.lastSubmitted(), surface.value()->offscreenTexture);
+    surface.value()->offscreenTexture = retainMetal(texture);
+    surface.value()->desc = desc;
+    return {};
 }
 
 core::ValueResult<backend::Frame> MetalDeviceSession::acquire(core::SurfaceHandle handle) {
     auto surface = impl_->surfaces.get(handle);
     if (!surface) return core::ValueResult<backend::Frame>::failure(surface.error());
+    if (surface.value()->offscreen) {
+        auto serial = impl_->scheduler.reserve();
+        if (!serial) return core::ValueResult<backend::Frame>::failure(serial.error());
+        id<MTLTexture> texture = bridgeMetal<id<MTLTexture>>(surface.value()->offscreenTexture);
+        backend::TextureDesc textureDesc{static_cast<std::uint32_t>(texture.width),
+            static_cast<std::uint32_t>(texture.height), 1, backend::PixelFormat::bgra8Unorm};
+        auto textureHandle = impl_->textures.create(TextureResource{
+            surface.value()->offscreenTexture, textureDesc});
+        if (!textureHandle) {
+            impl_->scheduler.cancel(serial.value());
+            return core::ValueResult<backend::Frame>::failure(textureHandle.error());
+        }
+        backend::Frame frame{serial.value(), surface.value()->desc.generation,
+            textureHandle.value(), textureDesc.width, textureDesc.height};
+        std::lock_guard lock(impl_->framesMutex);
+        impl_->frames.emplace(frame.serial, DrawableFrame{frame, {}, serial.value(), false});
+        return frame;
+    }
     void* retainedDrawable = surface.value()->surface.nextDrawable();
     if (retainedDrawable == nullptr) return core::ValueResult<backend::Frame>::failure(core::Error::make(
         core::ErrorDomain::surface, core::ErrorCode::unavailable, "Metal drawable unavailable"));
@@ -630,7 +695,9 @@ core::Result MetalDeviceSession::present(const backend::Frame& frame) {
     id<MTLCommandBuffer> commandBuffer = [bridgeMetal<id<MTLCommandQueue>>(impl_->queue) commandBuffer];
     if (commandBuffer == nil) { impl_->scheduler.cancel(stored.reservedSerial); return core::Result::failure(
         core::Error::make(core::ErrorDomain::device, core::ErrorCode::unavailable, "present command buffer unavailable")); }
-    [commandBuffer presentDrawable:bridgeMetal<id<CAMetalDrawable>>(stored.drawable)];
+    if (stored.drawable) {
+        [commandBuffer presentDrawable:bridgeMetal<id<CAMetalDrawable>>(stored.drawable)];
+    }
     auto texture = impl_->textures.erase(frame.drawable);
     if (texture) impl_->deferred.retire(stored.reservedSerial, std::static_pointer_cast<void>(texture.value()));
     impl_->deferred.retire(stored.reservedSerial, stored.drawable);

@@ -175,6 +175,18 @@ core::Result presentDrawFrame() {
         core::ErrorDomain::device, core::ErrorCode::unavailable, "EGL display has no Metal session"));
 }
 
+core::ValueResult<std::vector<std::byte>> readbackDrawFrame() {
+    if (g_draw == nullptr) return core::ValueResult<std::vector<std::byte>>::failure(core::Error::make(
+        core::ErrorDomain::surface, core::ErrorCode::invalid_state, "no current EGL draw surface"));
+    std::lock_guard lock(g_draw->frameMutex);
+    if (!g_draw->frame) return core::ValueResult<std::vector<std::byte>>::failure(core::Error::make(
+        core::ErrorDomain::surface, core::ErrorCode::invalid_state, "draw surface has no acquired frame"));
+    auto session = currentSession();
+    return session ? session->readbackRgba8(g_draw->frame->drawable)
+        : core::ValueResult<std::vector<std::byte>>::failure(core::Error::make(
+            core::ErrorDomain::device, core::ErrorCode::unavailable, "EGL display has no Metal session"));
+}
+
 } // namespace mithril::egl::bridge
 
 extern "C" {
@@ -399,7 +411,6 @@ MITHRIL_EXPORT EGLBoolean eglSwapBuffers(EGLDisplay display, EGLSurface handle) 
     if (!initialized(display)) return fail(EGL_NOT_INITIALIZED, EGL_FALSE);
     auto* surface = surfaceFrom(handle);
     if (surface == nullptr) return fail(EGL_BAD_SURFACE, EGL_FALSE);
-    if (!surface->window) return EGL_TRUE;
     if (surface != g_draw) return fail(EGL_BAD_SURFACE, EGL_FALSE);
     auto frame = bridge::acquireDrawFrame();
     if (!frame) return fail(EGL_BAD_SURFACE, EGL_FALSE);
