@@ -223,6 +223,13 @@ struct ProgramResources {
 // Accessor for the per-program resource table (keyed by GL program name).
 std::unordered_map<GLuint, ProgramResources>& program_table();
 
+// Process-wide VkPipelineLayout used as a fallback for programs with no
+// descriptor bindings (see Pipeline.cpp:empty_pipeline_layout). Exposed so the
+// draw path (CommandStream.cpp:backend_push_constants) can resolve the layout
+// for the injected _MithrilBaseVertex push-constant range even for programs
+// that own no descriptor set. Lazy-created on first use.
+VkPipelineLayout backend_default_pipeline_layout();
+
 // Build (or fetch from cache) a VkPipeline for the given configuration.
 // All arguments mirror backend_get_or_create_pipeline() in Backend.h.
 //   color_write_mask : 4-bit RGBA mask (bit0=R, bit1=G, bit2=B, bit3=A) from

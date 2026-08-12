@@ -153,63 +153,53 @@ int ensure_glsl_version(std::string& src) {
  * reference these identifiers with "'gl_VertexID' : undeclared identifier",
  * which crashes Minecraft 1.21's rendertype_lines vertex shader at startup.
  *
- * Mappings:
- *   gl_VertexID     -> gl_VertexIndex      (Vulkan GLSL builtin.)
- *   gl_InstanceID   -> gl_InstanceIndex    (NOTE: Vulkan's InstanceIndex is
- *                                           0-based and does NOT include the
- *                                           firstInstance offset; desktop GL's
- *                                           InstanceID is 1-based. Minecraft's
- *                                           rendertype_lines only uses
- *                                           gl_VertexID, so the InstanceID
- *                                           semantic shift is irrelevant for
- *                                           the shaders we currently see. For
- *                                           shaders that DO rely on the 1-based
- *                                           semantics, the caller would need to
- *                                           add +1 — left as a follow-up.)
+ * Mapping (as of the gl_VertexID baseVertex fix):
+ *   gl_InstanceID   -> gl_InstanceIndex    (Vulkan GLSL builtin.)
  *
- * SEMANTIC MISMATCH (Task 6 — gl_VertexID baseVertex semantics):
- *   The rename above is NOT semantically equivalent for indexed draws that
- *   use a non-zero baseVertex (glDrawElementsBaseVertex /
- *   glDrawElementsInstancedBaseVertex). In desktop GL, gl_VertexID in an
- *   indexed draw == (index + baseVertex) — i.e. it INCLUDES baseVertex. In
- *   Vulkan, gl_VertexIndex in an indexed draw == the raw index value — it
- *   does NOT include vkCmdDrawIndexed's vertexOffset (which only offsets
- *   vertex *fetch*, not the shader-visible index). So after this rename, a
- *   vertex shader that uses gl_VertexID for a lookup (e.g. indexing a
- *   texture array, fetching per-vertex data from a SSBO) will be off by
- *   baseVertex under glDrawElementsBaseVertex.
+ *   gl_VertexID     -> NOT renamed here. It is instead handled by
+ *                      inject_vertex_id_fixup(), which injects a
+ *                      `#define gl_VertexID (gl_VertexIndex + _mbv._mithrilBaseVertex)`
+ *                      macro into every vertex shader. That single macro
+ *                      serves TWO purposes that a plain rename cannot:
+ *                        1. Compilation: glslang's preprocessor expands the
+ *                           macro to the Vulkan builtin `gl_VertexIndex`, so
+ *                           the parser never sees a bare `gl_VertexID` token
+ *                           (which is not a Vulkan builtin) -> the shader
+ *                           compiles under Vulkan GLSL.
+ *                        2. Semantic fidelity (root cause: baseVertex):
+ *                           desktop GL defines gl_VertexID in an indexed draw
+ *                           as (index + baseVertex) — it INCLUDES baseVertex.
+ *                           Vulkan's gl_VertexIndex == the raw index value
+ *                           and does NOT include vkCmdDrawIndexed's
+ *                           vertexOffset (which only offsets vertex *fetch*,
+ *                           not the shader-visible index). Adding
+ *                           _mbv._mithrilBaseVertex (set == currentBaseVertex
+ *                           on every draw) restores the GL semantics, so a
+ *                           vertex shader that uses gl_VertexID for a lookup
+ *                           (texture-array index, per-vertex SSBO fetch) is
+ *                           no longer off by baseVertex under
+ *                           glDrawElementsBaseVertex /
+ *                           glDrawElementsInstancedBaseVertex.
  *
- *   The correct fix is to inject a push-constant compensation into the
- *   vertex shader source:
- *     layout(push_constant) uniform _MithrilBaseVertex {
- *         int _mithrilBaseVertex;
- *     } _mbv;
- *     #define gl_VertexID (gl_VertexIndex + _mbv._mithrilBaseVertex)
- *   and have Drawing.cpp set that push constant == g_state->currentBaseVertex
- *   before each glDrawElementsBaseVertex draw (and 0 otherwise). This would
- *   also require Pipeline.cpp to declare a push-constant range in the
- *   VkPipelineLayout, plus a backend_push_constants() entry point in
- *   Backend.h / CommandStream.cpp.
+ *   The macro is injected into EVERY vertex shader (whether or not it uses
+ *   gl_VertexID) and _mbv._mithrilBaseVertex is written to 0 on every draw
+ *   whose baseVertex == 0, so gl_VertexID is ALWAYS defined and equals the
+ *   correct GL value. This removes the old SEMANTIC MISMATCH described in
+ *   the previous revision of this comment (the push-constant compensation is
+ *   now implemented across Shader.cpp / Drawing.cpp / DescriptorSet.cpp /
+ *   Pipeline.cpp / CommandStream.cpp).
  *
- *   That is a 3+ file change introducing new push-constant infrastructure,
- *   so per the minimal-fix scope it is NOT done here. The rename is kept
- *   as-is because:
- *     1. Minecraft's core shaders do not use gl_VertexID for data fetches
- *        in any path that currently routes through a non-zero baseVertex
- *        (the vast majority of Minecraft's draw calls use baseVertex==0,
- *        where the semantic difference vanishes: gl_VertexID == index ==
- *        gl_VertexIndex).
- *     2. The rename is still REQUIRED for the shader to compile under
- *        Vulkan GLSL (gl_VertexID is not a Vulkan builtin); without it,
- *        glslang rejects the shader outright -> black screen.
- *   Full push-constant compensation is tracked as a follow-up. See the
- *   matching TODO in Drawing.cpp:glDrawElementsBaseVertex.
+ *   gl_InstanceID note (unchanged): Vulkan's InstanceIndex is 0-based and
+ *   does NOT include the firstInstance offset; desktop GL's InstanceID is
+ *   1-based. Minecraft's rendertype_lines only uses gl_VertexID, so the
+ *   InstanceID semantic shift (and the analogous baseInstance gap) is
+ *   irrelevant for the shaders we currently see — left as a follow-up.
  *
  * The rewrite is word-boundary scoped (regex \b) so it does not touch
- * identifiers like myGl_VertexID_foo. It also skips occurrences inside string
- * literals and line comments — though Minecraft's core shaders do not embed
- * those in expression contexts, this keeps the rewrite safe for third-party
- * shader packs.
+ * identifiers like myGl_InstanceID_foo. It also skips occurrences inside
+ * string literals and line comments — though Minecraft's core shaders do not
+ * embed those in expression contexts, this keeps the rewrite safe for
+ * third-party shader packs.
  *
  * Only vertex shaders are affected; fragment/compute shaders do not reference
  * these builtins. (gl_FragCoord and friends are already Vulkan-compatible.)
@@ -219,27 +209,82 @@ int ensure_glsl_version(std::string& src) {
  */
 void rewrite_desktop_builtins(std::string& src, GLenum gl_stage) {
     if (gl_stage != GL_VERTEX_SHADER) return;
-    // Word-boundary replace. Use a callback-free regex_replace with a single
-    // alternation so both identifiers are rewritten in one pass over the
-    // source (cheaper than two separate passes on Minecraft's ~4KB shaders).
-    static const std::regex re(
-        R"(\bgl_VertexID\b|\bgl_InstanceID\b)",
-        std::regex::optimize);
+    // Word-boundary replace. gl_InstanceID -> gl_InstanceIndex. gl_VertexID is
+    // deliberately NOT rewritten (it is handled by inject_vertex_id_fixup's
+    // macro, which references the Vulkan builtin gl_VertexIndex directly).
+    static const std::regex re(R"(\bgl_InstanceID\b)", std::regex::optimize);
     std::string out;
     out.reserve(src.size());
     std::string::const_iterator it = src.cbegin();
     std::smatch m;
     while (std::regex_search(it, src.cend(), m, re)) {
         out.append(it, m[0].first);
-        if (m.str() == "gl_VertexID") {
-            out.append("gl_VertexIndex");
-        } else {
-            out.append("gl_InstanceIndex");
-        }
+        out.append("gl_InstanceIndex");
         it = m[0].second;
     }
     out.append(it, src.cend());
     src = std::move(out);
+}
+
+/*
+ * Inject a vertex-shader push-constant compensation block + gl_VertexID macro
+ * (root cause: gl_VertexID baseVertex semantics).
+ *
+ * Background:
+ *   Desktop GL's gl_VertexID in an indexed draw == index + baseVertex; Vulkan's
+ *   gl_VertexIndex == the raw index (vkCmdDrawIndexed's vertexOffset does NOT
+ *   feed the shader-visible index). Under glDrawElementsBaseVertex /
+ *   glDrawElementsInstancedBaseVertex, a shader that uses gl_VertexID for a
+ *   data lookup reads the wrong index (off by baseVertex) -> geometry
+ *   misalignment -> garbled/red screen. This is exactly the gap documented in
+ *   fix-minecraft-black-screen/spec.md ("gl_VertexID 语义保留" SHALL
+ *   requirement) that was previously deferred.
+ *
+ * Injection (per vertex shader, both Y orientations — glsl_to_spirv runs once
+ * per variant):
+ *   layout(push_constant) uniform _MithrilBaseVertex {
+ *       int _mithrilBaseVertex;
+ *   } _mbv;
+ *   #define gl_VertexID (gl_VertexIndex + _mbv._mithrilBaseVertex)
+ *
+ *   - The push-constant block uses the Vulkan `push_constant` storage class,
+ *     which glslang accepts under EShClientOpenGL + EShMsgVulkanRules (verified
+ *     against the pinned glslang). It is NOT a descriptor-backed uniform block,
+ *     so SPIRV-Cross's reflect_stage() does NOT surface it as a UBO binding
+ *     (it lives in res.push_constant_buffers, not res.uniform_buffers) — it
+ *     cannot corrupt the descriptor layout.
+ *   - The `#define` expands every gl_VertexID occurrence (post-rewrite they are
+ *     untouched by rewrite_desktop_builtins) to the compensated expression.
+ *     glslang's preprocessor expands it BEFORE the parser, so the parser only
+ *     ever sees valid Vulkan GLSL (gl_VertexIndex + _mbv._mithrilBaseVertex).
+ *   - _mbv._mithrilBaseVertex is written by Drawing.cpp (backend_push_constants)
+ *     to g_state->currentBaseVertex on EVERY draw; it defaults to 0 so
+ *     baseVertex==0 draws (the vast majority in Minecraft) are unaffected and
+ *     the push constant is never undefined when read.
+ *
+ * The block + #define are inserted immediately after the #version directive
+ * (GLSL requires #version to be the first non-comment line). The block is a
+ * top-level declaration and the #define a preprocessor directive — both valid
+ * there. Must run AFTER ensure_glsl_version() (so #version exists) and is
+ * idempotent (guards on an existing _MithrilBaseVertex marker).
+ */
+void inject_vertex_id_fixup(std::string& src, GLenum gl_stage) {
+    if (gl_stage != GL_VERTEX_SHADER) return;
+    if (src.find("_MithrilBaseVertex") != std::string::npos) return;  // idempotent
+
+    // Insert right after the first #version line.
+    size_t pos = src.find("#version");
+    if (pos == std::string::npos) return;  // ensure_glsl_version guarantees this
+    size_t insert_at = src.find('\n', pos);
+    if (insert_at == std::string::npos) insert_at = src.length();
+    insert_at += 1;  // after the newline
+
+    const std::string snippet =
+        "layout(push_constant) uniform _MithrilBaseVertex {\n"
+        "    int _mithrilBaseVertex;\n"
+        "} _mbv;\n"
+        "#define gl_VertexID (gl_VertexIndex + _mbv._mithrilBaseVertex)\n";
+    src.insert(insert_at, snippet);
 }
 
 /*
@@ -967,13 +1012,19 @@ bool glsl_to_spirv(GLenum gl_stage, const std::string& src,
     if (stage == EShLangCount) { info = "unsupported shader stage"; return false; }
 
     // Preprocess: upgrade GLSL version (Vulkan requires 330+), rewrite
-    // desktop-GLSL builtins that Vulkan GLSL renames (gl_VertexID ->
-    // gl_VertexIndex etc.), inject attribute location bindings, and wrap
-    // loose non-opaque uniforms into a synthetic UBO so glslang produces
-    // Vulkan-conformant SPIR-V.
+    // desktop-GLSL builtins that Vulkan GLSL renames (gl_InstanceID ->
+    // gl_InstanceIndex), inject the gl_VertexID push-constant compensation,
+    // inject attribute location bindings, and wrap loose non-opaque uniforms
+    // into a synthetic UBO so glslang produces Vulkan-conformant SPIR-V.
     std::string source = src;
     int glsl_version = ensure_glsl_version(source);
     rewrite_desktop_builtins(source, gl_stage);
+    // Root cause: gl_VertexID baseVertex semantics. After ensure_glsl_version
+    // (so #version exists) inject the push-constant block + #define that
+    // rewrites gl_VertexID -> gl_VertexIndex + _mbv._mithrilBaseVertex. Placed
+    // BEFORE the source_unwrapped backup below so BOTH the wrapped and
+    // unwrapped compile-fallback paths inherit the injection.
+    inject_vertex_id_fixup(source, gl_stage);
     apply_attrib_bindings(source, gl_stage, attrib_bindings);
 
     // Normalize Vulkan-incompatible layout qualifiers (layout(packed) ->

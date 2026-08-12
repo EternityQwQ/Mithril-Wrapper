@@ -338,15 +338,34 @@ VkShaderModule create_module(const uint32_t* spirv, int word_count) {
 // Process-wide empty VkPipelineLayout used as a fallback for programs whose
 // SPIR-V reflects no descriptor bindings (e.g. vertex-only / pass-through
 // shaders). Created lazily on first use.
+//
+// Root cause: gl_VertexID baseVertex semantics. Even a binding-less vertex
+// shader carries the injected _MithrilBaseVertex push-constant block (see
+// Shader.cpp:inject_vertex_id_fixup), so this fallback layout must ALSO
+// declare the VERTEX-stage push-constant range (offset 0, size 4) or MoltenVK
+// rejects the pipeline at creation. Mirrors the per-program layout built in
+// DescriptorSet.cpp:ensure_program_layouts.
 VkPipelineLayout empty_pipeline_layout() {
     Backend* b = backend();
     static VkPipelineLayout layout = VK_NULL_HANDLE;
     if (layout == VK_NULL_HANDLE) {
         VkPipelineLayoutCreateInfo plci{};
         plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pcr.offset = 0;
+        pcr.size = 4;  // int _mithrilBaseVertex
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &pcr;
         vkCreatePipelineLayout(b->device, &plci, nullptr, &layout);
     }
     return layout;
+}
+
+// Exported accessor for the empty/fallback layout (used by
+// CommandStream.cpp:backend_push_constants for binding-less programs).
+VkPipelineLayout backend_default_pipeline_layout() {
+    return empty_pipeline_layout();
 }
 
 // Reflect all vertex-shader input locations from SPIR-V via SPIRV-Cross.

@@ -242,6 +242,24 @@ void backend_draw_indexed_instanced(int primitive, int count, int index_type,
                                     int primcount);
 
 /*
+ * Push a vertex-stage push constant into the CURRENT program's pipeline
+ * layout (root cause: gl_VertexID baseVertex semantics).
+ *
+ * Every vertex shader carries a `_MithrilBaseVertex` push-constant block
+ * (offset 0, size 4 = int) injected by Shader.cpp; Drawing.cpp calls this
+ * with g_state->currentBaseVertex on every draw so the shader's gl_VertexID
+ * (defined as gl_VertexIndex + _mbv._mithrilBaseVertex) matches desktop GL.
+ *
+ * `program` selects the per-program VkPipelineLayout (via program_table());
+ * a program with no descriptor bindings falls back to the process-wide empty
+ * layout, which also declares the same push-constant range. Callable outside
+ * a render pass (vkCmdPushConstants is a state command); typically invoked in
+ * prepare_draw right after backend_bind_pipeline.
+ */
+void backend_push_constants(GLuint program, uint32_t offset, uint32_t size,
+                            const void* data);
+
+/*
  * Indirect draws (GL 4.0 ARB_draw_indirect).
  *
  * Draw parameters are read from a GPU buffer rather than passed in. GL's

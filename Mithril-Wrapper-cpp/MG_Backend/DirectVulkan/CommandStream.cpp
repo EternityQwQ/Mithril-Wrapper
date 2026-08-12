@@ -1990,6 +1990,38 @@ void backend_bind_pipeline(VkPipeline pipeline) {
     }
 }
 
+/*
+ * Push a vertex-stage push constant (root cause: gl_VertexID baseVertex
+ * semantics). Every vertex shader carries a `_MithrilBaseVertex` block at
+ * offset 0 / size 4 (Shader.cpp:inject_vertex_id_fixup); Drawing.cpp writes
+ * g_state->currentBaseVertex here on every draw so the shader's gl_VertexID
+ * (== gl_VertexIndex + _mbv._mithrilBaseVertex) matches desktop GL.
+ *
+ * Resolves the layout from the per-program table; a program with no descriptor
+ * bindings falls back to the process-wide empty layout (both declare the same
+ * VERTEX-stage range). vkCmdPushConstants is a state command and is valid both
+ * inside and outside a render-pass instance.
+ */
+void backend_push_constants(GLuint program, uint32_t offset, uint32_t size,
+                            const void* data) {
+    mithril::vk::Backend* b = mithril::vk::backend();
+    if (!b || !b->commandBuffer || !b->commandBufferRecording) return;
+    if (!data) return;
+
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    auto& tbl = mithril::vk::program_table();
+    auto it = tbl.find(program);
+    if (it != tbl.end() && it->second.pipelineLayout != VK_NULL_HANDLE) {
+        layout = it->second.pipelineLayout;
+    } else {
+        layout = mithril::vk::backend_default_pipeline_layout();
+    }
+    if (layout == VK_NULL_HANDLE) return;
+
+    vkCmdPushConstants(b->commandBuffer, layout, VK_SHADER_STAGE_VERTEX_BIT,
+                       offset, size, data);
+}
+
 /* ---- Compute dispatch (glDispatchCompute) ----
  *
  * Mirrors MobileGL VulkanRenderer::DispatchCompute (VulkanRenderer.cpp:4492).

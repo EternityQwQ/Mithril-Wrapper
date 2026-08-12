@@ -249,11 +249,26 @@ void ensure_program_layouts(GLuint program,
         return;
     }
 
-    // ---- VkPipelineLayout (single set) ----
+    // ---- VkPipelineLayout (single set + gl_VertexID push constant) ----
+    // Root cause: gl_VertexID baseVertex semantics. Every vertex shader now
+    // carries a `_MithrilBaseVertex` push-constant block (see
+    // Shader.cpp:inject_vertex_id_fixup) so gl_VertexID == gl_VertexIndex +
+    // baseVertex. The pipeline layout MUST declare a matching VERTEX-stage
+    // push-constant range (offset 0, size 4 = int _mithrilBaseVertex), or
+    // MoltenVK rejects the shader at pipeline creation (VUID: the range must
+    // cover every push-constant block the shader accesses). Declaring the
+    // range unconditionally is safe — shaders that never touch the block
+    // simply never read it, and Drawing.cpp writes 0 on every draw.
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &pr.descriptorSetLayout;
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pcr.offset = 0;
+    pcr.size = 4;  // int _mithrilBaseVertex
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(b->device, &plci, nullptr, &pr.pipelineLayout) != VK_SUCCESS) {
         MITHRIL_LOG_WARN("vk", "vkCreatePipelineLayout failed (program %u)", program);
         vkDestroyDescriptorSetLayout(b->device, pr.descriptorSetLayout, nullptr);

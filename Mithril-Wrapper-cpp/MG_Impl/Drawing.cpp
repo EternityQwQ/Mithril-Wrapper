@@ -261,6 +261,16 @@ static bool prepare_draw(GLenum mode) {
 
     // Bind pipeline + set dynamic state via vkCmdSet*.
     backend_bind_pipeline(pipeline);
+    // FIX (root cause: gl_VertexID baseVertex semantics): push
+    // currentBaseVertex into the shader's _MithrilBaseVertex push-constant
+    // block on EVERY draw. Shader.cpp defines gl_VertexID as
+    // (gl_VertexIndex + _mbv._mithrilBaseVertex); writing
+    // g_state->currentBaseVertex here (0 for the vast majority of Minecraft
+    // draws, non-zero only under glDrawElementsBaseVertex / InstancedBaseVertex)
+    // restores desktop GL's gl_VertexID == index + baseVertex semantics. Always
+    // writing (not just when baseVertex != 0) guarantees the push constant is
+    // never undefined when the shader reads it.
+    backend_push_constants(prog->id, 0, 4, &g_state->currentBaseVertex);
     // Bind the program's descriptor set (UBOs + sampled images) immediately
     // after the pipeline so the shader's uniform/texture bindings are live for
     // the upcoming draw. The set is built per-draw from Program.uniforms +
@@ -509,26 +519,18 @@ void glDrawElementsBaseVertex(GLenum mode, GLsizei count, GLenum type,
     // 立即重置为 0，避免泄漏到后续无 BaseVertex 的 draw（应保持 vertexOffset=0）。
     // 深度对照 MobileGL drawParams.baseVertex。
     //
-    // TODO (Task 6 — gl_VertexID baseVertex 语义): 这里只把 baseVertex 作为
-    // vkCmdDrawIndexed 的 vertexOffset 传下去，这只补偿了 *顶点数据寻址*
-    // （buffer + (index + vertexOffset) * stride），并不影响 shader 内 gl_VertexIndex
-    // 的值。GL 的 gl_VertexID 在索引绘制中 == index + baseVertex（含 baseVertex），
-    // Vulkan 的 gl_VertexIndex == 原始 index（不含 vertexOffset）。因此当 baseVertex!=0
-    // 且 vertex shader 用 gl_VertexID 做 SSBO/纹理数组查找时，查找会偏移 baseVertex。
+    // FIX (root cause: gl_VertexID baseVertex 语义，已实现): vertexOffset 只补偿
+    // *顶点数据寻址*（buffer + (index + vertexOffset) * stride），不影响 shader 内
+    // gl_VertexIndex。GL 的 gl_VertexID 在索引绘制中 == index + baseVertex（含
+    // baseVertex），Vulkan 的 gl_VertexIndex == 原始 index（不含 vertexOffset）。
     //
-    // 完整修复需要在 vertex shader 注入 push-constant 补偿：
-    //   layout(push_constant) uniform _MithrilBaseVertex { int _mithrilBaseVertex; } _mbv;
-    //   #define gl_VertexID (gl_VertexIndex + _mbv._mithrilBaseVertex)
-    // 并在此处（及 glDrawElementsInstancedBaseVertex / glDrawElementsBaseVertexBaseInstance）
-    // draw 前调用 backend_push_constants(offset = baseVertex)。这需要 Pipeline.cpp 在
-    // VkPipelineLayout 声明 push-constant range + Backend.h / CommandStream.cpp 新增
-    // backend_push_constants 入口（当前 backend 无任何 push-constant 基础设施）。
-    // 属 3+ 文件改动，超出最小修复范围，留作 follow-up。
-    //
-    // 当前不补的合理性：Minecraft 绝大多数 draw call 的 baseVertex==0，此时
-    // gl_VertexID == index == gl_VertexIndex，语义差异消失。Shader.cpp 已保留
-    // gl_VertexID→gl_VertexIndex 改名（否则 Vulkan GLSL 编译失败 → 黑屏）。
-    // 详见 Shader.cpp:rewrite_desktop_builtins 的 SEMANTIC MISMATCH 注释。
+    // 本函数及所有 BaseVertex/BaseInstance 入口都把 baseVertex 写入
+    // g_state->currentBaseVertex；prepare_draw() 在每次 draw 前通过
+    // backend_push_constants 把它推入注入的 _MithrilBaseVertex push-constant，
+    // Shader.cpp 定义 gl_VertexID == gl_VertexIndex + _mbv._mithrilBaseVertex。
+    // 因此用 gl_VertexID 做 SSBO/纹理数组查找的 vertex shader 在 baseVertex!=0
+    // 时也得到正确的 GL 语义（不再偏移 baseVertex）。实现跨 Shader.cpp /
+    // DescriptorSet.cpp / Pipeline.cpp / CommandStream.cpp / Drawing.cpp。
     g_state->currentBaseVertex = basevertex;
     glDrawElements(mode, count, type, indices);
     g_state->currentBaseVertex = 0;
