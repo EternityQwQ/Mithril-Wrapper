@@ -40,6 +40,8 @@ struct Context final {
 };
 
 struct Surface final {
+    Surface(core::SurfaceHandle handleValue, backend::SurfaceDesc descValue, bool windowValue)
+        : handle(handleValue), desc(descValue), window(windowValue) {}
     core::SurfaceHandle handle;
     backend::SurfaceDesc desc;
     bool window{};
@@ -118,7 +120,7 @@ EGLSurface createSurface(EGLDisplay display, EGLConfig config, void* nativeWindo
     }
     desc.width = stored.value().width;
     desc.height = stored.value().height;
-    auto* surface = new (std::nothrow) Surface{surfaceHandle.value(), desc, window};
+    auto* surface = new (std::nothrow) Surface(surfaceHandle.value(), desc, window);
     if (surface == nullptr) {
         (void)g_display.session->release(surfaceHandle.value());
         return fail(EGL_BAD_ALLOC, EGL_NO_SURFACE);

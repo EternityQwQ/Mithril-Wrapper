@@ -207,7 +207,9 @@ GLuint DirectGlContext::createShader(GLenum type) {
     if (type != GL_VERTEX_SHADER && type != GL_FRAGMENT_SHADER) { setError(GL_INVALID_ENUM); return 0; }
     std::lock_guard lock(share_->mutex_);
     const GLuint name = share_->allocateName();
-    share_->shaders_.emplace(name, ShaderObject{type});
+    ShaderObject object;
+    object.type = type;
+    share_->shaders_.emplace(name, std::move(object));
     return name;
 }
 
