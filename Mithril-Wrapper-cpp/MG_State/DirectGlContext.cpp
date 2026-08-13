@@ -760,12 +760,14 @@ void DirectGlContext::clear(GLbitfield mask) {
     pass.clearRed = clearColor_[0]; pass.clearGreen = clearColor_[1];
     pass.clearBlue = clearColor_[2]; pass.clearAlpha = clearColor_[3];
     if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0) {
-        core::ValueResult<core::TextureHandle> depth = depthTarget(frame.value().width, frame.value().height);
+        core::ValueResult<core::TextureHandle> depth = core::ValueResult<core::TextureHandle>::failure(
+            core::Error::make(core::ErrorDomain::gl, core::ErrorCode::invalid_state,
+                "framebuffer has no depth attachment"));
         if (drawFramebuffer_ != 0) {
             const Framebuffer* framebuffer = framebufferForTarget(GL_DRAW_FRAMEBUFFER);
             if (framebuffer != nullptr && framebuffer->depth.kind != AttachmentKind::none)
                 depth = attachmentHandle(framebuffer->depth);
-        }
+        } else depth = depthTarget(frame.value().width, frame.value().height);
         if (!depth) { backendError(depth.error()); return; }
         pass.depthStencil = depth.value();
         pass.clearDepth = (mask & GL_DEPTH_BUFFER_BIT) != 0;
