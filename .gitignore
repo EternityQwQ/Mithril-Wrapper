@@ -4,6 +4,7 @@ build-core-*/
 build-verify-*/
 build-shader-*/
 build-clang-*/
+artifacts/builds/
 build-gl-*/
 build-macos/
 build-ios/
