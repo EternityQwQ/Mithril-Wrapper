@@ -3,7 +3,7 @@
 
 #include "backend/Pipeline.h"
 #include "egl/EglBridge.h"
-#include "metal/MetalDeviceSession.h"
+#include "MG_Backend/DirectMetal/MetalDeviceSession.h"
 #include "shader/GlslangCompiler.h"
 #include "shader/SpirvCrossMslCompiler.h"
 #include "fixtures/triangle_fixture.h"
@@ -52,6 +52,28 @@ bool testGlFrontend() {
     EGLSurface surface = eglCreatePbufferSurface(display, config, surfaceAttributes);
     if (context == EGL_NO_CONTEXT || surface == EGL_NO_SURFACE ||
         !eglMakeCurrent(display, surface, surface, context)) return false;
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    GLuint framebuffer = 0;
+    GLuint colorTexture = 0;
+    GLuint depthRenderbuffer = 0;
+    glGenFramebuffers(1, &framebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT) return false;
+    glGenTextures(1, &colorTexture);
+    glBindTexture(GL_TEXTURE_2D, colorTexture);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 32, 32);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+    glGenRenderbuffers(1, &depthRenderbuffer);
+    glBindRenderbuffer(GL_RENDERBUFFER, depthRenderbuffer);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 32, 32);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+        GL_RENDERBUFFER, depthRenderbuffer);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    glClearColor(0.25F, 0.5F, 0.75F, 1.0F);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    if (glGetError() != GL_NO_ERROR) return false;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     const auto vertex = mithril::tests::triangleVertexShader();
     const auto fragment = mithril::tests::triangleFragmentShader();
@@ -112,6 +134,9 @@ bool testGlFrontend() {
     glDeleteProgram(program);
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
+    glDeleteRenderbuffers(1, &depthRenderbuffer);
+    glDeleteTextures(1, &colorTexture);
+    glDeleteFramebuffers(1, &framebuffer);
     const bool released = eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) == EGL_TRUE;
     const bool destroyed = eglDestroySurface(display, surface) == EGL_TRUE &&
         eglDestroyContext(display, context) == EGL_TRUE;

@@ -1,7 +1,7 @@
-#include "frontend/gl/DirectGlApi.h"
+#include "MG_Impl/DirectGlApi.h"
 
 #include "egl/EglBridge.h"
-#include "frontend/gl/DirectGlContext.h"
+#include "MG_State/DirectGlContext.h"
 
 #include <GL/gl.h>
 
@@ -80,6 +80,31 @@ MITHRIL_GL_EXPORT void glUseProgram(GLuint p) { withContext([&](auto& c) { c.use
 MITHRIL_GL_EXPORT void glGetProgramiv(GLuint p, GLenum n, GLint* v) { withContext([&](auto& c) { c.getProgramiv(p, n, v); }); }
 MITHRIL_GL_EXPORT void glGetProgramInfoLog(GLuint p, GLsizei n, GLsizei* l, GLchar* v) { withContext([&](auto& c) { c.getProgramInfoLog(p, n, l, v); }); }
 
+MITHRIL_GL_EXPORT void glGenTextures(GLsizei n, GLuint* v) { withContext([&](auto& c) { c.genTextures(n, v); }); }
+MITHRIL_GL_EXPORT void glDeleteTextures(GLsizei n, const GLuint* v) { withContext([&](auto& c) { c.deleteTextures(n, v); }); }
+MITHRIL_GL_EXPORT void glBindTexture(GLenum t, GLuint v) { withContext([&](auto& c) { c.bindTexture(t, v); }); }
+MITHRIL_GL_EXPORT void glTexImage2D(GLenum t, GLint l, GLint i, GLsizei w, GLsizei h, GLint b, GLenum f, GLenum y, const void* p) { withContext([&](auto& c) { c.texImage2D(t, l, i, w, h, b, f, y, p); }); }
+MITHRIL_GL_EXPORT void glTexSubImage2D(GLenum t, GLint l, GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum q, const void* p) { withContext([&](auto& c) { c.texSubImage2D(t, l, x, y, w, h, f, q, p); }); }
+MITHRIL_GL_EXPORT void glTexStorage2D(GLenum t, GLsizei l, GLenum f, GLsizei w, GLsizei h) { withContext([&](auto& c) { c.texStorage2D(t, l, f, w, h); }); }
+MITHRIL_GL_EXPORT void glTexParameteri(GLenum t, GLenum p, GLint v) { withContext([&](auto& c) { c.texParameteri(t, p, v); }); }
+
+MITHRIL_GL_EXPORT void glGenFramebuffers(GLsizei n, GLuint* v) { withContext([&](auto& c) { c.genFramebuffers(n, v); }); }
+MITHRIL_GL_EXPORT void glDeleteFramebuffers(GLsizei n, const GLuint* v) { withContext([&](auto& c) { c.deleteFramebuffers(n, v); }); }
+MITHRIL_GL_EXPORT void glBindFramebuffer(GLenum t, GLuint v) { withContext([&](auto& c) { c.bindFramebuffer(t, v); }); }
+MITHRIL_GL_EXPORT void glFramebufferTexture2D(GLenum t, GLenum a, GLenum q, GLuint v, GLint l) { withContext([&](auto& c) { c.framebufferTexture2D(t, a, q, v, l); }); }
+MITHRIL_GL_EXPORT void glFramebufferTexture(GLenum t, GLenum a, GLuint v, GLint l) { glFramebufferTexture2D(t, a, GL_TEXTURE_2D, v, l); }
+MITHRIL_GL_EXPORT void glFramebufferTextureLayer(GLenum t, GLenum a, GLuint v, GLint l, GLint layer) { if (layer != 0) { withContext([](auto& c) { c.setError(GL_INVALID_VALUE); }); return; } glFramebufferTexture2D(t, a, GL_TEXTURE_2D, v, l); }
+MITHRIL_GL_EXPORT GLenum glCheckFramebufferStatus(GLenum t) { auto* c = context(); return c ? c->checkFramebufferStatus(t) : 0; }
+MITHRIL_GL_EXPORT void glDrawBuffer(GLenum v) { withContext([&](auto& c) { c.drawBuffer(v); }); }
+MITHRIL_GL_EXPORT void glReadBuffer(GLenum v) { withContext([&](auto& c) { c.readBuffer(v); }); }
+MITHRIL_GL_EXPORT void glDrawBuffers(GLsizei n, const GLenum* v) { withContext([&](auto& c) { c.drawBuffers(n, v); }); }
+MITHRIL_GL_EXPORT void glGenRenderbuffers(GLsizei n, GLuint* v) { withContext([&](auto& c) { c.genRenderbuffers(n, v); }); }
+MITHRIL_GL_EXPORT void glDeleteRenderbuffers(GLsizei n, const GLuint* v) { withContext([&](auto& c) { c.deleteRenderbuffers(n, v); }); }
+MITHRIL_GL_EXPORT void glBindRenderbuffer(GLenum t, GLuint v) { withContext([&](auto& c) { c.bindRenderbuffer(t, v); }); }
+MITHRIL_GL_EXPORT void glRenderbufferStorage(GLenum t, GLenum f, GLsizei w, GLsizei h) { withContext([&](auto& c) { c.renderbufferStorage(t, f, w, h); }); }
+MITHRIL_GL_EXPORT void glRenderbufferStorageMultisample(GLenum t, GLsizei s, GLenum f, GLsizei w, GLsizei h) { if (s != 1) { withContext([](auto& c) { c.setError(GL_INVALID_VALUE); }); return; } glRenderbufferStorage(t, f, w, h); }
+MITHRIL_GL_EXPORT void glFramebufferRenderbuffer(GLenum t, GLenum a, GLenum q, GLuint v) { withContext([&](auto& c) { c.framebufferRenderbuffer(t, a, q, v); }); }
+
 MITHRIL_GL_EXPORT void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) { withContext([&](auto& c) { c.viewport(x, y, w, h); }); }
 MITHRIL_GL_EXPORT void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a) { withContext([&](auto& c) { c.clearColor(r, g, b, a); }); }
 MITHRIL_GL_EXPORT void glClearDepth(GLdouble v) { withContext([&](auto& c) { c.clearDepth(v); }); }
@@ -108,6 +133,9 @@ GlProc lookupDirectGlProc(const char* name) noexcept {
     GL_PROC(glEnableVertexAttribArray); GL_PROC(glDisableVertexAttribArray); GL_PROC(glVertexAttribPointer); GL_PROC(glVertexAttribIPointer);
     GL_PROC(glCreateShader); GL_PROC(glDeleteShader); GL_PROC(glShaderSource); GL_PROC(glCompileShader); GL_PROC(glGetShaderiv); GL_PROC(glGetShaderInfoLog);
     GL_PROC(glCreateProgram); GL_PROC(glDeleteProgram); GL_PROC(glAttachShader); GL_PROC(glDetachShader); GL_PROC(glLinkProgram); GL_PROC(glUseProgram); GL_PROC(glGetProgramiv); GL_PROC(glGetProgramInfoLog);
+    GL_PROC(glGenTextures); GL_PROC(glDeleteTextures); GL_PROC(glBindTexture); GL_PROC(glTexImage2D); GL_PROC(glTexSubImage2D); GL_PROC(glTexStorage2D); GL_PROC(glTexParameteri);
+    GL_PROC(glGenFramebuffers); GL_PROC(glDeleteFramebuffers); GL_PROC(glBindFramebuffer); GL_PROC(glFramebufferTexture2D); GL_PROC(glFramebufferTexture); GL_PROC(glFramebufferTextureLayer); GL_PROC(glCheckFramebufferStatus); GL_PROC(glDrawBuffer); GL_PROC(glReadBuffer); GL_PROC(glDrawBuffers);
+    GL_PROC(glGenRenderbuffers); GL_PROC(glDeleteRenderbuffers); GL_PROC(glBindRenderbuffer); GL_PROC(glRenderbufferStorage); GL_PROC(glRenderbufferStorageMultisample); GL_PROC(glFramebufferRenderbuffer);
     GL_PROC(glViewport); GL_PROC(glClearColor); GL_PROC(glClearDepth); GL_PROC(glClearDepthf); GL_PROC(glClearStencil); GL_PROC(glClear);
     GL_PROC(glDrawArrays); GL_PROC(glDrawArraysInstanced); GL_PROC(glDrawElements); GL_PROC(glDrawElementsBaseVertex); GL_PROC(glDrawElementsInstanced); GL_PROC(glDrawElementsInstancedBaseVertex);
     GL_PROC(glFlush); GL_PROC(glFinish);

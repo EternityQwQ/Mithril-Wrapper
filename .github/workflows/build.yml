@@ -17,7 +17,6 @@ jobs:
         run: >-
           cmake -S . -B build-macos -G Ninja
           -DCMAKE_BUILD_TYPE=Release
-          -DMITHRIL_BUILD_LEGACY=OFF
           -DMITHRIL_BUILD_DIRECT=ON
           -DMITHRIL_BUILD_TESTS=ON
           -DMITHRIL_ENABLE_SHADER_TOOLCHAIN=ON
@@ -44,6 +43,10 @@ jobs:
             echo 'Forbidden source or target dependency found' >&2
             exit 1
           fi
+          if find Mithril-Wrapper-cpp -type f \( -path '*/DirectVulkan/*' -o -path '*/MoltenVK/*' \) | grep -q .; then
+            echo 'Retired Vulkan backend still exists in the repository' >&2
+            exit 1
+          fi
 
   ios-arm64:
     runs-on: macos-15
@@ -64,7 +67,6 @@ jobs:
           -DENABLE_BITCODE=OFF
           -DENABLE_ARC=ON
           -DCMAKE_BUILD_TYPE=Release
-          -DMITHRIL_BUILD_LEGACY=OFF
           -DMITHRIL_BUILD_DIRECT=ON
           -DMITHRIL_BUILD_TESTS=OFF
           -DMITHRIL_ENABLE_SHADER_TOOLCHAIN=ON
@@ -89,7 +91,9 @@ jobs:
           done
           for symbol in glGetString glGetError glGenBuffers glBufferData \
                         glGenVertexArrays glCreateShader glCompileShader \
-                        glCreateProgram glLinkProgram glDrawArrays glDrawElements; do
+                        glCreateProgram glLinkProgram glDrawArrays glDrawElements \
+                        glGenTextures glTexStorage2D glGenFramebuffers \
+                        glCheckFramebufferStatus glGenRenderbuffers; do
             grep -q " _$symbol$" <<<"$export_symbols"
           done
           if grep -Eqi ' _vk[A-Z]|moltenvk' <<<"$export_symbols"; then exit 1; fi

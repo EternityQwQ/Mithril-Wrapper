@@ -6,9 +6,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path -LiteralPath $RepositoryRoot).Path
-$directories = @("metal", "platform/apple", "egl", "frontend/gl")
+$retiredPaths = @(
+    (Join-Path $root "Mithril-Wrapper-cpp/MG_Backend/DirectVulkan"),
+    (Join-Path $root "Mithril-Wrapper-cpp/3rdparty/MoltenVK")
+)
+foreach ($retiredPath in $retiredPaths) {
+    if (Test-Path -LiteralPath $retiredPath) { throw "Retired backend path still exists: $retiredPath" }
+}
+$directories = @("MG_Backend/DirectMetal", "MG_Impl", "MG_State", "egl")
 $files = foreach ($directory in $directories) {
-    $path = Join-Path $root ("Mithril-Wrapper-cpp/src/" + $directory)
+    $path = Join-Path $root ("Mithril-Wrapper-cpp/" + $directory)
     if (Test-Path -LiteralPath $path) {
         Get-ChildItem -LiteralPath $path -Recurse -File |
             Where-Object { @(".cpp", ".h", ".mm") -contains $_.Extension.ToLowerInvariant() }

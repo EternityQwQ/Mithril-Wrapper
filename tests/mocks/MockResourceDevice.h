@@ -24,6 +24,10 @@ public:
         calls.emplace_back("createSampler"); return core::SamplerHandle{1, 1};
     }
     core::Result upload(core::BufferHandle, std::size_t, std::span<const std::byte>) override { calls.emplace_back("upload"); return {}; }
+    core::Result upload(core::TextureHandle, std::uint32_t, std::uint32_t, std::uint32_t,
+                        std::uint32_t, std::uint32_t, std::span<const std::byte>) override {
+        calls.emplace_back("uploadTexture"); return {};
+    }
     core::Result release(core::BufferHandle) override { calls.emplace_back("releaseBuffer"); return {}; }
     core::Result release(core::TextureHandle) override { calls.emplace_back("releaseTexture"); return {}; }
     core::Result release(core::SamplerHandle) override { calls.emplace_back("releaseSampler"); return {}; }

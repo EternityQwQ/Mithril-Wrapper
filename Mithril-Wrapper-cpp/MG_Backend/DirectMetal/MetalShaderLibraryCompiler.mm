@@ -1,4 +1,4 @@
-#import "metal/MetalShaderLibraryCompiler.h"
+#import "MG_Backend/DirectMetal/MetalShaderLibraryCompiler.h"
 
 #import <Metal/Metal.h>
 

@@ -1,4 +1,4 @@
-#import "platform/apple/AppleCapabilities.h"
+#import "MG_Backend/DirectMetal/AppleCapabilities.h"
 
 #import <Metal/Metal.h>
 

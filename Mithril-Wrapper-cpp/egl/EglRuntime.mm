@@ -2,10 +2,10 @@
 
 #include "egl/EglConfig.h"
 #include "egl/EglBridge.h"
-#include "frontend/gl/DirectGlContext.h"
-#include "frontend/gl/DirectGlApi.h"
+#include "MG_State/DirectGlContext.h"
+#include "MG_Impl/DirectGlApi.h"
 #include "gl/Context.h"
-#include "metal/MetalDeviceSession.h"
+#include "MG_Backend/DirectMetal/MetalDeviceSession.h"
 
 #include <algorithm>
 #include <memory>
@@ -19,6 +19,10 @@
 #define MITHRIL_EXPORT __attribute__((visibility("default")))
 #else
 #define MITHRIL_EXPORT
+#endif
+
+#ifndef MITHRIL_COMMIT_ID
+#define MITHRIL_COMMIT_ID "unknown"
 #endif
 
 namespace mithril::egl {
@@ -214,6 +218,8 @@ MITHRIL_EXPORT EGLBoolean eglInitialize(EGLDisplay display, EGLint* major, EGLin
         auto session = mithril::metal::MetalDeviceSession::create();
         if (!session) return fail(EGL_NOT_INITIALIZED, EGL_FALSE);
         g_display.session = std::move(session.value());
+        NSLog(@"[Mithril] Direct Metal build %s; device=%s", MITHRIL_COMMIT_ID,
+            g_display.session->capabilities().deviceName.c_str());
     }
     ++g_display.initializeCount;
     if (major) *major = 1;

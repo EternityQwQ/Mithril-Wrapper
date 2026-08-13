@@ -2,6 +2,7 @@
 
 #include "backend/CommandEncoder.h"
 #include "backend/Pipeline.h"
+#include "backend/Presenter.h"
 #include "core/Handles.h"
 #include "shader/ShaderTypes.h"
 
@@ -41,6 +42,21 @@ struct ProgramObject final {
     bool linked{};
 };
 
+struct TextureObject final {
+    core::TextureHandle handle;
+    GLsizei width{};
+    GLsizei height{};
+    GLint internalFormat{GL_RGBA8};
+    GLsizei levels{1};
+};
+
+struct RenderbufferObject final {
+    core::TextureHandle handle;
+    GLsizei width{};
+    GLsizei height{};
+    GLenum internalFormat{GL_RGBA8};
+};
+
 class DirectGlShareGroup final {
 public:
     explicit DirectGlShareGroup(std::shared_ptr<metal::MetalDeviceSession>);
@@ -56,6 +72,8 @@ private:
     std::unordered_map<GLuint, BufferObject> buffers_;
     std::unordered_map<GLuint, ShaderObject> shaders_;
     std::unordered_map<GLuint, ProgramObject> programs_;
+    std::unordered_map<GLuint, TextureObject> textures_;
+    std::unordered_map<GLuint, RenderbufferObject> renderbuffers_;
     friend class DirectGlContext;
 };
 
@@ -99,6 +117,29 @@ public:
     void getProgramiv(GLuint, GLenum, GLint*);
     void getProgramInfoLog(GLuint, GLsizei, GLsizei*, GLchar*);
 
+    void genTextures(GLsizei, GLuint*);
+    void deleteTextures(GLsizei, const GLuint*);
+    void bindTexture(GLenum, GLuint);
+    void texImage2D(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*);
+    void texSubImage2D(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*);
+    void texStorage2D(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
+    void texParameteri(GLenum, GLenum, GLint);
+
+    void genFramebuffers(GLsizei, GLuint*);
+    void deleteFramebuffers(GLsizei, const GLuint*);
+    void bindFramebuffer(GLenum, GLuint);
+    void framebufferTexture2D(GLenum, GLenum, GLenum, GLuint, GLint);
+    void framebufferRenderbuffer(GLenum, GLenum, GLenum, GLuint);
+    [[nodiscard]] GLenum checkFramebufferStatus(GLenum);
+    void drawBuffer(GLenum);
+    void readBuffer(GLenum);
+    void drawBuffers(GLsizei, const GLenum*);
+
+    void genRenderbuffers(GLsizei, GLuint*);
+    void deleteRenderbuffers(GLsizei, const GLuint*);
+    void bindRenderbuffer(GLenum, GLuint);
+    void renderbufferStorage(GLenum, GLenum, GLsizei, GLsizei);
+
     void viewport(GLint, GLint, GLsizei, GLsizei);
     void clearColor(GLfloat, GLfloat, GLfloat, GLfloat) noexcept;
     void clearDepth(GLdouble) noexcept;
@@ -126,11 +167,31 @@ private:
         std::array<VertexAttribute, 16> attributes;
         GLuint elementBuffer{};
     };
+    enum class AttachmentKind : std::uint8_t { none, texture, renderbuffer };
+    struct Attachment {
+        AttachmentKind kind{AttachmentKind::none};
+        GLuint name{};
+        GLint level{};
+    };
+    struct Framebuffer {
+        Attachment color;
+        Attachment depth;
+        Attachment stencil;
+        GLenum drawBuffer{GL_COLOR_ATTACHMENT0};
+        GLenum readBuffer{GL_COLOR_ATTACHMENT0};
+    };
 
     [[nodiscard]] GLuint boundBuffer(GLenum) const;
     [[nodiscard]] VertexArray* currentVao();
     [[nodiscard]] core::ValueResult<core::TextureHandle> depthTarget(std::uint32_t, std::uint32_t);
     [[nodiscard]] core::ValueResult<core::PipelineHandle> pipelineFor(GLenum, const VertexArray&);
+    [[nodiscard]] Framebuffer* framebufferForTarget(GLenum);
+    [[nodiscard]] const Framebuffer* framebufferForTarget(GLenum) const;
+    [[nodiscard]] core::TextureHandle attachmentHandle(const Attachment&) const;
+    [[nodiscard]] backend::PixelFormat attachmentFormat(const Attachment&) const;
+    [[nodiscard]] bool attachmentExtent(const Attachment&, GLsizei&, GLsizei&) const;
+    [[nodiscard]] core::ValueResult<backend::Frame> acquireRenderFrame();
+    [[nodiscard]] static bool textureFormat(GLint, backend::PixelFormat&) noexcept;
     [[nodiscard]] static bool primitive(GLenum, ir::Primitive&) noexcept;
     [[nodiscard]] static bool vertexScalar(GLenum, backend::VertexScalar&) noexcept;
     void copyLog(std::string_view, GLsizei, GLsizei*, GLchar*);
@@ -143,7 +204,13 @@ private:
     GLuint currentVao_{};
     GLuint currentProgram_{};
     GLuint nextVao_{1};
+    GLuint nextFramebuffer_{1};
     std::unordered_map<GLuint, VertexArray> vaos_;
+    std::unordered_map<GLuint, Framebuffer> framebuffers_;
+    GLuint texture2D_{};
+    GLuint renderbuffer_{};
+    GLuint drawFramebuffer_{};
+    GLuint readFramebuffer_{};
     backend::Viewport viewport_{};
     std::array<float, 4> clearColor_{};
     double clearDepth_{1.0};

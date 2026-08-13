@@ -1,10 +1,10 @@
-#import "metal/MetalDeviceSession.h"
+#import "MG_Backend/DirectMetal/MetalDeviceSession.h"
 
-#import "metal/DeferredReleaseQueue.h"
-#import "metal/FrameScheduler.h"
-#import "metal/MetalShaderLibraryCompiler.h"
-#import "platform/apple/AppleCapabilities.h"
-#import "platform/apple/AppleSurface.h"
+#import "MG_Backend/DirectMetal/DeferredReleaseQueue.h"
+#import "MG_Backend/DirectMetal/FrameScheduler.h"
+#import "MG_Backend/DirectMetal/MetalShaderLibraryCompiler.h"
+#import "MG_Backend/DirectMetal/AppleCapabilities.h"
+#import "MG_Backend/DirectMetal/AppleSurface.h"
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -441,6 +441,46 @@ core::Result MetalDeviceSession::upload(core::BufferHandle handle, std::size_t o
     }
     std::memcpy(static_cast<std::byte*>(bridgeMetal<id<MTLBuffer>>(buffer.value()->object).contents) + offset,
                 bytes.data(), bytes.size());
+    return {};
+}
+
+core::Result MetalDeviceSession::upload(core::TextureHandle handle, std::uint32_t mipLevel,
+                                        std::uint32_t x, std::uint32_t y,
+                                        std::uint32_t width, std::uint32_t height,
+                                        std::span<const std::byte> bytes) {
+    auto texture = impl_->textures.get(handle);
+    if (!texture) return core::Result::failure(texture.error());
+    const auto& desc = texture.value()->desc;
+    const std::uint32_t mipWidth = std::max(1U, desc.width >> mipLevel);
+    const std::uint32_t mipHeight = std::max(1U, desc.height >> mipLevel);
+    const std::size_t rowBytes = static_cast<std::size_t>(width) * 4U;
+    if (mipLevel >= desc.mipLevels || x > mipWidth || y > mipHeight ||
+        width > mipWidth - x || height > mipHeight - y || bytes.size() != rowBytes * height ||
+        (desc.format != backend::PixelFormat::rgba8Unorm && desc.format != backend::PixelFormat::bgra8Unorm)) {
+        return core::Result::failure(core::Error::make(core::ErrorDomain::resource,
+            core::ErrorCode::invalid_argument, "texture upload is out of bounds or has unsupported format"));
+    }
+    id<MTLBuffer> staging = [bridgeMetal<id<MTLDevice>>(impl_->device)
+        newBufferWithBytes:bytes.data() length:bytes.size() options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> commandBuffer = [bridgeMetal<id<MTLCommandQueue>>(impl_->queue) commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (staging == nil || commandBuffer == nil || blit == nil) {
+        return core::Result::failure(core::Error::make(core::ErrorDomain::device,
+            core::ErrorCode::unavailable, "Metal texture staging resources unavailable"));
+    }
+    [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:rowBytes
+        sourceBytesPerImage:rowBytes * height sourceSize:MTLSizeMake(width, height, 1)
+        toTexture:bridgeMetal<id<MTLTexture>>(texture.value()->object)
+        destinationSlice:0 destinationLevel:mipLevel destinationOrigin:MTLOriginMake(x, y, 0)];
+    [blit endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status == MTLCommandBufferStatusError) {
+        const char* message = commandBuffer.error.localizedDescription.UTF8String;
+        return core::Result::failure(core::Error::make(core::ErrorDomain::device,
+            core::ErrorCode::unavailable,
+            message != nullptr ? message : "Metal texture upload failed"));
+    }
     return {};
 }
 

@@ -4,8 +4,8 @@
 /*
  * Minimal EGL 1.5-compatible public header for Mithril-Wrapper.
  *
- * Mithril-Wrapper ships its own EGL implementation backed by Vulkan 1.2 via
- * MoltenVK (see ../egl/egl.mm). This header provides the EGL types, enum tokens and
+ * Mithril-Wrapper ships its own EGL implementation backed directly by Metal 2.
+ * This header provides the EGL types, enum tokens and
  * PFNEGL*PROC function-pointer typedefs that consumers (Amethyst-iOS'
  * Natives/ctxbridges/gl_bridge.h, LWJGL's EGL probe, etc.) #include via
  * <EGL/egl.h>. Only the subset of EGL actually exercised by Amethyst's

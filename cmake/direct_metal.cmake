@@ -11,7 +11,7 @@ add_library(mithril_core STATIC
     ${MITHRIL_CORE_ROOT}/src/shader/ShaderTypes.cpp
 )
 
-target_include_directories(mithril_core PUBLIC ${MITHRIL_CORE_ROOT}/src)
+target_include_directories(mithril_core PUBLIC ${MITHRIL_CORE_ROOT} ${MITHRIL_CORE_ROOT}/src)
 target_compile_features(mithril_core PUBLIC cxx_std_20)
 set_target_properties(mithril_core PROPERTIES CXX_EXTENSIONS OFF)
 
@@ -42,7 +42,7 @@ if(MITHRIL_ENABLE_SHADER_TOOLCHAIN)
         ${MITHRIL_CORE_ROOT}/src/shader/GlslangCompiler.cpp
         ${MITHRIL_CORE_ROOT}/src/shader/SpirvCrossMslCompiler.cpp
     )
-    target_include_directories(mithril_shader_toolchain PUBLIC ${MITHRIL_CORE_ROOT}/src)
+    target_include_directories(mithril_shader_toolchain PUBLIC ${MITHRIL_CORE_ROOT} ${MITHRIL_CORE_ROOT}/src)
     target_compile_features(mithril_shader_toolchain PUBLIC cxx_std_20)
     target_link_libraries(mithril_shader_toolchain PRIVATE
         mithril_core
@@ -58,10 +58,11 @@ if(MITHRIL_ENABLE_SHADER_TOOLCHAIN)
     endif()
 
     add_library(mithril_gl_frontend STATIC
-        ${MITHRIL_CORE_ROOT}/src/frontend/gl/DirectGlApi.cpp
-        ${MITHRIL_CORE_ROOT}/src/frontend/gl/DirectGlContext.cpp
+        ${MITHRIL_CORE_ROOT}/MG_Impl/DirectGlApi.cpp
+        ${MITHRIL_CORE_ROOT}/MG_State/DirectGlContext.cpp
     )
     target_include_directories(mithril_gl_frontend PUBLIC
+        ${MITHRIL_CORE_ROOT}
         ${MITHRIL_CORE_ROOT}/src
         ${MITHRIL_CORE_ROOT}/include)
     target_compile_features(mithril_gl_frontend PUBLIC cxx_std_20)
@@ -76,17 +77,18 @@ endif()
 
 if(APPLE AND MITHRIL_BUILD_DIRECT)
     set(MITHRIL_DIRECT_SOURCES
-        ${MITHRIL_CORE_ROOT}/src/egl/EglConfig.cpp
-        ${MITHRIL_CORE_ROOT}/src/egl/EglRuntime.mm
-        ${MITHRIL_CORE_ROOT}/src/metal/DeferredReleaseQueue.cpp
-        ${MITHRIL_CORE_ROOT}/src/metal/FrameScheduler.mm
-        ${MITHRIL_CORE_ROOT}/src/metal/MetalDeviceSession.mm
-        ${MITHRIL_CORE_ROOT}/src/metal/MetalShaderLibraryCompiler.mm
-        ${MITHRIL_CORE_ROOT}/src/platform/apple/AppleCapabilities.mm
-        ${MITHRIL_CORE_ROOT}/src/platform/apple/AppleSurface.mm
+        ${MITHRIL_CORE_ROOT}/egl/EglConfig.cpp
+        ${MITHRIL_CORE_ROOT}/egl/EglRuntime.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/DeferredReleaseQueue.cpp
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/FrameScheduler.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/MetalDeviceSession.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/MetalShaderLibraryCompiler.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/AppleCapabilities.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/AppleSurface.mm
     )
     add_library(mithril_direct SHARED ${MITHRIL_DIRECT_SOURCES})
     target_include_directories(mithril_direct PUBLIC
+        ${MITHRIL_CORE_ROOT}
         ${MITHRIL_CORE_ROOT}/src
         ${MITHRIL_CORE_ROOT}/include)
     target_compile_features(mithril_direct PUBLIC cxx_std_20)
@@ -98,16 +100,17 @@ if(APPLE AND MITHRIL_BUILD_DIRECT)
         target_link_libraries(mithril_direct PRIVATE "-framework AppKit")
     endif()
     set_source_files_properties(
-        ${MITHRIL_CORE_ROOT}/src/egl/EglRuntime.mm
-        ${MITHRIL_CORE_ROOT}/src/metal/FrameScheduler.mm
-        ${MITHRIL_CORE_ROOT}/src/metal/MetalDeviceSession.mm
-        ${MITHRIL_CORE_ROOT}/src/metal/MetalShaderLibraryCompiler.mm
-        ${MITHRIL_CORE_ROOT}/src/platform/apple/AppleCapabilities.mm
-        ${MITHRIL_CORE_ROOT}/src/platform/apple/AppleSurface.mm
+        ${MITHRIL_CORE_ROOT}/egl/EglRuntime.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/FrameScheduler.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/MetalDeviceSession.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/MetalShaderLibraryCompiler.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/AppleCapabilities.mm
+        ${MITHRIL_CORE_ROOT}/MG_Backend/DirectMetal/AppleSurface.mm
         PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     set_target_properties(mithril_direct PROPERTIES
         OUTPUT_NAME mithril PREFIX "lib" SUFFIX ".dylib"
         CXX_EXTENSIONS OFF OBJCXX_EXTENSIONS OFF)
+    target_compile_definitions(mithril_direct PRIVATE MITHRIL_COMMIT_ID="${MITHRIL_COMMIT_ID}")
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(mithril_direct PRIVATE -Wall -Wextra -Wpedantic -Werror)
     endif()

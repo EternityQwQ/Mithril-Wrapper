@@ -1,7 +1,7 @@
-#include "frontend/gl/DirectGlContext.h"
+#include "MG_State/DirectGlContext.h"
 
 #include "egl/EglBridge.h"
-#include "metal/MetalDeviceSession.h"
+#include "MG_Backend/DirectMetal/MetalDeviceSession.h"
 #include "shader/GlslangCompiler.h"
 #include "shader/SpirvCrossMslCompiler.h"
 
@@ -41,11 +41,20 @@ DirectGlShareGroup::~DirectGlShareGroup() {
         (void)name;
         if (shader.handle.valid()) (void)session_->release(shader.handle);
     }
+    for (auto& [name, texture] : textures_) {
+        (void)name;
+        if (texture.handle.valid()) (void)session_->release(texture.handle);
+    }
+    for (auto& [name, renderbuffer] : renderbuffers_) {
+        (void)name;
+        if (renderbuffer.handle.valid()) (void)session_->release(renderbuffer.handle);
+    }
 }
 
 GLuint DirectGlShareGroup::allocateName() {
     while (nextName_ == 0 || buffers_.contains(nextName_) || shaders_.contains(nextName_) ||
-           programs_.contains(nextName_)) ++nextName_;
+           programs_.contains(nextName_) || textures_.contains(nextName_) ||
+           renderbuffers_.contains(nextName_)) ++nextName_;
     return nextName_++;
 }
 
@@ -361,6 +370,343 @@ void DirectGlContext::getProgramInfoLog(GLuint name, GLsizei capacity, GLsizei* 
     copyLog(found->second.log, capacity, length, output);
 }
 
+bool DirectGlContext::textureFormat(GLint internalFormat, backend::PixelFormat& output) noexcept {
+    if (internalFormat == GL_RGBA || internalFormat == GL_RGBA8 || internalFormat == GL_RGB ||
+        internalFormat == GL_RGB8) output = backend::PixelFormat::rgba8Unorm;
+    else if (internalFormat == GL_DEPTH_COMPONENT || internalFormat == GL_DEPTH_COMPONENT16 ||
+             internalFormat == GL_DEPTH_COMPONENT24 || internalFormat == GL_DEPTH_COMPONENT32 ||
+             internalFormat == GL_DEPTH_COMPONENT32F) output = backend::PixelFormat::depth32Float;
+    else if (internalFormat == GL_DEPTH24_STENCIL8 || internalFormat == GL_DEPTH32F_STENCIL8)
+        output = backend::PixelFormat::depth32FloatStencil8;
+    else return false;
+    return true;
+}
+
+void DirectGlContext::genTextures(GLsizei count, GLuint* output) {
+    if (count < 0 || (count != 0 && output == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    std::lock_guard lock(share_->mutex_);
+    for (GLsizei index = 0; index < count; ++index) {
+        const GLuint name = share_->allocateName();
+        share_->textures_.emplace(name, TextureObject{});
+        output[index] = name;
+    }
+}
+
+void DirectGlContext::deleteTextures(GLsizei count, const GLuint* names) {
+    if (count < 0 || (count != 0 && names == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    std::lock_guard lock(share_->mutex_);
+    for (GLsizei index = 0; index < count; ++index) {
+        auto found = share_->textures_.find(names[index]);
+        if (found == share_->textures_.end()) continue;
+        if (found->second.handle.valid()) (void)session_->release(found->second.handle);
+        share_->textures_.erase(found);
+        if (texture2D_ == names[index]) texture2D_ = 0;
+    }
+}
+
+void DirectGlContext::bindTexture(GLenum target, GLuint name) {
+    if (target != GL_TEXTURE_2D) { setError(GL_INVALID_ENUM); return; }
+    std::lock_guard lock(share_->mutex_);
+    if (name != 0 && !share_->textures_.contains(name)) share_->textures_.emplace(name, TextureObject{});
+    texture2D_ = name;
+}
+
+void DirectGlContext::texImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width,
+                                 GLsizei height, GLint border, GLenum format, GLenum type,
+                                 const void* pixels) {
+    if (target != GL_TEXTURE_2D || format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+        setError(GL_INVALID_ENUM); return;
+    }
+    if (level != 0 || border != 0 || width < 0 || height < 0) { setError(GL_INVALID_VALUE); return; }
+    if (texture2D_ == 0) { setError(GL_INVALID_OPERATION); return; }
+    backend::PixelFormat pixelFormat;
+    if (!textureFormat(internalFormat, pixelFormat) || pixelFormat != backend::PixelFormat::rgba8Unorm) {
+        setError(GL_INVALID_ENUM); return;
+    }
+    if (width == 0 || height == 0) return;
+    auto created = session_->createTexture({static_cast<std::uint32_t>(width),
+        static_cast<std::uint32_t>(height), 1, pixelFormat});
+    if (!created) { backendError(created.error()); return; }
+    std::lock_guard lock(share_->mutex_);
+    auto& texture = share_->textures_[texture2D_];
+    if (texture.handle.valid()) (void)session_->release(texture.handle);
+    texture = {created.value(), width, height, internalFormat, 1};
+    if (pixels != nullptr) {
+        auto uploaded = session_->upload(texture.handle, 0, 0, 0,
+            static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height),
+            {static_cast<const std::byte*>(pixels), static_cast<std::size_t>(width) * height * 4U});
+        if (!uploaded) backendError(uploaded.error());
+    }
+}
+
+void DirectGlContext::texSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei width,
+                                    GLsizei height, GLenum format, GLenum type, const void* pixels) {
+    if (target != GL_TEXTURE_2D || format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+        setError(GL_INVALID_ENUM); return;
+    }
+    if (level < 0 || x < 0 || y < 0 || width < 0 || height < 0 ||
+        ((width != 0 && height != 0) && pixels == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    std::lock_guard lock(share_->mutex_);
+    auto found = share_->textures_.find(texture2D_);
+    if (found == share_->textures_.end() || !found->second.handle.valid()) {
+        setError(GL_INVALID_OPERATION); return;
+    }
+    auto uploaded = session_->upload(found->second.handle, static_cast<std::uint32_t>(level),
+        static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y),
+        static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height),
+        {static_cast<const std::byte*>(pixels), static_cast<std::size_t>(width) * height * 4U});
+    if (!uploaded) backendError(uploaded.error());
+}
+
+void DirectGlContext::texStorage2D(GLenum target, GLsizei levels, GLenum internalFormat,
+                                   GLsizei width, GLsizei height) {
+    if (target != GL_TEXTURE_2D) { setError(GL_INVALID_ENUM); return; }
+    if (levels <= 0 || width <= 0 || height <= 0) { setError(GL_INVALID_VALUE); return; }
+    if (texture2D_ == 0) { setError(GL_INVALID_OPERATION); return; }
+    backend::PixelFormat format;
+    if (!textureFormat(static_cast<GLint>(internalFormat), format)) { setError(GL_INVALID_ENUM); return; }
+    auto created = session_->createTexture({static_cast<std::uint32_t>(width),
+        static_cast<std::uint32_t>(height), static_cast<std::uint16_t>(levels), format});
+    if (!created) { backendError(created.error()); return; }
+    std::lock_guard lock(share_->mutex_);
+    auto& texture = share_->textures_[texture2D_];
+    if (texture.handle.valid()) (void)session_->release(texture.handle);
+    texture = {created.value(), width, height, static_cast<GLint>(internalFormat), levels};
+}
+
+void DirectGlContext::texParameteri(GLenum target, GLenum pname, GLint param) {
+    if (target != GL_TEXTURE_2D) { setError(GL_INVALID_ENUM); return; }
+    if (pname != GL_TEXTURE_MIN_FILTER && pname != GL_TEXTURE_MAG_FILTER &&
+        pname != GL_TEXTURE_WRAP_S && pname != GL_TEXTURE_WRAP_T &&
+        pname != GL_TEXTURE_BASE_LEVEL && pname != GL_TEXTURE_MAX_LEVEL) setError(GL_INVALID_ENUM);
+    (void)param;
+}
+
+DirectGlContext::Framebuffer* DirectGlContext::framebufferForTarget(GLenum target) {
+    GLuint name = 0;
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) name = drawFramebuffer_;
+    else if (target == GL_READ_FRAMEBUFFER) name = readFramebuffer_;
+    else return nullptr;
+    auto found = framebuffers_.find(name);
+    return found != framebuffers_.end() ? &found->second : nullptr;
+}
+
+const DirectGlContext::Framebuffer* DirectGlContext::framebufferForTarget(GLenum target) const {
+    return const_cast<DirectGlContext*>(this)->framebufferForTarget(target);
+}
+
+core::TextureHandle DirectGlContext::attachmentHandle(const Attachment& attachment) const {
+    std::lock_guard lock(share_->mutex_);
+    if (attachment.kind == AttachmentKind::texture) {
+        auto found = share_->textures_.find(attachment.name);
+        return found != share_->textures_.end() ? found->second.handle : core::TextureHandle{};
+    }
+    if (attachment.kind == AttachmentKind::renderbuffer) {
+        auto found = share_->renderbuffers_.find(attachment.name);
+        return found != share_->renderbuffers_.end() ? found->second.handle : core::TextureHandle{};
+    }
+    return {};
+}
+
+bool DirectGlContext::attachmentExtent(const Attachment& attachment, GLsizei& width,
+                                       GLsizei& height) const {
+    std::lock_guard lock(share_->mutex_);
+    if (attachment.kind == AttachmentKind::texture) {
+        auto found = share_->textures_.find(attachment.name);
+        if (found == share_->textures_.end() || !found->second.handle.valid()) return false;
+        if (attachment.level < 0 || attachment.level >= found->second.levels) return false;
+        width = std::max(1, found->second.width >> attachment.level);
+        height = std::max(1, found->second.height >> attachment.level);
+        return true;
+    }
+    if (attachment.kind == AttachmentKind::renderbuffer) {
+        auto found = share_->renderbuffers_.find(attachment.name);
+        if (found == share_->renderbuffers_.end() || !found->second.handle.valid()) return false;
+        width = found->second.width; height = found->second.height; return true;
+    }
+    return false;
+}
+
+backend::PixelFormat DirectGlContext::attachmentFormat(const Attachment& attachment) const {
+    std::lock_guard lock(share_->mutex_);
+    GLint internalFormat = 0;
+    if (attachment.kind == AttachmentKind::texture) {
+        auto found = share_->textures_.find(attachment.name);
+        if (found != share_->textures_.end()) internalFormat = found->second.internalFormat;
+    } else if (attachment.kind == AttachmentKind::renderbuffer) {
+        auto found = share_->renderbuffers_.find(attachment.name);
+        if (found != share_->renderbuffers_.end()) internalFormat = static_cast<GLint>(found->second.internalFormat);
+    }
+    backend::PixelFormat result = backend::PixelFormat::none;
+    (void)textureFormat(internalFormat, result);
+    return result;
+}
+
+void DirectGlContext::genFramebuffers(GLsizei count, GLuint* output) {
+    if (count < 0 || (count != 0 && output == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    for (GLsizei index = 0; index < count; ++index) {
+        while (nextFramebuffer_ == 0 || framebuffers_.contains(nextFramebuffer_)) ++nextFramebuffer_;
+        output[index] = nextFramebuffer_;
+        framebuffers_.emplace(nextFramebuffer_++, Framebuffer{});
+    }
+}
+
+void DirectGlContext::deleteFramebuffers(GLsizei count, const GLuint* names) {
+    if (count < 0 || (count != 0 && names == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    for (GLsizei index = 0; index < count; ++index) {
+        framebuffers_.erase(names[index]);
+        if (drawFramebuffer_ == names[index]) drawFramebuffer_ = 0;
+        if (readFramebuffer_ == names[index]) readFramebuffer_ = 0;
+    }
+}
+
+void DirectGlContext::bindFramebuffer(GLenum target, GLuint name) {
+    if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) {
+        setError(GL_INVALID_ENUM); return;
+    }
+    if (name != 0 && !framebuffers_.contains(name)) framebuffers_.emplace(name, Framebuffer{});
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) drawFramebuffer_ = name;
+    if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) readFramebuffer_ = name;
+}
+
+void DirectGlContext::framebufferTexture2D(GLenum target, GLenum attachment, GLenum textureTarget,
+                                           GLuint texture, GLint level) {
+    if (textureTarget != GL_TEXTURE_2D) { setError(GL_INVALID_ENUM); return; }
+    Framebuffer* framebuffer = framebufferForTarget(target);
+    if (framebuffer == nullptr || (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER &&
+        target != GL_READ_FRAMEBUFFER)) { setError(target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER ||
+        target == GL_READ_FRAMEBUFFER ? GL_INVALID_OPERATION : GL_INVALID_ENUM); return; }
+    if (level < 0) { setError(GL_INVALID_VALUE); return; }
+    {
+        std::lock_guard lock(share_->mutex_);
+        if (texture != 0 && !share_->textures_.contains(texture)) { setError(GL_INVALID_OPERATION); return; }
+    }
+    Attachment value{texture == 0 ? AttachmentKind::none : AttachmentKind::texture, texture, level};
+    if (attachment == GL_COLOR_ATTACHMENT0) framebuffer->color = value;
+    else if (attachment == GL_DEPTH_ATTACHMENT) framebuffer->depth = value;
+    else if (attachment == GL_STENCIL_ATTACHMENT) framebuffer->stencil = value;
+    else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) framebuffer->depth = framebuffer->stencil = value;
+    else setError(GL_INVALID_ENUM);
+}
+
+void DirectGlContext::framebufferRenderbuffer(GLenum target, GLenum attachment,
+                                              GLenum renderbufferTarget, GLuint renderbuffer) {
+    if (renderbufferTarget != GL_RENDERBUFFER) { setError(GL_INVALID_ENUM); return; }
+    Framebuffer* framebuffer = framebufferForTarget(target);
+    if (framebuffer == nullptr) { setError(target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER ||
+        target == GL_READ_FRAMEBUFFER ? GL_INVALID_OPERATION : GL_INVALID_ENUM); return; }
+    {
+        std::lock_guard lock(share_->mutex_);
+        if (renderbuffer != 0 && !share_->renderbuffers_.contains(renderbuffer)) {
+            setError(GL_INVALID_OPERATION); return;
+        }
+    }
+    Attachment value{renderbuffer == 0 ? AttachmentKind::none : AttachmentKind::renderbuffer,
+        renderbuffer, 0};
+    if (attachment == GL_COLOR_ATTACHMENT0) framebuffer->color = value;
+    else if (attachment == GL_DEPTH_ATTACHMENT) framebuffer->depth = value;
+    else if (attachment == GL_STENCIL_ATTACHMENT) framebuffer->stencil = value;
+    else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT) framebuffer->depth = framebuffer->stencil = value;
+    else setError(GL_INVALID_ENUM);
+}
+
+GLenum DirectGlContext::checkFramebufferStatus(GLenum target) {
+    if (target != GL_FRAMEBUFFER && target != GL_DRAW_FRAMEBUFFER && target != GL_READ_FRAMEBUFFER) {
+        setError(GL_INVALID_ENUM); return 0;
+    }
+    const GLuint name = target == GL_READ_FRAMEBUFFER ? readFramebuffer_ : drawFramebuffer_;
+    if (name == 0) return GL_FRAMEBUFFER_COMPLETE;
+    const Framebuffer* framebuffer = framebufferForTarget(target);
+    if (framebuffer == nullptr) { setError(GL_INVALID_OPERATION); return 0; }
+    const Attachment* attachments[] = {&framebuffer->color, &framebuffer->depth, &framebuffer->stencil};
+    GLsizei expectedWidth = 0;
+    GLsizei expectedHeight = 0;
+    bool attached = false;
+    for (const Attachment* attachment : attachments) {
+        if (attachment->kind == AttachmentKind::none) continue;
+        GLsizei width = 0;
+        GLsizei height = 0;
+        if (!attachmentExtent(*attachment, width, height)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        if (!attached) { expectedWidth = width; expectedHeight = height; attached = true; }
+        else if (width != expectedWidth || height != expectedHeight) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+    }
+    if (!attached) return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+    if (framebuffer->drawBuffer != GL_NONE && framebuffer->drawBuffer != GL_COLOR_ATTACHMENT0)
+        return GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER;
+    if (framebuffer->readBuffer != GL_NONE && framebuffer->readBuffer != GL_COLOR_ATTACHMENT0)
+        return GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER;
+    return GL_FRAMEBUFFER_COMPLETE;
+}
+
+void DirectGlContext::drawBuffer(GLenum mode) {
+    Framebuffer* framebuffer = framebufferForTarget(GL_DRAW_FRAMEBUFFER);
+    if (drawFramebuffer_ == 0) { if (mode != GL_BACK && mode != GL_NONE) setError(GL_INVALID_ENUM); return; }
+    if (framebuffer == nullptr || (mode != GL_COLOR_ATTACHMENT0 && mode != GL_NONE)) {
+        setError(GL_INVALID_ENUM); return;
+    }
+    framebuffer->drawBuffer = mode;
+}
+
+void DirectGlContext::readBuffer(GLenum mode) {
+    Framebuffer* framebuffer = framebufferForTarget(GL_READ_FRAMEBUFFER);
+    if (readFramebuffer_ == 0) { if (mode != GL_BACK && mode != GL_NONE) setError(GL_INVALID_ENUM); return; }
+    if (framebuffer == nullptr || (mode != GL_COLOR_ATTACHMENT0 && mode != GL_NONE)) {
+        setError(GL_INVALID_ENUM); return;
+    }
+    framebuffer->readBuffer = mode;
+}
+
+void DirectGlContext::drawBuffers(GLsizei count, const GLenum* buffers) {
+    if (count < 0 || (count != 0 && buffers == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    if (count > 1) { setError(GL_INVALID_VALUE); return; }
+    if (count == 1) drawBuffer(buffers[0]);
+}
+
+void DirectGlContext::genRenderbuffers(GLsizei count, GLuint* output) {
+    if (count < 0 || (count != 0 && output == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    std::lock_guard lock(share_->mutex_);
+    for (GLsizei index = 0; index < count; ++index) {
+        const GLuint name = share_->allocateName();
+        share_->renderbuffers_.emplace(name, RenderbufferObject{});
+        output[index] = name;
+    }
+}
+
+void DirectGlContext::deleteRenderbuffers(GLsizei count, const GLuint* names) {
+    if (count < 0 || (count != 0 && names == nullptr)) { setError(GL_INVALID_VALUE); return; }
+    std::lock_guard lock(share_->mutex_);
+    for (GLsizei index = 0; index < count; ++index) {
+        auto found = share_->renderbuffers_.find(names[index]);
+        if (found == share_->renderbuffers_.end()) continue;
+        if (found->second.handle.valid()) (void)session_->release(found->second.handle);
+        share_->renderbuffers_.erase(found);
+        if (renderbuffer_ == names[index]) renderbuffer_ = 0;
+    }
+}
+
+void DirectGlContext::bindRenderbuffer(GLenum target, GLuint name) {
+    if (target != GL_RENDERBUFFER) { setError(GL_INVALID_ENUM); return; }
+    std::lock_guard lock(share_->mutex_);
+    if (name != 0 && !share_->renderbuffers_.contains(name)) share_->renderbuffers_.emplace(name, RenderbufferObject{});
+    renderbuffer_ = name;
+}
+
+void DirectGlContext::renderbufferStorage(GLenum target, GLenum internalFormat,
+                                          GLsizei width, GLsizei height) {
+    if (target != GL_RENDERBUFFER) { setError(GL_INVALID_ENUM); return; }
+    if (width <= 0 || height <= 0) { setError(GL_INVALID_VALUE); return; }
+    if (renderbuffer_ == 0) { setError(GL_INVALID_OPERATION); return; }
+    backend::PixelFormat format;
+    if (!textureFormat(static_cast<GLint>(internalFormat), format)) { setError(GL_INVALID_ENUM); return; }
+    auto created = session_->createTexture({static_cast<std::uint32_t>(width),
+        static_cast<std::uint32_t>(height), 1, format});
+    if (!created) { backendError(created.error()); return; }
+    std::lock_guard lock(share_->mutex_);
+    auto& renderbuffer = share_->renderbuffers_[renderbuffer_];
+    if (renderbuffer.handle.valid()) (void)session_->release(renderbuffer.handle);
+    renderbuffer = {created.value(), width, height, internalFormat};
+}
+
 void DirectGlContext::viewport(GLint x, GLint y, GLsizei width, GLsizei height) {
     if (width < 0 || height < 0) { setError(GL_INVALID_VALUE); return; }
     viewport_ = {static_cast<double>(x), static_cast<double>(y), static_cast<double>(width),
@@ -372,6 +718,24 @@ void DirectGlContext::clearColor(GLfloat red, GLfloat green, GLfloat blue, GLflo
 }
 void DirectGlContext::clearDepth(GLdouble value) noexcept { clearDepth_ = std::clamp(value, 0.0, 1.0); }
 void DirectGlContext::clearStencil(GLint value) noexcept { clearStencil_ = static_cast<std::uint32_t>(value); }
+
+core::ValueResult<backend::Frame> DirectGlContext::acquireRenderFrame() {
+    if (drawFramebuffer_ == 0) return egl::bridge::acquireDrawFrame();
+    if (checkFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        return core::ValueResult<backend::Frame>::failure(core::Error::make(
+            core::ErrorDomain::gl, core::ErrorCode::invalid_state, "draw framebuffer is incomplete"));
+    }
+    const Framebuffer* framebuffer = framebufferForTarget(GL_DRAW_FRAMEBUFFER);
+    GLsizei width = 0;
+    GLsizei height = 0;
+    if (framebuffer == nullptr || !attachmentExtent(framebuffer->color, width, height)) {
+        return core::ValueResult<backend::Frame>::failure(core::Error::make(
+            core::ErrorDomain::gl, core::ErrorCode::unsupported,
+            "depth-only draw framebuffers are not implemented"));
+    }
+    return backend::Frame{0, 0, attachmentHandle(framebuffer->color),
+        static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
+}
 
 core::ValueResult<core::TextureHandle> DirectGlContext::depthTarget(std::uint32_t width,
                                                                     std::uint32_t height) {
@@ -386,7 +750,7 @@ void DirectGlContext::clear(GLbitfield mask) {
     if ((mask & ~(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0) {
         setError(GL_INVALID_VALUE); return;
     }
-    auto frame = egl::bridge::acquireDrawFrame();
+    auto frame = acquireRenderFrame();
     if (!frame) { backendError(frame.error()); return; }
     auto commands = session_->createCommandEncoder();
     if (!commands) { backendError(commands.error()); return; }
@@ -396,7 +760,12 @@ void DirectGlContext::clear(GLbitfield mask) {
     pass.clearRed = clearColor_[0]; pass.clearGreen = clearColor_[1];
     pass.clearBlue = clearColor_[2]; pass.clearAlpha = clearColor_[3];
     if ((mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0) {
-        auto depth = depthTarget(frame.value().width, frame.value().height);
+        core::ValueResult<core::TextureHandle> depth = depthTarget(frame.value().width, frame.value().height);
+        if (drawFramebuffer_ != 0) {
+            const Framebuffer* framebuffer = framebufferForTarget(GL_DRAW_FRAMEBUFFER);
+            if (framebuffer != nullptr && framebuffer->depth.kind != AttachmentKind::none)
+                depth = attachmentHandle(framebuffer->depth);
+        }
         if (!depth) { backendError(depth.error()); return; }
         pass.depthStencil = depth.value();
         pass.clearDepth = (mask & GL_DEPTH_BUFFER_BIT) != 0;
@@ -453,6 +822,15 @@ core::ValueResult<core::PipelineHandle> DirectGlContext::pipelineFor(GLenum mode
     desc.key.colorFormats[0] = backend::PixelFormat::bgra8Unorm;
     desc.key.depthStencilFormat = depthTexture_.valid()
         ? backend::PixelFormat::depth32FloatStencil8 : backend::PixelFormat::none;
+    if (drawFramebuffer_ != 0) {
+        const Framebuffer* framebuffer = framebufferForTarget(GL_DRAW_FRAMEBUFFER);
+        if (framebuffer != nullptr) {
+            desc.key.colorFormats[0] = attachmentFormat(framebuffer->color);
+            desc.key.colorAttachmentCount = desc.key.colorFormats[0] == backend::PixelFormat::none ? 0 : 1;
+            if (framebuffer->depth.kind != AttachmentKind::none)
+                desc.key.depthStencilFormat = attachmentFormat(framebuffer->depth);
+        }
+    }
     desc.key.primitive = primitiveMode;
     for (std::uint32_t location = 0; location < vao.attributes.size(); ++location) {
         const auto& attribute = vao.attributes[location];
@@ -473,7 +851,7 @@ void DirectGlContext::drawArrays(GLenum mode, GLint first, GLsizei count, GLsize
     if (first < 0 || count < 0 || instances < 0) { setError(GL_INVALID_VALUE); return; }
     auto* vao = currentVao();
     if (vao == nullptr || currentProgram_ == 0) { setError(GL_INVALID_OPERATION); return; }
-    auto frame = egl::bridge::acquireDrawFrame();
+    auto frame = acquireRenderFrame();
     auto pipeline = pipelineFor(mode, *vao);
     if (!frame) { backendError(frame.error()); return; }
     if (!pipeline) { backendError(pipeline.error()); return; }
@@ -516,7 +894,7 @@ void DirectGlContext::drawElements(GLenum mode, GLsizei count, GLenum type, cons
     if (vao == nullptr || vao->elementBuffer == 0 || currentProgram_ == 0) {
         setError(GL_INVALID_OPERATION); return;
     }
-    auto frame = egl::bridge::acquireDrawFrame();
+    auto frame = acquireRenderFrame();
     auto pipeline = pipelineFor(mode, *vao);
     if (!frame) { backendError(frame.error()); return; }
     if (!pipeline) { backendError(pipeline.error()); return; }
@@ -572,6 +950,13 @@ void DirectGlContext::getIntegerv(GLenum name, GLint* output) {
     else if (name == GL_VERTEX_ARRAY_BINDING) *output = static_cast<GLint>(currentVao_);
     else if (name == GL_CURRENT_PROGRAM) *output = static_cast<GLint>(currentProgram_);
     else if (name == GL_MAX_VERTEX_ATTRIBS) *output = 16;
+    else if (name == GL_MAX_TEXTURE_SIZE || name == GL_MAX_RENDERBUFFER_SIZE) *output = 8192;
+    else if (name == GL_MAX_COLOR_ATTACHMENTS || name == GL_MAX_DRAW_BUFFERS) *output = 1;
+    else if (name == GL_TEXTURE_BINDING_2D) *output = static_cast<GLint>(texture2D_);
+    else if (name == GL_RENDERBUFFER_BINDING) *output = static_cast<GLint>(renderbuffer_);
+    else if (name == GL_FRAMEBUFFER_BINDING || name == GL_DRAW_FRAMEBUFFER_BINDING)
+        *output = static_cast<GLint>(drawFramebuffer_);
+    else if (name == GL_READ_FRAMEBUFFER_BINDING) *output = static_cast<GLint>(readFramebuffer_);
     else { setError(GL_INVALID_ENUM); *output = 0; }
 }
 

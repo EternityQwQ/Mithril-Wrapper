@@ -35,6 +35,8 @@ public:
     core::ValueResult<core::TextureHandle> createTexture(const backend::TextureDesc&) override;
     core::ValueResult<core::SamplerHandle> createSampler(const backend::SamplerDesc&) override;
     core::Result upload(core::BufferHandle, std::size_t, std::span<const std::byte>) override;
+    core::Result upload(core::TextureHandle, std::uint32_t, std::uint32_t, std::uint32_t,
+                        std::uint32_t, std::uint32_t, std::span<const std::byte>) override;
     core::Result release(core::BufferHandle) override;
     core::Result release(core::TextureHandle) override;
     core::Result release(core::SamplerHandle) override;
