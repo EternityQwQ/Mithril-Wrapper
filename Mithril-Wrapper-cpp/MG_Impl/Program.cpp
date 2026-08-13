@@ -696,7 +696,11 @@ static void store_uniform(GLint location, const GLfloat* v, int count, int comps
     mithril::Program* p = current_program();
     if (!p || location < 0 || !v) return;
     auto it = p->uniformByLocation.find(location);
-    if (it == p->uniformByLocation.end()) return;  // unknown location: drop
+    if (it == p->uniformByLocation.end()) {
+        MITHRIL_LOG_DEBUG("program", "store_uniform: dropped unknown location %d (program %u, count=%d comps=%d)",
+                          location, p->id, count, comps);
+        return;
+    }
     mithril::Uniform& u = p->uniforms[it->second];
     u.value.assign(v, v + (size_t)count * comps);
     // Write raw bytes into the UBO backing store at the reflected offset.
@@ -716,7 +720,11 @@ static void store_uniform_int(GLint location, const GLint* v, int count, int com
     mithril::Program* p = current_program();
     if (!p || location < 0 || !v) return;
     auto it = p->uniformByLocation.find(location);
-    if (it == p->uniformByLocation.end()) return;  // unknown location: drop
+    if (it == p->uniformByLocation.end()) {
+        MITHRIL_LOG_DEBUG("program", "store_uniform_int: dropped unknown location %d (program %u, count=%d comps=%d)",
+                          location, p->id, count, comps);
+        return;
+    }
     mithril::Uniform& u = p->uniforms[it->second];
     // Store as floats for glGetUniform* compatibility.
     u.value.resize((size_t)count * comps);

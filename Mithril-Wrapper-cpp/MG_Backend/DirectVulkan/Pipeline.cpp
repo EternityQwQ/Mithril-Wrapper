@@ -311,6 +311,16 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
     bool prfi = (mithril::g_state && mithril::g_state->primitiveRestartFixedIndex);
     mix(&pr, sizeof(pr));
     mix(&prfi, sizeof(prfi));
+    // T4: rasterization STATIC state. Without these in the cache key, toggling
+    // glPolygonMode / glLineWidth / GL_DEPTH_CLAMP would reuse a pipeline
+    // built for the previous values. Vulkan doesn't expose them as dynamic
+    // state on the 1.2 core path, so they must be hashed here.
+    GLenum polyMode = (mithril::g_state ? mithril::g_state->polygonModeFront : (GLenum)0x1B00);
+    float  lw       = (mithril::g_state ? mithril::g_state->lineWidth        : 1.0f);
+    bool   dc       = (mithril::g_state && mithril::g_state->depthClamp);
+    mix(&polyMode, sizeof(polyMode));
+    mix(&lw,       sizeof(lw));
+    mix(&dc,       sizeof(dc));
     return h;
 }
 
@@ -665,13 +675,29 @@ VkPipeline get_or_create_pipeline(GLuint program,
     // ---- Rasterizer ----
     VkPipelineRasterizationStateCreateInfo rs{};
     rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rs.depthClampEnable = VK_FALSE;
+    // T4: wire g_state->polygonModeFront / lineWidth / depthClamp into the
+    // STATIC pipeline rasterization state. These fields are static in Vulkan
+    // 1.2 (no VK_DYNAMIC_STATE_POLYGON_MODE without VK_EXT_extended_dynamic_state3)
+    // so the only way to honor glPolygonMode / glLineWidth / GL_DEPTH_CLAMP is
+    // to bake them into the pipeline + include them in the cache key (see
+    // hash_signature). The values are also part of the pipeline cache key so a
+    // state change forces a new pipeline.
+    rs.depthClampEnable = (mithril::g_state && mithril::g_state->depthClamp) ? VK_TRUE : VK_FALSE;
     rs.rasterizerDiscardEnable = VK_FALSE;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
+    if (mithril::g_state) {
+        switch (mithril::g_state->polygonModeFront) {
+            case 0x1B01 /*GL_POINT*/: rs.polygonMode = VK_POLYGON_MODE_POINT; break;
+            case 0x1B02 /*GL_LINE*/:  rs.polygonMode = VK_POLYGON_MODE_LINE;  break;
+            case 0x1B00 /*GL_FILL*/:
+            default:                  rs.polygonMode = VK_POLYGON_MODE_FILL;  break;
+        }
+    }
     rs.cullMode = VK_CULL_MODE_NONE;        // dynamic via vkCmdSetCullMode
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; // dynamic
     rs.depthBiasEnable = VK_FALSE;
-    rs.lineWidth = 1.0f;
+    rs.lineWidth = (mithril::g_state && mithril::g_state->lineWidth > 0.0f)
+                       ? mithril::g_state->lineWidth : 1.0f;
 
     // ---- Multisample ----
     VkPipelineMultisampleStateCreateInfo ms{};

@@ -340,6 +340,18 @@ static bool prepare_draw(GLenum mode) {
         g_state->depthTest ? 1 : 0,
         g_state->depthMask ? 1 : 0,
         (int)g_state->depthFunc);
+    // T4: polygon mode, line width and depth clamp are STATIC Vulkan 1.2
+    // pipeline rasterization state (no VK_DYNAMIC_STATE_* in our setup), so
+    // their values are baked into the pipeline at creation time
+    // (Pipeline.cpp create_rasterization_state) and participate in the
+    // pipeline cache key (hash_signature). The backend_set_* wrappers are
+    // intentional no-ops; we still call them here so the value flow from
+    // g_state to pipeline is visible at the call site, mirroring the other
+    // dynamic-state setters (backend_set_cull_mode, etc.). 真正进入管线的值
+    // 通过 hash_signature 中的 g_state 读取实现，这里调用仅作 API 对称。
+    backend_set_polygon_mode((int)g_state->polygonModeFront);
+    backend_set_line_width(g_state->lineWidth);
+    backend_set_depth_clamp(g_state->depthClamp ? 1 : 0);
     // Apply dynamic pipeline state: depth bias + stencil.
     // 对照 MobileGL 动态状态应用.
     if (g_state->polygonOffsetFill) {

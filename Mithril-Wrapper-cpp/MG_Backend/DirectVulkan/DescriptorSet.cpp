@@ -968,11 +968,32 @@ void bind_program_descriptors(GLuint program, VkPipelineBindPoint bindPoint) {
                 // 即为最终参数。Minecraft 通常在纹理创建后立即设置参数并不再修改，
                 // 因此无需额外缓存失效逻辑。
                 mithril::Texture* tex = mithril::state_get_texture(tex_id);
-                GLenum minF = tex ? (GLenum)tex->minFilter : GL_NEAREST_MIPMAP_LINEAR;
-                GLenum magF = tex ? (GLenum)tex->magFilter : GL_LINEAR;
-                GLenum wrapS = tex ? (GLenum)tex->wrapS : GL_REPEAT;
-                GLenum wrapT = tex ? (GLenum)tex->wrapT : GL_REPEAT;
-                GLenum wrapR = tex ? (GLenum)tex->wrapR : GL_REPEAT;
+                // T5 (sampler object priority): 当一个 sampler object 绑定到当前
+                // texture unit 时,采样器参数以 sampler object 为准,完全覆盖
+                // texture 自身的 glTexParameteri 设置。这是 GL 3.3 + ARB_sampler_objects
+                // 的标准行为(见 glcorearb.h 注释:"When a sampler object is bound to
+                // a texture unit, its parameters override those of the texture bound
+                // to that unit")。如果当前 unit 上没有 sampler object (samplerBindings
+                // 为 0),沿用 texture 自身的参数(Minecraft 等场景的默认路径)。
+                mithril::Sampler* smp = nullptr;
+                if (mithril::g_state) {
+                    GLuint sname = mithril::g_state->samplerBindings[unit];
+                    if (sname) smp = mithril::state_get_sampler(sname);
+                }
+                GLenum minF, magF, wrapS, wrapT, wrapR;
+                if (smp) {
+                    minF  = (GLenum)smp->minFilter;
+                    magF  = (GLenum)smp->magFilter;
+                    wrapS = (GLenum)smp->wrapS;
+                    wrapT = (GLenum)smp->wrapT;
+                    wrapR = (GLenum)smp->wrapR;
+                } else {
+                    minF  = tex ? (GLenum)tex->minFilter : GL_NEAREST_MIPMAP_LINEAR;
+                    magF  = tex ? (GLenum)tex->magFilter : GL_LINEAR;
+                    wrapS = tex ? (GLenum)tex->wrapS : GL_REPEAT;
+                    wrapT = tex ? (GLenum)tex->wrapT : GL_REPEAT;
+                    wrapR = tex ? (GLenum)tex->wrapR : GL_REPEAT;
+                }
                 samp = backend_get_or_create_sampler(
                     tex_id, minF, magF, wrapS, wrapT, wrapR, nullptr);
             }
@@ -1183,11 +1204,34 @@ void bind_program_descriptors(GLuint program, VkPipelineBindPoint bindPoint) {
             if (tex_id) {
                 view = backend_get_texture_view(tex_id);
                 mithril::Texture* tex = mithril::state_get_texture(tex_id);
-                GLenum minF = tex ? (GLenum)tex->minFilter : GL_NEAREST;
-                GLenum magF = tex ? (GLenum)tex->magFilter : GL_NEAREST;
-                GLenum wrapS = tex ? (GLenum)tex->wrapS : GL_CLAMP_TO_EDGE;
-                GLenum wrapT = tex ? (GLenum)tex->wrapT : GL_CLAMP_TO_EDGE;
-                GLenum wrapR = tex ? (GLenum)tex->wrapR : GL_CLAMP_TO_EDGE;
+                // T5: sampler object priority (see sibling path above). On the
+                // image-units path the unit is determined by the storage-image
+                // binding (db.binding) when the program has no explicit
+                // glUniform1i mapping, otherwise samplerUnitForBinding.
+                GLint samplerUnit = unit;
+                if (samplerUnit < 0 && uit_i != prog->samplerUnitForBinding.end()) {
+                    samplerUnit = uit_i->second;
+                }
+                mithril::Sampler* smp = nullptr;
+                if (mithril::g_state && samplerUnit >= 0 &&
+                    samplerUnit < mithril::kMaxTextureUnits) {
+                    GLuint sname = mithril::g_state->samplerBindings[samplerUnit];
+                    if (sname) smp = mithril::state_get_sampler(sname);
+                }
+                GLenum minF, magF, wrapS, wrapT, wrapR;
+                if (smp) {
+                    minF  = (GLenum)smp->minFilter;
+                    magF  = (GLenum)smp->magFilter;
+                    wrapS = (GLenum)smp->wrapS;
+                    wrapT = (GLenum)smp->wrapT;
+                    wrapR = (GLenum)smp->wrapR;
+                } else {
+                    minF  = tex ? (GLenum)tex->minFilter : GL_NEAREST;
+                    magF  = tex ? (GLenum)tex->magFilter : GL_NEAREST;
+                    wrapS = tex ? (GLenum)tex->wrapS : GL_CLAMP_TO_EDGE;
+                    wrapT = tex ? (GLenum)tex->wrapT : GL_CLAMP_TO_EDGE;
+                    wrapR = tex ? (GLenum)tex->wrapR : GL_CLAMP_TO_EDGE;
+                }
                 samp = backend_get_or_create_sampler(
                     tex_id, minF, magF, wrapS, wrapT, wrapR, nullptr);
             }

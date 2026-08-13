@@ -226,6 +226,15 @@ void backend_set_blend_color(float r, float g, float b, float a);
 void backend_set_depth_bias(float slope, float clamp);
 void backend_set_cull_mode(int mode);        /* 0=None,1=Front,2=Back */
 void backend_set_front_face(int ccw);        /* 1=CCW, 0=CW */
+/* Polygon mode, line width and depth clamp are STATIC VkPipelineRasterizationState
+ * fields in Vulkan 1.2 — see CommandStream.cpp for the no-op rationale. The
+ * current values flow from g_state into the pipeline at creation time
+ * (Pipeline.cpp) and participate in the pipeline cache key, so a state change
+ * correctly invalidates the cached pipeline. The backend_* wrappers exist for
+ * API symmetry. */
+void backend_set_polygon_mode(int mode);     /* 0=FILL, 1=LINE, 2=POINT */
+void backend_set_line_width(float width);
+void backend_set_depth_clamp(int enabled);
 void backend_set_depth_test(int enabled, int write_mask, int compare_func);
 void backend_set_color_write_mask(int r, int g, int b, int a);
 void backend_set_stencil_state(int enabled, int func, int ref, int mask,

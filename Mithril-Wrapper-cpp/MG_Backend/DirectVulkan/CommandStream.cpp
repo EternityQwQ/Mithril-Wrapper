@@ -2283,6 +2283,30 @@ void backend_set_stencil_state(int enabled, int func, int ref, int mask,
     // Stencil dynamic state deferred (bring-up).
 }
 
+/* Polygon mode, line width and depth clamp are STATIC VkPipelineRasterizationState
+ * fields in Vulkan 1.2 (not part of VK_DYNAMIC_STATE_* that we enable). The
+ * correct way to expose glPolygonMode / glLineWidth / GL_DEPTH_CLAMP toggles
+ * is therefore to bake the values into the pipeline at creation time AND make
+ * them part of the pipeline cache key. That is done in Pipeline.cpp
+ * (create_rasterization_state + hash_signature). The backend_* wrappers below
+ * are kept for API symmetry with the other dynamic-state setters and to give
+ * Drawing.cpp a single call site to read the value; they are intentional
+ * no-ops. */
+void backend_set_polygon_mode(int mode) {
+    (void)mode;
+    // Static pipeline state — see comment above.
+}
+
+void backend_set_line_width(float width) {
+    (void)width;
+    // Static pipeline state — see comment above.
+}
+
+void backend_set_depth_clamp(int enabled) {
+    (void)enabled;
+    // Static pipeline state — see comment above.
+}
+
 void backend_draw_arrays(int primitive, int first, int count) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
