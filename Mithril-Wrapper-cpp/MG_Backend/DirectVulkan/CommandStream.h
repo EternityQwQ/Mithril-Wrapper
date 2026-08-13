@@ -1,6 +1,7 @@
 // Mithril-Wrapper - MG_Backend/DirectVulkan/CommandStream.h
-// Render-pass orchestration (dynamic rendering) + encoder dynamic-state setters
-// + draw command recording + per-frame submit/present. Implements the
+// Render-pass orchestration (traditional VkRenderPass / VkFramebuffer,
+// MobileGL's DirectVulkan architecture) + encoder dynamic-state setters +
+// draw command recording + per-frame submit/present. Implements the
 // backend_begin_render_pass / backend_end_render_pass / backend_commit /
 // backend_set_* / backend_draw_* family declared in MG_Backend/Backend.h.
 #ifndef MITHRIL_DIRECTVULKAN_COMMANDSTREAM_H
@@ -51,12 +52,34 @@ void set_load_clear(bool clear);   // true = CLEAR (glClear), false = LOAD
  */
 void set_active_swapchain(Swapchain* sc);
 
-// Begin a dynamic-rendering pass against the given attachments.
+// Begin a traditional VkRenderPass (auto-cached by format set, samples,
+// loadClear) against the given attachments. Replaces the previous
+// VK_KHR_dynamic_rendering path.
 void begin_render_pass(VkImageView* color_views, int color_count,
                        VkImageView depth_view, int width, int height, int samples);
 
-// End the active dynamic-rendering pass.
+// End the active render pass.
 void end_render_pass();
+
+/*
+ * Render-pass / framebuffer cache accessors (replaces the previous
+ * VkPipelineRenderingCreateInfo-based pipeline construction).
+ *
+ * Mithril builds pipelines against a CANONICAL "template" render pass for
+ * the (color formats, depth format, samples) tuple. Vulkan's
+ * pipeline/render-pass compatibility rules ignore loadOp/storeOp, so the
+ * same pipeline binds correctly for any draw-time render pass with the
+ * same attachment formats — including CLEAR vs LOAD flavour passes. This
+ * is the same pattern MobileGL's DirectVulkan backend uses.
+ */
+VkRenderPass get_or_create_render_pass(const VkFormat* color_formats, int color_count,
+                                        VkFormat depth_format, int samples,
+                                        bool loadClear);
+VkFramebuffer get_or_create_framebuffer(VkRenderPass rp,
+                                         const VkImageView* color_views, int color_count,
+                                         VkImageView depth_view, int width, int height);
+VkRenderPass get_template_render_pass(const VkFormat* color_formats, int color_count,
+                                      VkFormat depth_format, int samples);
 
 // Clear specific aspects of the current framebuffer via vkCmdClearAttachments.
 // Must be called inside a render pass. `mask` is a GLbitfield (uint32_t) of
