@@ -1,4 +1,5 @@
 #import <EGL/egl.h>
+#import <Foundation/Foundation.h>
 
 #include "egl/EglConfig.h"
 #include "egl/EglBridge.h"
