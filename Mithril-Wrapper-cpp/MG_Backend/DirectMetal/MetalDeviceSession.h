@@ -28,6 +28,8 @@ public:
     // Explicitly synchronous diagnostic path. Normal presentation remains
     // fully asynchronous and never calls this helper.
     [[nodiscard]] core::ValueResult<std::vector<std::byte>> readbackRgba8(core::TextureHandle);
+    [[nodiscard]] core::ValueResult<void*> mapBuffer(core::BufferHandle, std::size_t, std::size_t);
+    [[nodiscard]] core::Result generateMipmaps(core::TextureHandle);
     [[nodiscard]] core::ValueResult<backend::SurfaceDesc> describeSurface(core::SurfaceHandle) const;
     [[nodiscard]] core::Result waitIdle(std::uint64_t timeoutNanoseconds);
 

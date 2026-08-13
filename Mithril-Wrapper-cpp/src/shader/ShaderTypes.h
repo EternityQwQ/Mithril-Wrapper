@@ -3,6 +3,7 @@
 #include "shader/ShaderError.h"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,7 +11,8 @@
 namespace mithril::shader {
 
 enum class ShaderStage : std::uint8_t { vertex, fragment };
-enum class BindingKind : std::uint8_t { uniformBuffer, sampledTexture, sampler };
+enum class BindingKind : std::uint8_t { uniformBuffer, plainUniform, sampledTexture, stageInput };
+enum class ScalarKind : std::uint8_t { floating, signedInteger, unsignedInteger, boolean, sampler };
 
 struct ShaderSource {
     ShaderStage stage{ShaderStage::vertex};
@@ -32,9 +34,17 @@ struct SpirvArtifact {
 
 struct ReflectedBinding {
     BindingKind kind{BindingKind::uniformBuffer};
+    ShaderStage stage{ShaderStage::vertex};
+    ScalarKind scalar{ScalarKind::floating};
     std::uint32_t set{};
     std::uint32_t binding{};
     std::uint32_t arraySize{1};
+    std::uint32_t vectorSize{1};
+    std::uint32_t columns{1};
+    std::uint32_t byteSize{};
+    std::uint32_t mslBuffer{std::numeric_limits<std::uint32_t>::max()};
+    std::uint32_t mslTexture{std::numeric_limits<std::uint32_t>::max()};
+    std::uint32_t mslSampler{std::numeric_limits<std::uint32_t>::max()};
     std::string name;
 };
 

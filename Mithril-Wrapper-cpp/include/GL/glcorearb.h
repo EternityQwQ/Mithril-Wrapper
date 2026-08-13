@@ -18,6 +18,7 @@ extern "C" {
 #define GL_FALSE                        0
 #define GL_TRUE                         1
 #define GL_NONE                         0
+#define GL_INVALID_INDEX                0xFFFFFFFFu
 #define GL_ZERO                         0
 #define GL_ONE                          1
 
@@ -38,6 +39,29 @@ extern "C" {
 #define GL_UNSIGNED_INT_2_10_10_10_REV  0x8368
 #define GL_UNSIGNED_INT_10F_11F_11F_REV 0x8C3B
 #define GL_INT_2_10_10_10_REV           0x8D9F
+#define GL_FLOAT_VEC2                   0x8B50
+#define GL_FLOAT_VEC3                   0x8B51
+#define GL_FLOAT_VEC4                   0x8B52
+#define GL_INT_VEC2                     0x8B53
+#define GL_INT_VEC3                     0x8B54
+#define GL_INT_VEC4                     0x8B55
+#define GL_BOOL                         0x8B56
+#define GL_BOOL_VEC2                    0x8B57
+#define GL_BOOL_VEC3                    0x8B58
+#define GL_BOOL_VEC4                    0x8B59
+#define GL_FLOAT_MAT2                   0x8B5A
+#define GL_FLOAT_MAT3                   0x8B5B
+#define GL_FLOAT_MAT4                   0x8B5C
+#define GL_SAMPLER_2D                   0x8B5E
+#define GL_FLOAT_MAT2x3                 0x8B65
+#define GL_FLOAT_MAT2x4                 0x8B66
+#define GL_FLOAT_MAT3x2                 0x8B67
+#define GL_FLOAT_MAT3x4                 0x8B68
+#define GL_FLOAT_MAT4x2                 0x8B69
+#define GL_FLOAT_MAT4x3                 0x8B6A
+#define GL_UNSIGNED_INT_VEC2            0x8DC6
+#define GL_UNSIGNED_INT_VEC3            0x8DC7
+#define GL_UNSIGNED_INT_VEC4            0x8DC8
 
 /* Primitives */
 #define GL_POINTS                       0x0000
@@ -107,7 +131,7 @@ extern "C" {
 #define GL_ALWAYS                       0x0207
 #define GL_DEPTH_TEST                   0x0B71
 #define GL_DEPTH_WRITEMASK              0x0B72
-#define GL_DEPTH_FUNC                   0x0B73
+#define GL_DEPTH_FUNC                   0x0B74
 #define GL_DEPTH_RANGE                  0x0B70
 #define GL_DEPTH_CLEAR_VALUE            0x0B73
 
@@ -343,6 +367,10 @@ extern "C" {
 #define GL_BUFFER_SIZE                  0x8764
 #define GL_BUFFER_USAGE                 0x8765
 #define GL_BUFFER_ACCESS                0x8824
+#define GL_BUFFER_MAPPED                0x88BC
+#define GL_BUFFER_ACCESS_FLAGS          0x911F
+#define GL_BUFFER_MAP_LENGTH            0x9120
+#define GL_BUFFER_MAP_OFFSET            0x9121
 
 /* Map */
 #define GL_READ_ONLY                    0x88B8
@@ -518,6 +546,7 @@ extern "C" {
 #define GL_WAIT_FAILED                  0x911D
 #define GL_SYNC_FLUSH_COMMANDS_BIT      0x00000001
 #define GL_TIMEOUT_IGNORED              ((GLuint64)-1)
+#define GL_SYNC_GPU_COMMANDS_COMPLETE   0x9117
 #define GL_FENCE_CONDITION              0x1184
 
 #define GL_TEXTURE0                     0x84C0

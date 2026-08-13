@@ -5,12 +5,15 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <span>
 
 namespace mithril::backend {
 
 struct RenderPassDesc {
     core::TextureHandle color;
     core::TextureHandle depthStencil;
+    std::uint32_t colorLevel{};
+    std::uint32_t depthStencilLevel{};
     bool clearColor{};
     float clearRed{};
     float clearGreen{};
@@ -26,6 +29,7 @@ struct DrawCommand {
     std::uint32_t vertexStart{};
     std::uint32_t vertexCount{};
     std::uint32_t instanceCount{1};
+    std::uint32_t baseInstance{};
 };
 
 enum class IndexType : std::uint8_t { uint16, uint32 };
@@ -37,6 +41,17 @@ struct Viewport {
     double height{};
     double nearDepth{};
     double farDepth{1.0};
+};
+
+enum class RenderStage : std::uint8_t { vertex, fragment };
+enum class CullMode : std::uint8_t { none, front, back, frontAndBack };
+enum class FrontFace : std::uint8_t { clockwise, counterClockwise };
+
+struct ScissorRect {
+    std::int32_t x{};
+    std::int32_t y{};
+    std::uint32_t width{};
+    std::uint32_t height{};
 };
 
 struct DrawIndexedCommand {
@@ -52,9 +67,17 @@ public:
     virtual core::Result beginRenderPass(const RenderPassDesc&) = 0;
     virtual core::Result bindPipeline(core::PipelineHandle) = 0;
     virtual core::Result setViewport(const Viewport&) = 0;
+    virtual core::Result setScissor(const ScissorRect&) = 0;
+    virtual core::Result setCullState(CullMode, FrontFace) = 0;
+    virtual core::Result setBlendColor(float red, float green, float blue, float alpha) = 0;
     virtual core::Result bindVertexBuffer(std::uint32_t slot, core::BufferHandle, std::size_t offset) = 0;
     virtual core::Result bindIndexBuffer(core::BufferHandle, std::size_t offset, IndexType) = 0;
-    virtual core::Result bindTexture(std::uint32_t slot, core::TextureHandle, core::SamplerHandle) = 0;
+    virtual core::Result bindBuffer(RenderStage, std::uint32_t slot, core::BufferHandle,
+                                    std::size_t offset) = 0;
+    virtual core::Result bindBytes(RenderStage, std::uint32_t slot, std::span<const std::byte>) = 0;
+    virtual core::Result bindTexture(RenderStage, std::uint32_t textureSlot,
+                                     std::uint32_t samplerSlot, core::TextureHandle,
+                                     core::SamplerHandle) = 0;
     virtual core::Result draw(const DrawCommand&) = 0;
     virtual core::Result drawIndexed(const DrawIndexedCommand&) = 0;
     virtual core::Result endRenderPass() = 0;

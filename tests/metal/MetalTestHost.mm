@@ -4,6 +4,7 @@
 #include "backend/Pipeline.h"
 #include "egl/EglBridge.h"
 #include "MG_Backend/DirectMetal/MetalDeviceSession.h"
+#include "MG_State/DirectGlContext.h"
 #include "shader/GlslangCompiler.h"
 #include "shader/SpirvCrossMslCompiler.h"
 #include "fixtures/triangle_fixture.h"
@@ -131,6 +132,49 @@ bool testGlFrontend() {
     if (linked != GL_TRUE) return fail("program link");
     glUseProgram(program);
 
+    if (glGetUniformLocation(program, "MissingUniform") != -1)
+        return fail("missing uniform location");
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    const char* uniformVertexSource =
+        "#version 330 core\nlayout(location=0) in vec2 position; out vec2 uv; "
+        "uniform mat4 Transform; void main(){ gl_Position=Transform*vec4(position,0,1); uv=position*0.5+0.5; }";
+    const char* uniformFragmentSource =
+        "#version 330 core\nin vec2 uv; out vec4 color; uniform sampler2D Sampler0; "
+        "uniform sampler2D Sampler1; uniform vec4 ColorModulator; "
+        "void main(){ color=(texture(Sampler0,uv)+texture(Sampler1,uv))*0.5*ColorModulator; }";
+    GLuint uniformVertex = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(uniformVertex, 1, &uniformVertexSource, nullptr);
+    glCompileShader(uniformVertex);
+    GLuint uniformFragment = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(uniformFragment, 1, &uniformFragmentSource, nullptr);
+    glCompileShader(uniformFragment);
+    GLuint uniformProgram = glCreateProgram();
+    glAttachShader(uniformProgram, uniformVertex);
+    glAttachShader(uniformProgram, uniformFragment);
+    glLinkProgram(uniformProgram);
+    glGetProgramiv(uniformProgram, GL_LINK_STATUS, &linked);
+    if (linked != GL_TRUE) return fail("uniform texture program link");
+    glUseProgram(uniformProgram);
+    constexpr GLfloat identity[] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    glUniformMatrix4fv(glGetUniformLocation(uniformProgram, "Transform"), 1, GL_FALSE, identity);
+    glUniform4f(glGetUniformLocation(uniformProgram, "ColorModulator"), 1, 1, 1, 1);
+    glUniform1i(glGetUniformLocation(uniformProgram, "Sampler0"), 0);
+    glUniform1i(glGetUniformLocation(uniformProgram, "Sampler1"), 1);
+    GLuint sampledTextures[2]{};
+    constexpr std::array<GLubyte, 4> red{255, 0, 0, 255};
+    constexpr std::array<GLubyte, 4> green{0, 255, 0, 255};
+    glGenTextures(2, sampledTextures);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sampledTextures[0]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, sampledTextures[1]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, green.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
     constexpr std::array vertices{
         Vertex{-0.8F, -0.8F, 1.0F, 0.0F, 0.0F},
         Vertex{ 0.8F, -0.8F, 0.0F, 1.0F, 0.0F},
@@ -140,7 +184,23 @@ bool testGlFrontend() {
     GLuint vao = 0;
     glGenBuffers(1, &buffer);
     glBindBuffer(GL_ARRAY_BUFFER, buffer);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices.data(), GL_STATIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), nullptr, GL_DYNAMIC_DRAW);
+    void* mapped = glMapBufferRange(GL_ARRAY_BUFFER, 0, sizeof(vertices),
+        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (mapped == nullptr) return fail("map vertex buffer");
+    std::memcpy(mapped, vertices.data(), sizeof(vertices));
+    if (glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY) != nullptr ||
+        glGetError() != GL_INVALID_OPERATION) return fail("reject double map");
+    if (glUnmapBuffer(GL_ARRAY_BUFFER) != GL_TRUE) return fail("unmap vertex buffer");
+    GLint mappedState = GL_TRUE;
+    glGetBufferParameteriv(GL_ARRAY_BUFFER, GL_BUFFER_MAPPED, &mappedState);
+    if (mappedState != GL_FALSE) return fail("buffer mapping query");
+    mapped = glMapBufferRange(GL_ARRAY_BUFFER, 4, 8,
+        GL_MAP_WRITE_BIT | GL_MAP_FLUSH_EXPLICIT_BIT);
+    if (mapped == nullptr) return fail("map explicit flush range");
+    glFlushMappedBufferRange(GL_ARRAY_BUFFER, 0, 8);
+    if (glGetError() != GL_NO_ERROR || glUnmapBuffer(GL_ARRAY_BUFFER) != GL_TRUE)
+        return fail("relative explicit flush range");
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
     glEnableVertexAttribArray(0);
@@ -149,10 +209,37 @@ bool testGlFrontend() {
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex),
         reinterpret_cast<const void*>(2 * sizeof(float)));
     glViewport(0, 0, 64, 64);
+    glDisableVertexAttribArray(1);
     glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
     glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     if (glGetError() != GL_NO_ERROR) return fail("default framebuffer draw");
+    glUseProgram(program);
+    glEnableVertexAttribArray(1);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, minecraftFramebuffer);
+    glViewport(0, 0, 32, 32);
+    glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
+    glScissor(0, 0, 32, 32);
+    glEnable(GL_SCISSOR_TEST);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (glGetError() != GL_NO_ERROR) return fail("Minecraft framebuffer draw");
+    if (!mithril::egl::bridge::currentSession()) return fail("current Metal session");
+    auto fboPixels = mithril::egl::bridge::currentGlContext()->readbackDrawFramebuffer();
+    if (!fboPixels) return fail("Minecraft framebuffer readback");
+    std::size_t fboColored = 0;
+    for (std::size_t index = 0; index < fboPixels.value().size(); ++index) {
+        if (index % 4 != 3 && std::to_integer<unsigned char>(fboPixels.value()[index]) > 16) ++fboColored;
+    }
+    if (fboColored < 200) return fail("Minecraft framebuffer pixels");
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, 64, 64);
     auto pixels = mithril::egl::bridge::readbackDrawFrame();
     if (!pixels) return fail("default framebuffer readback");
     std::size_t colored = 0;
@@ -164,11 +251,13 @@ bool testGlFrontend() {
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &buffer);
     glDeleteProgram(program);
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
+    glDeleteProgram(uniformProgram);
+    glDeleteShader(uniformVertex);
+    glDeleteShader(uniformFragment);
     glDeleteRenderbuffers(1, &depthRenderbuffer);
-    const GLuint textures[] = {colorTexture, minecraftColorTexture, minecraftDepthTexture};
-    glDeleteTextures(3, textures);
+    const GLuint textures[] = {colorTexture, minecraftColorTexture, minecraftDepthTexture,
+        sampledTextures[0], sampledTextures[1]};
+    glDeleteTextures(5, textures);
     glDeleteFramebuffers(1, &framebuffer);
     glDeleteFramebuffers(1, &minecraftFramebuffer);
     const bool released = eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) == EGL_TRUE;
@@ -208,8 +297,8 @@ int main() {
         pipelineDesc.key.colorFormats[0] = mithril::backend::PixelFormat::rgba8Unorm;
         pipelineDesc.key.depthStencilFormat = mithril::backend::PixelFormat::none;
         pipelineDesc.vertexAttributes = {
-            {0, 0, 0, sizeof(Vertex), mithril::backend::VertexScalar::float32, 2, false},
-            {1, 0, 2 * sizeof(float), sizeof(Vertex), mithril::backend::VertexScalar::float32, 3, false},
+            {0, 0, 0, sizeof(Vertex), mithril::backend::VertexScalar::float32, 2, 0, false},
+            {1, 0, 2 * sizeof(float), sizeof(Vertex), mithril::backend::VertexScalar::float32, 3, 0, false},
         };
         const std::array shaders{vertexShader.value(), fragmentShader.value()};
         auto pipeline = session.value()->createPipeline(shaders, pipelineDesc);

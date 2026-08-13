@@ -29,8 +29,15 @@ std::uint64_t hashPipelineKey(const PipelineKey& input) noexcept {
     mix(static_cast<std::uint8_t>(key.depthStencilFormat));
     mix(static_cast<std::uint8_t>(key.primitive));
     mix(static_cast<std::uint8_t>(key.depthCompare));
+    mix(static_cast<std::uint8_t>(key.sourceRgb));
+    mix(static_cast<std::uint8_t>(key.destinationRgb));
+    mix(static_cast<std::uint8_t>(key.sourceAlpha));
+    mix(static_cast<std::uint8_t>(key.destinationAlpha));
+    mix(static_cast<std::uint8_t>(key.rgbOperation));
+    mix(static_cast<std::uint8_t>(key.alphaOperation));
     mix(key.colorAttachmentCount);
     mix(key.sampleCount);
+    mix(key.colorWriteMask);
     mix(key.blending);
     mix(key.depthWrite);
     mix(key.flipY);

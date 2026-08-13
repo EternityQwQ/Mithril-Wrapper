@@ -16,6 +16,7 @@ enum class PixelFormat : std::uint8_t {
     depth32FloatStencil8,
 };
 enum class Filter : std::uint8_t { nearest, linear };
+enum class MipFilter : std::uint8_t { none, nearest, linear };
 enum class AddressMode : std::uint8_t { clampToEdge, repeat, mirroredRepeat };
 enum class VertexScalar : std::uint8_t { float32, sint32, uint32, sint16, uint16, sint8, uint8 };
 
@@ -34,8 +35,11 @@ struct TextureDesc {
 struct SamplerDesc {
     Filter minFilter{Filter::nearest};
     Filter magFilter{Filter::nearest};
+    MipFilter mipFilter{MipFilter::none};
     AddressMode addressU{AddressMode::clampToEdge};
     AddressMode addressV{AddressMode::clampToEdge};
+    float lodMinClamp{};
+    float lodMaxClamp{1000.0F};
 };
 
 struct VertexAttributeDesc {
@@ -45,6 +49,7 @@ struct VertexAttributeDesc {
     std::uint32_t stride{};
     VertexScalar scalar{VertexScalar::float32};
     std::uint8_t components{4};
+    std::uint32_t divisor{};
     bool normalized{};
 };
 

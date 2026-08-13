@@ -51,13 +51,48 @@ MTLPixelFormat metalFormat(backend::PixelFormat format) {
 
 MTLCompareFunction compareFunction(ir::Compare compare) {
     switch (compare) {
+        case ir::Compare::never: return MTLCompareFunctionNever;
         case ir::Compare::always: return MTLCompareFunctionAlways;
         case ir::Compare::less: return MTLCompareFunctionLess;
         case ir::Compare::lessEqual: return MTLCompareFunctionLessEqual;
         case ir::Compare::equal: return MTLCompareFunctionEqual;
+        case ir::Compare::notEqual: return MTLCompareFunctionNotEqual;
         case ir::Compare::greater: return MTLCompareFunctionGreater;
+        case ir::Compare::greaterEqual: return MTLCompareFunctionGreaterEqual;
     }
     return MTLCompareFunctionAlways;
+}
+
+MTLBlendFactor blendFactor(ir::BlendFactor factor) {
+    switch (factor) {
+        case ir::BlendFactor::zero: return MTLBlendFactorZero;
+        case ir::BlendFactor::one: return MTLBlendFactorOne;
+        case ir::BlendFactor::sourceColor: return MTLBlendFactorSourceColor;
+        case ir::BlendFactor::oneMinusSourceColor: return MTLBlendFactorOneMinusSourceColor;
+        case ir::BlendFactor::sourceAlpha: return MTLBlendFactorSourceAlpha;
+        case ir::BlendFactor::oneMinusSourceAlpha: return MTLBlendFactorOneMinusSourceAlpha;
+        case ir::BlendFactor::destinationColor: return MTLBlendFactorDestinationColor;
+        case ir::BlendFactor::oneMinusDestinationColor: return MTLBlendFactorOneMinusDestinationColor;
+        case ir::BlendFactor::destinationAlpha: return MTLBlendFactorDestinationAlpha;
+        case ir::BlendFactor::oneMinusDestinationAlpha: return MTLBlendFactorOneMinusDestinationAlpha;
+        case ir::BlendFactor::sourceAlphaSaturated: return MTLBlendFactorSourceAlphaSaturated;
+        case ir::BlendFactor::blendColor: return MTLBlendFactorBlendColor;
+        case ir::BlendFactor::oneMinusBlendColor: return MTLBlendFactorOneMinusBlendColor;
+        case ir::BlendFactor::blendAlpha: return MTLBlendFactorBlendAlpha;
+        case ir::BlendFactor::oneMinusBlendAlpha: return MTLBlendFactorOneMinusBlendAlpha;
+    }
+    return MTLBlendFactorOne;
+}
+
+MTLBlendOperation blendOperation(ir::BlendOperation operation) {
+    switch (operation) {
+        case ir::BlendOperation::add: return MTLBlendOperationAdd;
+        case ir::BlendOperation::subtract: return MTLBlendOperationSubtract;
+        case ir::BlendOperation::reverseSubtract: return MTLBlendOperationReverseSubtract;
+        case ir::BlendOperation::minimum: return MTLBlendOperationMin;
+        case ir::BlendOperation::maximum: return MTLBlendOperationMax;
+    }
+    return MTLBlendOperationAdd;
 }
 
 MTLVertexFormat vertexFormat(const backend::VertexAttributeDesc& attribute) {
@@ -147,6 +182,7 @@ public:
         if (!color) return core::Result::failure(color.error());
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = bridgeMetal<id<MTLTexture>>(color.value()->object);
+        pass.colorAttachments[0].level = desc.colorLevel;
         pass.colorAttachments[0].loadAction = desc.clearColor ? MTLLoadActionClear : MTLLoadActionLoad;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(
@@ -156,12 +192,14 @@ public:
             if (!depth) return core::Result::failure(depth.error());
             id<MTLTexture> texture = bridgeMetal<id<MTLTexture>>(depth.value()->object);
             pass.depthAttachment.texture = texture;
+            pass.depthAttachment.level = desc.depthStencilLevel;
             pass.depthAttachment.loadAction = desc.clearDepth ? MTLLoadActionClear : MTLLoadActionLoad;
             pass.depthAttachment.storeAction = MTLStoreActionStore;
             pass.depthAttachment.clearDepth = desc.clearDepthValue;
             if (depth.value()->desc.format == backend::PixelFormat::depth24Stencil8 ||
                 depth.value()->desc.format == backend::PixelFormat::depth32FloatStencil8) {
                 pass.stencilAttachment.texture = texture;
+                pass.stencilAttachment.level = desc.depthStencilLevel;
                 pass.stencilAttachment.loadAction = desc.clearStencil ? MTLLoadActionClear : MTLLoadActionLoad;
                 pass.stencilAttachment.storeAction = MTLStoreActionStore;
                 pass.stencilAttachment.clearStencil = desc.clearStencilValue;
@@ -199,6 +237,36 @@ public:
         return {};
     }
 
+    core::Result setScissor(const backend::ScissorRect& scissor) override {
+        if (!encoder_ || scissor.x < 0 || scissor.y < 0) {
+            return fail(core::ErrorCode::invalid_argument, "invalid Metal scissor rectangle");
+        }
+        [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) setScissorRect:MTLScissorRect{
+            static_cast<NSUInteger>(scissor.x), static_cast<NSUInteger>(scissor.y),
+            scissor.width, scissor.height}];
+        return {};
+    }
+
+    core::Result setCullState(backend::CullMode cull, backend::FrontFace frontFace) override {
+        if (!encoder_) return fail(core::ErrorCode::invalid_state, "render pass is not active");
+        id<MTLRenderCommandEncoder> encoder = bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_);
+        MTLCullMode mode = MTLCullModeNone;
+        if (cull == backend::CullMode::front) mode = MTLCullModeFront;
+        else if (cull == backend::CullMode::back) mode = MTLCullModeBack;
+        skipDraw_ = cull == backend::CullMode::frontAndBack;
+        [encoder setCullMode:mode];
+        [encoder setFrontFacingWinding:frontFace == backend::FrontFace::counterClockwise
+            ? MTLWindingCounterClockwise : MTLWindingClockwise];
+        return {};
+    }
+
+    core::Result setBlendColor(float red, float green, float blue, float alpha) override {
+        if (!encoder_) return fail(core::ErrorCode::invalid_state, "render pass is not active");
+        [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_)
+            setBlendColorRed:red green:green blue:blue alpha:alpha];
+        return {};
+    }
+
     core::Result bindVertexBuffer(std::uint32_t slot, core::BufferHandle handle, std::size_t offset) override {
         auto buffer = session_->impl_->buffers.get(handle);
         if (!buffer) return core::Result::failure(buffer.error());
@@ -222,7 +290,33 @@ public:
         return {};
     }
 
-    core::Result bindTexture(std::uint32_t slot, core::TextureHandle textureHandle,
+    core::Result bindBuffer(backend::RenderStage stage, std::uint32_t slot,
+                            core::BufferHandle handle, std::size_t offset) override {
+        auto buffer = session_->impl_->buffers.get(handle);
+        if (!buffer) return core::Result::failure(buffer.error());
+        if (!encoder_ || offset > buffer.value()->size || slot >= 31U)
+            return fail(core::ErrorCode::invalid_argument, "invalid shader buffer bind");
+        id<MTLRenderCommandEncoder> encoder = bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_);
+        if (stage == backend::RenderStage::vertex)
+            [encoder setVertexBuffer:bridgeMetal<id<MTLBuffer>>(buffer.value()->object) offset:offset atIndex:slot];
+        else [encoder setFragmentBuffer:bridgeMetal<id<MTLBuffer>>(buffer.value()->object) offset:offset atIndex:slot];
+        return {};
+    }
+
+    core::Result bindBytes(backend::RenderStage stage, std::uint32_t slot,
+                           std::span<const std::byte> bytes) override {
+        if (!encoder_ || bytes.empty() || slot >= 31U) {
+            return fail(core::ErrorCode::invalid_argument, "invalid shader byte binding");
+        }
+        id<MTLRenderCommandEncoder> encoder = bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_);
+        if (stage == backend::RenderStage::vertex)
+            [encoder setVertexBytes:bytes.data() length:bytes.size() atIndex:slot];
+        else [encoder setFragmentBytes:bytes.data() length:bytes.size() atIndex:slot];
+        return {};
+    }
+
+    core::Result bindTexture(backend::RenderStage stage, std::uint32_t textureSlot,
+                             std::uint32_t samplerSlot, core::TextureHandle textureHandle,
                              core::SamplerHandle samplerHandle) override {
         auto texture = session_->impl_->textures.get(textureHandle);
         if (!texture) return core::Result::failure(texture.error());
@@ -230,8 +324,13 @@ public:
         if (!sampler) return core::Result::failure(sampler.error());
         if (!encoder_) return fail(core::ErrorCode::invalid_state, "render pass is not active");
         auto encoder = bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_);
-        [encoder setFragmentTexture:bridgeMetal<id<MTLTexture>>(texture.value()->object) atIndex:slot];
-        [encoder setFragmentSamplerState:bridgeMetal<id<MTLSamplerState>>(sampler.value()->object) atIndex:slot];
+        if (stage == backend::RenderStage::vertex) {
+            [encoder setVertexTexture:bridgeMetal<id<MTLTexture>>(texture.value()->object) atIndex:textureSlot];
+            [encoder setVertexSamplerState:bridgeMetal<id<MTLSamplerState>>(sampler.value()->object) atIndex:samplerSlot];
+        } else {
+            [encoder setFragmentTexture:bridgeMetal<id<MTLTexture>>(texture.value()->object) atIndex:textureSlot];
+            [encoder setFragmentSamplerState:bridgeMetal<id<MTLSamplerState>>(sampler.value()->object) atIndex:samplerSlot];
+        }
         return {};
     }
 
@@ -239,8 +338,9 @@ public:
         if (!encoder_ || command.vertexCount == 0 || command.instanceCount == 0) {
             return fail(core::ErrorCode::invalid_argument, "invalid draw command");
         }
-        [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) drawPrimitives:primitive_
-            vertexStart:command.vertexStart vertexCount:command.vertexCount instanceCount:command.instanceCount];
+        if (!skipDraw_) [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) drawPrimitives:primitive_
+            vertexStart:command.vertexStart vertexCount:command.vertexCount
+            instanceCount:command.instanceCount baseInstance:command.baseInstance];
         return {};
     }
 
@@ -248,7 +348,7 @@ public:
         if (!encoder_ || !indexBuffer_ || command.indexCount == 0 || command.instanceCount == 0) {
             return fail(core::ErrorCode::invalid_argument, "invalid indexed draw command");
         }
-        [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) drawIndexedPrimitives:primitive_
+        if (!skipDraw_) [bridgeMetal<id<MTLRenderCommandEncoder>>(encoder_) drawIndexedPrimitives:primitive_
             indexCount:command.indexCount indexType:indexType_
             indexBuffer:bridgeMetal<id<MTLBuffer>>(indexBuffer_) indexBufferOffset:indexOffset_
             instanceCount:command.instanceCount baseVertex:command.baseVertex
@@ -283,6 +383,7 @@ private:
     MTLIndexType indexType_{MTLIndexTypeUInt16};
     MTLPrimitiveType primitive_{MTLPrimitiveTypeTriangle};
     bool committed_{};
+    bool skipDraw_{};
 };
 
 MetalDeviceSession::MetalDeviceSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -398,6 +499,40 @@ core::ValueResult<core::BufferHandle> MetalDeviceSession::createBuffer(const bac
     return impl_->buffers.create(BufferResource{retainMetal(buffer), desc.size});
 }
 
+core::ValueResult<void*> MetalDeviceSession::mapBuffer(core::BufferHandle handle,
+                                                       std::size_t offset,
+                                                       std::size_t length) {
+    auto buffer = impl_->buffers.get(handle);
+    if (!buffer) return core::ValueResult<void*>::failure(buffer.error());
+    if (offset > buffer.value()->size || length > buffer.value()->size - offset) {
+        return core::ValueResult<void*>::failure(core::Error::make(
+            core::ErrorDomain::resource, core::ErrorCode::invalid_argument,
+            "buffer mapping is out of bounds"));
+    }
+    void* contents = bridgeMetal<id<MTLBuffer>>(buffer.value()->object).contents;
+    if (contents == nullptr) {
+        return core::ValueResult<void*>::failure(core::Error::make(
+            core::ErrorDomain::resource, core::ErrorCode::unavailable,
+            "Metal buffer is not CPU accessible"));
+    }
+    return static_cast<std::byte*>(contents) + offset;
+}
+
+core::Result MetalDeviceSession::generateMipmaps(core::TextureHandle handle) {
+    auto texture = impl_->textures.get(handle);
+    if (!texture) return core::Result::failure(texture.error());
+    if (texture.value()->desc.mipLevels <= 1) return {};
+    id<MTLCommandBuffer> commandBuffer = [bridgeMetal<id<MTLCommandQueue>>(impl_->queue) commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (commandBuffer == nil || blit == nil) return core::Result::failure(core::Error::make(
+        core::ErrorDomain::device, core::ErrorCode::unavailable,
+        "Metal mipmap command encoder unavailable"));
+    [blit generateMipmapsForTexture:bridgeMetal<id<MTLTexture>>(texture.value()->object)];
+    [blit endEncoding];
+    [commandBuffer commit];
+    return {};
+}
+
 core::ValueResult<core::TextureHandle> MetalDeviceSession::createTexture(const backend::TextureDesc& desc) {
     if (desc.width == 0 || desc.height == 0 || desc.mipLevels == 0 || desc.format == backend::PixelFormat::none) {
         return core::ValueResult<core::TextureHandle>::failure(core::Error::make(
@@ -418,6 +553,10 @@ core::ValueResult<core::SamplerHandle> MetalDeviceSession::createSampler(const b
     MTLSamplerDescriptor* descriptor = [MTLSamplerDescriptor new];
     descriptor.minFilter = desc.minFilter == backend::Filter::linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     descriptor.magFilter = desc.magFilter == backend::Filter::linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+    descriptor.mipFilter = desc.mipFilter == backend::MipFilter::linear ? MTLSamplerMipFilterLinear :
+        desc.mipFilter == backend::MipFilter::nearest ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterNotMipmapped;
+    descriptor.lodMinClamp = desc.lodMinClamp;
+    descriptor.lodMaxClamp = desc.lodMaxClamp;
     const auto address = [](backend::AddressMode mode) {
         if (mode == backend::AddressMode::repeat) return MTLSamplerAddressModeRepeat;
         if (mode == backend::AddressMode::mirroredRepeat) return MTLSamplerAddressModeMirrorRepeat;
@@ -529,7 +668,7 @@ core::ValueResult<core::PipelineHandle> MetalDeviceSession::createPipeline(
     for (const auto& attribute : desc.vertexAttributes) {
         mixLayout(attribute.location); mixLayout(attribute.bufferSlot); mixLayout(attribute.offset);
         mixLayout(attribute.stride); mixLayout(static_cast<std::uint8_t>(attribute.scalar));
-        mixLayout(attribute.components); mixLayout(attribute.normalized);
+        mixLayout(attribute.components); mixLayout(attribute.divisor); mixLayout(attribute.normalized);
     }
     key.vertexLayoutHash = layoutHash;
     const std::uint64_t cacheKey = ir::hashPipelineKey(key);
@@ -552,11 +691,14 @@ core::ValueResult<core::PipelineHandle> MetalDeviceSession::createPipeline(
     for (std::uint8_t index = 0; index < key.colorAttachmentCount; ++index) {
         descriptor.colorAttachments[index].pixelFormat = metalFormat(key.colorFormats[index]);
         descriptor.colorAttachments[index].blendingEnabled = key.blending;
+        descriptor.colorAttachments[index].writeMask = static_cast<MTLColorWriteMask>(key.colorWriteMask);
         if (key.blending) {
-            descriptor.colorAttachments[index].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-            descriptor.colorAttachments[index].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-            descriptor.colorAttachments[index].sourceAlphaBlendFactor = MTLBlendFactorOne;
-            descriptor.colorAttachments[index].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+            descriptor.colorAttachments[index].sourceRGBBlendFactor = blendFactor(key.sourceRgb);
+            descriptor.colorAttachments[index].destinationRGBBlendFactor = blendFactor(key.destinationRgb);
+            descriptor.colorAttachments[index].sourceAlphaBlendFactor = blendFactor(key.sourceAlpha);
+            descriptor.colorAttachments[index].destinationAlphaBlendFactor = blendFactor(key.destinationAlpha);
+            descriptor.colorAttachments[index].rgbBlendOperation = blendOperation(key.rgbOperation);
+            descriptor.colorAttachments[index].alphaBlendOperation = blendOperation(key.alphaOperation);
         }
     }
     const MTLPixelFormat depthFormat = metalFormat(key.depthStencilFormat);
@@ -578,7 +720,9 @@ core::ValueResult<core::PipelineHandle> MetalDeviceSession::createPipeline(
             vertexDescriptor.attributes[attribute.location].offset = attribute.offset;
             vertexDescriptor.attributes[attribute.location].bufferIndex = attribute.bufferSlot;
             vertexDescriptor.layouts[attribute.bufferSlot].stride = attribute.stride;
-            vertexDescriptor.layouts[attribute.bufferSlot].stepFunction = MTLVertexStepFunctionPerVertex;
+            vertexDescriptor.layouts[attribute.bufferSlot].stepFunction = attribute.divisor == 0
+                ? MTLVertexStepFunctionPerVertex : MTLVertexStepFunctionPerInstance;
+            vertexDescriptor.layouts[attribute.bufferSlot].stepRate = std::max(1U, attribute.divisor);
         }
         descriptor.vertexDescriptor = vertexDescriptor;
     }

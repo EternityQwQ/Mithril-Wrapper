@@ -9,6 +9,12 @@ else()
 endif()
 
 add_test(NAME mithril_core.unit COMMAND mithril_core_tests)
+
+if(MITHRIL_ENABLE_SHADER_TOOLCHAIN)
+    add_executable(mithril_shader_reflection_tests unit/shader_reflection_tests.cpp)
+    target_link_libraries(mithril_shader_reflection_tests PRIVATE mithril_shader_toolchain)
+    add_test(NAME mithril_shader.reflection COMMAND mithril_shader_reflection_tests)
+endif()
 add_test(NAME mithril_core.boundary
     COMMAND ${MITHRIL_POWERSHELL} -NoProfile -ExecutionPolicy Bypass
         -File ${CMAKE_SOURCE_DIR}/tools/quality/scan_for_vulkan.ps1
