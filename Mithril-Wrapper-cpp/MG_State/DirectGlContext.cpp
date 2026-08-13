@@ -409,9 +409,7 @@ bool DirectGlContext::textureFormat(GLint internalFormat, backend::PixelFormat& 
     else if (internalFormat == GL_DEPTH_COMPONENT || internalFormat == GL_DEPTH_COMPONENT16 ||
              internalFormat == GL_DEPTH_COMPONENT24 || internalFormat == GL_DEPTH_COMPONENT32 ||
              internalFormat == GL_DEPTH_COMPONENT32F) output = backend::PixelFormat::depth32Float;
-    else if (internalFormat == GL_DEPTH24_STENCIL8)
-        output = backend::PixelFormat::depth24Stencil8;
-    else if (internalFormat == GL_DEPTH32F_STENCIL8)
+    else if (internalFormat == GL_DEPTH24_STENCIL8 || internalFormat == GL_DEPTH32F_STENCIL8)
         output = backend::PixelFormat::depth32FloatStencil8;
     else return false;
     return true;
