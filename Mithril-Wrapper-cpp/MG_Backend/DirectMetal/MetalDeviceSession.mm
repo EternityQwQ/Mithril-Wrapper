@@ -451,12 +451,15 @@ core::Result MetalDeviceSession::upload(core::TextureHandle handle, std::uint32_
     auto texture = impl_->textures.get(handle);
     if (!texture) return core::Result::failure(texture.error());
     const auto& desc = texture.value()->desc;
+    const bool uploadable = desc.format == backend::PixelFormat::rgba8Unorm ||
+        desc.format == backend::PixelFormat::bgra8Unorm ||
+        desc.format == backend::PixelFormat::depth32Float;
     const std::uint32_t mipWidth = std::max(1U, desc.width >> mipLevel);
     const std::uint32_t mipHeight = std::max(1U, desc.height >> mipLevel);
     const std::size_t rowBytes = static_cast<std::size_t>(width) * 4U;
     if (mipLevel >= desc.mipLevels || x > mipWidth || y > mipHeight ||
         width > mipWidth - x || height > mipHeight - y || bytes.size() != rowBytes * height ||
-        (desc.format != backend::PixelFormat::rgba8Unorm && desc.format != backend::PixelFormat::bgra8Unorm)) {
+        !uploadable) {
         return core::Result::failure(core::Error::make(core::ErrorDomain::resource,
             core::ErrorCode::invalid_argument, "texture upload is out of bounds or has unsupported format"));
     }

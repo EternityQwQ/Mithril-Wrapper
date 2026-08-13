@@ -69,6 +69,10 @@ bool testGlFrontend() {
     glBindTexture(GL_TEXTURE_2D, colorTexture);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 32, 32);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, colorTexture, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, colorTexture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT)
+        return fail("color texture rejected as depth attachment");
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, 0, 0);
     glGenRenderbuffers(1, &depthRenderbuffer);
     glBindRenderbuffer(GL_RENDERBUFFER, depthRenderbuffer);
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 32, 32);
@@ -78,6 +82,29 @@ bool testGlFrontend() {
     glClearColor(0.25F, 0.5F, 0.75F, 1.0F);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     if (glGetError() != GL_NO_ERROR) return fail("framebuffer clear");
+
+    GLuint minecraftFramebuffer = 0;
+    GLuint minecraftColorTexture = 0;
+    GLuint minecraftDepthTexture = 0;
+    glGenFramebuffers(1, &minecraftFramebuffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, minecraftFramebuffer);
+    glGenTextures(1, &minecraftColorTexture);
+    glBindTexture(GL_TEXTURE_2D, minecraftColorTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 32, 32, 0,
+        GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        GL_TEXTURE_2D, minecraftColorTexture, 0);
+    glGenTextures(1, &minecraftDepthTexture);
+    glBindTexture(GL_TEXTURE_2D, minecraftDepthTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, 32, 32, 0,
+        GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+        GL_TEXTURE_2D, minecraftDepthTexture, 0);
+    if (glGetError() != GL_NO_ERROR) return fail("Minecraft framebuffer allocation");
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        return fail("Minecraft depth texture framebuffer status");
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (glGetError() != GL_NO_ERROR) return fail("Minecraft depth texture framebuffer clear");
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     const auto vertex = mithril::tests::triangleVertexShader();
@@ -140,8 +167,10 @@ bool testGlFrontend() {
     glDeleteShader(vertexShader);
     glDeleteShader(fragmentShader);
     glDeleteRenderbuffers(1, &depthRenderbuffer);
-    glDeleteTextures(1, &colorTexture);
+    const GLuint textures[] = {colorTexture, minecraftColorTexture, minecraftDepthTexture};
+    glDeleteTextures(3, textures);
     glDeleteFramebuffers(1, &framebuffer);
+    glDeleteFramebuffers(1, &minecraftFramebuffer);
     const bool released = eglMakeCurrent(display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT) == EGL_TRUE;
     const bool destroyed = eglDestroySurface(display, surface) == EGL_TRUE &&
         eglDestroyContext(display, context) == EGL_TRUE;

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <span>
 
 namespace mithril::frontend::gl {
@@ -24,6 +25,38 @@ bool bufferUsage(GLenum usage) {
 
 shader::ShaderStage stage(GLenum type) {
     return type == GL_VERTEX_SHADER ? shader::ShaderStage::vertex : shader::ShaderStage::fragment;
+}
+
+bool colorFormat(backend::PixelFormat format) {
+    return format == backend::PixelFormat::rgba8Unorm ||
+        format == backend::PixelFormat::bgra8Unorm;
+}
+
+bool depthFormat(backend::PixelFormat format) {
+    return format == backend::PixelFormat::depth32Float ||
+        format == backend::PixelFormat::depth24Stencil8 ||
+        format == backend::PixelFormat::depth32FloatStencil8;
+}
+
+bool stencilFormat(backend::PixelFormat format) {
+    return format == backend::PixelFormat::depth24Stencil8 ||
+        format == backend::PixelFormat::depth32FloatStencil8;
+}
+
+bool textureTransferFormat(backend::PixelFormat internalFormat, GLenum format, GLenum type) {
+    if (colorFormat(internalFormat)) {
+        return (format == GL_RGB || format == GL_RGBA) && type == GL_UNSIGNED_BYTE;
+    }
+    if (internalFormat == backend::PixelFormat::depth32Float) {
+        return format == GL_DEPTH_COMPONENT &&
+            (type == GL_FLOAT || type == GL_UNSIGNED_INT || type == GL_UNSIGNED_SHORT ||
+             type == GL_UNSIGNED_BYTE);
+    }
+    if (stencilFormat(internalFormat)) {
+        return format == GL_DEPTH_STENCIL &&
+            (type == GL_UNSIGNED_INT_24_8 || type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV);
+    }
+    return false;
 }
 
 } // namespace
@@ -376,7 +409,9 @@ bool DirectGlContext::textureFormat(GLint internalFormat, backend::PixelFormat& 
     else if (internalFormat == GL_DEPTH_COMPONENT || internalFormat == GL_DEPTH_COMPONENT16 ||
              internalFormat == GL_DEPTH_COMPONENT24 || internalFormat == GL_DEPTH_COMPONENT32 ||
              internalFormat == GL_DEPTH_COMPONENT32F) output = backend::PixelFormat::depth32Float;
-    else if (internalFormat == GL_DEPTH24_STENCIL8 || internalFormat == GL_DEPTH32F_STENCIL8)
+    else if (internalFormat == GL_DEPTH24_STENCIL8)
+        output = backend::PixelFormat::depth24Stencil8;
+    else if (internalFormat == GL_DEPTH32F_STENCIL8)
         output = backend::PixelFormat::depth32FloatStencil8;
     else return false;
     return true;
@@ -414,29 +449,88 @@ void DirectGlContext::bindTexture(GLenum target, GLuint name) {
 void DirectGlContext::texImage2D(GLenum target, GLint level, GLint internalFormat, GLsizei width,
                                  GLsizei height, GLint border, GLenum format, GLenum type,
                                  const void* pixels) {
-    if (target != GL_TEXTURE_2D || format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
-        setError(GL_INVALID_ENUM); return;
-    }
+    if (target != GL_TEXTURE_2D) { setError(GL_INVALID_ENUM); return; }
     if (level != 0 || border != 0 || width < 0 || height < 0) { setError(GL_INVALID_VALUE); return; }
     if (texture2D_ == 0) { setError(GL_INVALID_OPERATION); return; }
     backend::PixelFormat pixelFormat;
-    if (!textureFormat(internalFormat, pixelFormat) || pixelFormat != backend::PixelFormat::rgba8Unorm) {
+    if (!textureFormat(internalFormat, pixelFormat) ||
+        !textureTransferFormat(pixelFormat, format, type)) {
         setError(GL_INVALID_ENUM); return;
     }
-    if (width == 0 || height == 0) return;
+    if (pixels != nullptr && stencilFormat(pixelFormat)) {
+        setError(GL_INVALID_OPERATION); return;
+    }
+    if (width == 0 || height == 0) {
+        core::TextureHandle previous;
+        {
+            std::lock_guard lock(share_->mutex_);
+            auto& texture = share_->textures_[texture2D_];
+            previous = texture.handle;
+            texture = {{}, width, height, internalFormat, 1};
+        }
+        if (previous.valid()) (void)session_->release(previous);
+        return;
+    }
     auto created = session_->createTexture({static_cast<std::uint32_t>(width),
         static_cast<std::uint32_t>(height), 1, pixelFormat});
     if (!created) { backendError(created.error()); return; }
-    std::lock_guard lock(share_->mutex_);
-    auto& texture = share_->textures_[texture2D_];
-    if (texture.handle.valid()) (void)session_->release(texture.handle);
-    texture = {created.value(), width, height, internalFormat, 1};
+
     if (pixels != nullptr) {
-        auto uploaded = session_->upload(texture.handle, 0, 0, 0,
+        const std::size_t pixelCount = static_cast<std::size_t>(width) *
+            static_cast<std::size_t>(height);
+        std::vector<std::byte> rgbaPixels;
+        std::vector<float> depthPixels;
+        std::span<const std::byte> uploadBytes;
+        if (pixelFormat == backend::PixelFormat::rgba8Unorm && format == GL_RGB) {
+            const auto* source = static_cast<const std::byte*>(pixels);
+            rgbaPixels.resize(pixelCount * 4U);
+            for (std::size_t index = 0; index < pixelCount; ++index) {
+                rgbaPixels[index * 4U] = source[index * 3U];
+                rgbaPixels[index * 4U + 1U] = source[index * 3U + 1U];
+                rgbaPixels[index * 4U + 2U] = source[index * 3U + 2U];
+                rgbaPixels[index * 4U + 3U] = std::byte{0xff};
+            }
+            uploadBytes = rgbaPixels;
+        } else if (pixelFormat == backend::PixelFormat::depth32Float && type != GL_FLOAT) {
+            depthPixels.resize(pixelCount);
+            if (type == GL_UNSIGNED_BYTE) {
+                const auto* source = static_cast<const GLubyte*>(pixels);
+                const float scale = 1.0F / std::numeric_limits<GLubyte>::max();
+                for (std::size_t index = 0; index < pixelCount; ++index)
+                    depthPixels[index] = static_cast<float>(source[index]) * scale;
+            } else if (type == GL_UNSIGNED_SHORT) {
+                const auto* source = static_cast<const GLushort*>(pixels);
+                const float scale = 1.0F / std::numeric_limits<GLushort>::max();
+                for (std::size_t index = 0; index < pixelCount; ++index)
+                    depthPixels[index] = static_cast<float>(source[index]) * scale;
+            } else {
+                const auto* source = static_cast<const GLuint*>(pixels);
+                const double scale = 1.0 / std::numeric_limits<GLuint>::max();
+                for (std::size_t index = 0; index < pixelCount; ++index)
+                    depthPixels[index] = static_cast<float>(static_cast<double>(source[index]) * scale);
+            }
+            uploadBytes = std::as_bytes(std::span<const float>(depthPixels));
+        } else {
+            uploadBytes = {static_cast<const std::byte*>(pixels), pixelCount * 4U};
+        }
+        auto uploaded = session_->upload(created.value(), 0, 0, 0,
             static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height),
-            {static_cast<const std::byte*>(pixels), static_cast<std::size_t>(width) * height * 4U});
-        if (!uploaded) backendError(uploaded.error());
+            uploadBytes);
+        if (!uploaded) {
+            (void)session_->release(created.value());
+            backendError(uploaded.error());
+            return;
+        }
     }
+
+    core::TextureHandle previous;
+    {
+        std::lock_guard lock(share_->mutex_);
+        auto& texture = share_->textures_[texture2D_];
+        previous = texture.handle;
+        texture = {created.value(), width, height, internalFormat, 1};
+    }
+    if (previous.valid()) (void)session_->release(previous);
 }
 
 void DirectGlContext::texSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei width,
@@ -618,19 +712,36 @@ GLenum DirectGlContext::checkFramebufferStatus(GLenum target) {
     if (name == 0) return GL_FRAMEBUFFER_COMPLETE;
     const Framebuffer* framebuffer = framebufferForTarget(target);
     if (framebuffer == nullptr) { setError(GL_INVALID_OPERATION); return 0; }
-    const Attachment* attachments[] = {&framebuffer->color, &framebuffer->depth, &framebuffer->stencil};
+    struct AttachmentRequirement {
+        const Attachment* attachment;
+        bool (*accepts)(backend::PixelFormat);
+    };
+    const AttachmentRequirement attachments[] = {
+        {&framebuffer->color, colorFormat},
+        {&framebuffer->depth, depthFormat},
+        {&framebuffer->stencil, stencilFormat},
+    };
     GLsizei expectedWidth = 0;
     GLsizei expectedHeight = 0;
     bool attached = false;
-    for (const Attachment* attachment : attachments) {
-        if (attachment->kind == AttachmentKind::none) continue;
+    for (const auto& requirement : attachments) {
+        const Attachment& attachment = *requirement.attachment;
+        if (attachment.kind == AttachmentKind::none) continue;
         GLsizei width = 0;
         GLsizei height = 0;
-        if (!attachmentExtent(*attachment, width, height)) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
+        if (!attachmentExtent(attachment, width, height) ||
+            !requirement.accepts(attachmentFormat(attachment)))
+            return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
         if (!attached) { expectedWidth = width; expectedHeight = height; attached = true; }
         else if (width != expectedWidth || height != expectedHeight) return GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT;
     }
     if (!attached) return GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+    if (framebuffer->color.kind == AttachmentKind::none &&
+        framebuffer->drawBuffer == GL_COLOR_ATTACHMENT0)
+        return GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER;
+    if (framebuffer->color.kind == AttachmentKind::none &&
+        framebuffer->readBuffer == GL_COLOR_ATTACHMENT0)
+        return GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER;
     if (framebuffer->drawBuffer != GL_NONE && framebuffer->drawBuffer != GL_COLOR_ATTACHMENT0)
         return GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER;
     if (framebuffer->readBuffer != GL_NONE && framebuffer->readBuffer != GL_COLOR_ATTACHMENT0)
@@ -809,17 +920,6 @@ core::ValueResult<core::PipelineHandle> DirectGlContext::pipelineFor(GLenum mode
     ir::Primitive primitiveMode;
     if (!primitive(mode, primitiveMode)) return core::ValueResult<core::PipelineHandle>::failure(
         core::Error::make(core::ErrorDomain::gl, core::ErrorCode::unsupported, "unsupported GL primitive"));
-    std::lock_guard lock(share_->mutex_);
-    auto program = share_->programs_.find(currentProgram_);
-    if (program == share_->programs_.end() || !program->second.linked) {
-        return core::ValueResult<core::PipelineHandle>::failure(core::Error::make(
-            core::ErrorDomain::gl, core::ErrorCode::invalid_state, "no linked GL program is active"));
-    }
-    std::vector<core::ShaderHandle> shaders;
-    for (GLuint name : program->second.attachedShaders) {
-        auto found = share_->shaders_.find(name);
-        if (found != share_->shaders_.end() && found->second.compiled) shaders.push_back(found->second.handle);
-    }
     backend::PipelineDesc desc;
     desc.key.colorFormats[0] = backend::PixelFormat::bgra8Unorm;
     desc.key.depthStencilFormat = depthTexture_.valid()
@@ -831,6 +931,21 @@ core::ValueResult<core::PipelineHandle> DirectGlContext::pipelineFor(GLenum mode
             desc.key.colorAttachmentCount = desc.key.colorFormats[0] == backend::PixelFormat::none ? 0 : 1;
             if (framebuffer->depth.kind != AttachmentKind::none)
                 desc.key.depthStencilFormat = attachmentFormat(framebuffer->depth);
+        }
+    }
+    std::vector<core::ShaderHandle> shaders;
+    {
+        std::lock_guard lock(share_->mutex_);
+        auto program = share_->programs_.find(currentProgram_);
+        if (program == share_->programs_.end() || !program->second.linked) {
+            return core::ValueResult<core::PipelineHandle>::failure(core::Error::make(
+                core::ErrorDomain::gl, core::ErrorCode::invalid_state,
+                "no linked GL program is active"));
+        }
+        for (GLuint name : program->second.attachedShaders) {
+            auto found = share_->shaders_.find(name);
+            if (found != share_->shaders_.end() && found->second.compiled)
+                shaders.push_back(found->second.handle);
         }
     }
     desc.key.primitive = primitiveMode;
@@ -860,6 +975,11 @@ void DirectGlContext::drawArrays(GLenum mode, GLint first, GLsizei count, GLsize
     auto commands = session_->createCommandEncoder();
     if (!commands) { backendError(commands.error()); return; }
     backend::RenderPassDesc pass{frame.value().drawable, depthTexture_};
+    if (drawFramebuffer_ != 0) {
+        const Framebuffer* framebuffer = framebufferForTarget(GL_DRAW_FRAMEBUFFER);
+        pass.depthStencil = framebuffer != nullptr
+            ? attachmentHandle(framebuffer->depth) : core::TextureHandle{};
+    }
     core::Result result = commands.value()->beginRenderPass(pass);
     if (result) result = commands.value()->bindPipeline(pipeline.value());
     backend::Viewport viewport = viewport_;
@@ -903,6 +1023,11 @@ void DirectGlContext::drawElements(GLenum mode, GLsizei count, GLenum type, cons
     auto commands = session_->createCommandEncoder();
     if (!commands) { backendError(commands.error()); return; }
     backend::RenderPassDesc pass{frame.value().drawable, depthTexture_};
+    if (drawFramebuffer_ != 0) {
+        const Framebuffer* framebuffer = framebufferForTarget(GL_DRAW_FRAMEBUFFER);
+        pass.depthStencil = framebuffer != nullptr
+            ? attachmentHandle(framebuffer->depth) : core::TextureHandle{};
+    }
     core::Result result = commands.value()->beginRenderPass(pass);
     if (result) result = commands.value()->bindPipeline(pipeline.value());
     backend::Viewport viewport = viewport_;
