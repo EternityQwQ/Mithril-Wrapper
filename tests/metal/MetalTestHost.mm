@@ -35,15 +35,20 @@ bool require(const Result& result, const char* operation) {
 }
 
 bool testGlFrontend() {
+    const auto fail = [](const char* stage) {
+        std::cerr << "GL frontend stage failed: " << stage << " glError=0x"
+                  << std::hex << glGetError() << std::dec << '\n';
+        return false;
+    };
     EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     EGLint major = 0;
     EGLint minor = 0;
-    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor)) return false;
+    if (display == EGL_NO_DISPLAY || !eglInitialize(display, &major, &minor)) return fail("eglInitialize");
     EGLConfig config = nullptr;
     EGLint configCount = 0;
     const EGLint choose[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
         EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE};
-    if (!eglChooseConfig(display, choose, &config, 1, &configCount) || configCount != 1) return false;
+    if (!eglChooseConfig(display, choose, &config, 1, &configCount) || configCount != 1) return fail("eglChooseConfig");
     const EGLint contextAttributes[] = {EGL_CONTEXT_MAJOR_VERSION, 3,
         EGL_CONTEXT_MINOR_VERSION, 3, EGL_CONTEXT_OPENGL_PROFILE_MASK,
         EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE};
@@ -51,15 +56,15 @@ bool testGlFrontend() {
     const EGLint surfaceAttributes[] = {EGL_WIDTH, 64, EGL_HEIGHT, 64, EGL_NONE};
     EGLSurface surface = eglCreatePbufferSurface(display, config, surfaceAttributes);
     if (context == EGL_NO_CONTEXT || surface == EGL_NO_SURFACE ||
-        !eglMakeCurrent(display, surface, surface, context)) return false;
+        !eglMakeCurrent(display, surface, surface, context)) return fail("eglMakeCurrent");
 
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return fail("default framebuffer status");
     GLuint framebuffer = 0;
     GLuint colorTexture = 0;
     GLuint depthRenderbuffer = 0;
     glGenFramebuffers(1, &framebuffer);
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT) return false;
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT) return fail("empty framebuffer status");
     glGenTextures(1, &colorTexture);
     glBindTexture(GL_TEXTURE_2D, colorTexture);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 32, 32);
@@ -69,10 +74,10 @@ bool testGlFrontend() {
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 32, 32);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
         GL_RENDERBUFFER, depthRenderbuffer);
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return false;
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return fail("complete framebuffer status");
     glClearColor(0.25F, 0.5F, 0.75F, 1.0F);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-    if (glGetError() != GL_NO_ERROR) return false;
+    if (glGetError() != GL_NO_ERROR) return fail("framebuffer clear");
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     const auto vertex = mithril::tests::triangleVertexShader();
@@ -83,20 +88,20 @@ bool testGlFrontend() {
     glCompileShader(vertexShader);
     GLint compiled = GL_FALSE;
     glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &compiled);
-    if (compiled != GL_TRUE) return false;
+    if (compiled != GL_TRUE) return fail("vertex compile");
     GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
     const char* fragmentSource = fragment.source.c_str();
     glShaderSource(fragmentShader, 1, &fragmentSource, nullptr);
     glCompileShader(fragmentShader);
     glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &compiled);
-    if (compiled != GL_TRUE) return false;
+    if (compiled != GL_TRUE) return fail("fragment compile");
     GLuint program = glCreateProgram();
     glAttachShader(program, vertexShader);
     glAttachShader(program, fragmentShader);
     glLinkProgram(program);
     GLint linked = GL_FALSE;
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if (linked != GL_TRUE) return false;
+    if (linked != GL_TRUE) return fail("program link");
     glUseProgram(program);
 
     constexpr std::array vertices{
@@ -120,9 +125,9 @@ bool testGlFrontend() {
     glClearColor(0.0F, 0.0F, 0.0F, 1.0F);
     glClear(GL_COLOR_BUFFER_BIT);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    if (glGetError() != GL_NO_ERROR) return false;
+    if (glGetError() != GL_NO_ERROR) return fail("default framebuffer draw");
     auto pixels = mithril::egl::bridge::readbackDrawFrame();
-    if (!pixels) return false;
+    if (!pixels) return fail("default framebuffer readback");
     std::size_t colored = 0;
     for (std::size_t index = 0; index < pixels.value().size(); ++index) {
         if (index % 4 != 3 && std::to_integer<unsigned char>(pixels.value()[index]) > 16) ++colored;
@@ -141,7 +146,12 @@ bool testGlFrontend() {
     const bool destroyed = eglDestroySurface(display, surface) == EGL_TRUE &&
         eglDestroyContext(display, context) == EGL_TRUE;
     const bool terminated = eglTerminate(display) == EGL_TRUE;
-    return rendered && swapped && released && destroyed && terminated;
+    if (!rendered) return fail("triangle pixels");
+    if (!swapped) return fail("eglSwapBuffers");
+    if (!released) return fail("egl release current");
+    if (!destroyed) return fail("egl destroy objects");
+    if (!terminated) return fail("eglTerminate");
+    return true;
 }
 
 } // namespace
