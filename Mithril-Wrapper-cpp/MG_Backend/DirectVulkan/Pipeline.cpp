@@ -319,7 +319,7 @@ uint64_t hash_signature(GLuint program, const MGVertexAttrib* attribs, int attri
     // glPolygonMode / glLineWidth / GL_DEPTH_CLAMP would reuse a pipeline
     // built for the previous values. Vulkan doesn't expose them as dynamic
     // state on the 1.2 core path, so they must be hashed here.
-    GLenum polyMode = (mithril::g_state ? mithril::g_state->polygonModeFront : (GLenum)0x1B00);
+    GLenum polyMode = (mithril::g_state ? mithril::g_state->polygonModeFront : GL_FILL);
     float  lw       = (mithril::g_state ? mithril::g_state->lineWidth        : 1.0f);
     bool   dc       = (mithril::g_state && mithril::g_state->depthClamp);
     mix(&polyMode, sizeof(polyMode));
@@ -690,11 +690,16 @@ VkPipeline get_or_create_pipeline(GLuint program,
     rs.rasterizerDiscardEnable = VK_FALSE;
     rs.polygonMode = VK_POLYGON_MODE_FILL;
     if (mithril::g_state) {
+        // GL polygon-mode tokens (glcorearb.h): GL_POINT=0x1B00, GL_LINE=0x1B01,
+        // GL_FILL=0x1B02. NOTE: a previous revision mislabeled these three
+        // values (0x1B01↔GL_POINT etc.), which mapped the DEFAULT GL_FILL
+        // (0x1B02) to VK_POLYGON_MODE_LINE — every pipeline was built in
+        // wireframe mode and all draws rendered black. Use the macros directly.
         switch (mithril::g_state->polygonModeFront) {
-            case 0x1B01 /*GL_POINT*/: rs.polygonMode = VK_POLYGON_MODE_POINT; break;
-            case 0x1B02 /*GL_LINE*/:  rs.polygonMode = VK_POLYGON_MODE_LINE;  break;
-            case 0x1B00 /*GL_FILL*/:
-            default:                  rs.polygonMode = VK_POLYGON_MODE_FILL;  break;
+            case GL_POINT: rs.polygonMode = VK_POLYGON_MODE_POINT; break;
+            case GL_LINE:  rs.polygonMode = VK_POLYGON_MODE_LINE;  break;
+            case GL_FILL:
+            default:       rs.polygonMode = VK_POLYGON_MODE_FILL;  break;
         }
     }
     rs.cullMode = VK_CULL_MODE_NONE;        // dynamic via vkCmdSetCullMode
