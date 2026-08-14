@@ -2610,6 +2610,55 @@ void backend_set_stencil_state(int enabled, int func, int ref, int mask,
     // Stencil dynamic state deferred (bring-up).
 }
 
+// Polygon mode / line width / depth clamp are STATIC VkPipelineRasterizationState
+// fields in Vulkan 1.2 (no VK_DYNAMIC_STATE_POLYGON_MODE without
+// VK_EXT_extended_dynamic_state3). They are therefore BAKED into the pipeline
+// at creation time in Pipeline.cpp:get_or_create_pipeline, with the current
+// g_state values read there. The backend_set_* wrappers below are
+// intentional no-ops at the command-buffer level: the next draw will pick
+// up a freshly-built (or cached) pipeline whose rasterization state already
+// reflects the requested values, and the cache key in Pipeline.cpp:
+// hash_signature includes these fields so a state change forces a new
+// pipeline. This matches the contract documented in Backend.h:229-234.
+void backend_set_polygon_mode(int mode) { (void)mode; }
+void backend_set_line_width(float width) { (void)width; }
+void backend_set_depth_clamp(int enabled) { (void)enabled; }
+
+/*
+ * Push a vertex-stage push constant into the CURRENT program's pipeline
+ * layout (gl_VertexID baseVertex semantics; see Backend.h:268 for the
+ * full contract).
+ *
+ * The push-constant range (offset=0, size=4, stage=VERTEX) is declared by
+ * the per-program layout (DescriptorSet.cpp:ensure_program_layouts) AND
+ * by the process-wide empty layout (Pipeline.cpp:empty_pipeline_layout).
+ * Both layouts agree on the range, so a binding-less program can use the
+ * fallback layout with the same push call.
+ *
+ * vkCmdPushConstants is a state command — it does NOT require an active
+ * render pass and is harmless to record when the program hasn't been bound
+ * yet (the next vkCmdBindPipeline will pick it up). This matches the
+ * MobileGL pattern.
+ */
+void backend_push_constants(GLuint program, uint32_t offset, uint32_t size,
+                            const void* data) {
+    mithril::vk::Backend* b = mithril::vk::backend();
+    if (!b || !b->commandBuffer) return;
+    if (!mithril::vk::ensure_command_buffer_recording()) return;
+    if (!data || size == 0) return;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    if (program != 0) {
+        auto& tbl = mithril::vk::program_table();
+        auto it = tbl.find(program);
+        if (it != tbl.end()) layout = it->second.pipelineLayout;
+    }
+    if (layout == VK_NULL_HANDLE) {
+        layout = mithril::vk::backend_default_pipeline_layout();
+    }
+    vkCmdPushConstants(b->commandBuffer, layout, VK_SHADER_STAGE_VERTEX_BIT,
+                       offset, size, data);
+}
+
 void backend_draw_arrays(int primitive, int first, int count) {
     (void)primitive;
     mithril::vk::Backend* b = mithril::vk::backend();
