@@ -1,5 +1,8 @@
 # Mithril-Wrapper
 
+> [!CAUTION]
+> 本仓库已转移至https://github.com/MithrilWrapper-Dev/Mithril-Wrapper
+
 > OpenGL 3.3 Core Profile → Vulkan 1.2 (via MoltenVK) → Metal 翻译层，让依赖桌面
 > OpenGL 的应用能在仅有 Metal 后端的 iOS 上运行。
 
