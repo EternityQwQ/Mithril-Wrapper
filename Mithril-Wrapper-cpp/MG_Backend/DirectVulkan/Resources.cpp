@@ -480,6 +480,13 @@ static VkAccessFlags       dst_access_for_layout(VkImageLayout layout);
 static VkPipelineStageFlags src_stage_for_layout(VkImageLayout layout);
 static VkPipelineStageFlags dst_stage_for_layout(VkImageLayout layout);
 
+// KNOWN LIMITATION (T3 audit): only GL_UNPACK_ALIGNMENT is honoured. The
+// remaining MGUnpackParams fields (unpackRowLength / skipPixels / skipRows /
+// imageHeight / skipImages) are NOT implemented — staging rows are computed
+// from the tightly-packed (w x bpp) src stride aligned to unpack_alignment.
+// This covers the overwhelming majority of real-world uploads (GL default
+// UNPACK_ROW_LENGTH == 0, no skips). Per the GL 3.3 finalize plan this is a
+// documented known limitation, not a regression to fix now.
 void stage_and_copy_image(TextureEntry& tex, int level, int x, int y, int z,
                           int w, int h, int d, const void* pixels,
                           int unpack_alignment, GLenum format, GLenum type,
